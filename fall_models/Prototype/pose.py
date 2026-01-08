@@ -1,0 +1,259 @@
+import os
+import glob
+import re
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+
+# ----------------------------- CONFIG -----------------------------
+
+@dataclass
+class PoseExportConfig:
+    model_path: str = "yolo11l-pose.pt"
+    conf_thres: float = 0.25
+    fps: int = 30
+    max_people: int = 1
+    num_kpts: int = 17               # COCO keypoints for Ultralytics pose models
+    video_codec: str = "mp4v"        # mp4v is widely supported
+    save_csv: bool = False
+
+
+# ----------------------------- SORTING -----------------------------
+
+def numeric_suffix_key(path: str) -> float:
+    """
+    Extract the last number from the filename and sort by it.
+    Works for: 2018-07-04T12_04_17.783869.png
+    """
+    name = os.path.splitext(os.path.basename(path))[0]
+    nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", name)
+    return float(nums[-1]) if nums else 0.0
+
+
+def list_frames(frames_dir: str, pattern: str = "*.png") -> List[str]:
+    paths = glob.glob(os.path.join(frames_dir, pattern))
+    paths = sorted(paths, key=numeric_suffix_key)
+    if not paths:
+        raise FileNotFoundError(f"No frames found in {frames_dir} matching {pattern}")
+    return paths
+
+
+# ----------------------------- IO HELPERS -----------------------------
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def make_video_writer(out_path: str, fps: int, frame_size: Tuple[int, int], codec: str = "mp4v") -> cv2.VideoWriter:
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    w, h = frame_size
+    return cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+
+
+def read_image(path: str) -> np.ndarray:
+    img = cv2.imread(path)
+    if img is None:
+        raise RuntimeError(f"Failed to read image: {path}")
+    return img
+
+
+# ----------------------------- DATA STRUCTURES -----------------------------
+
+def init_pose_arrays(num_frames: int, max_people: int, num_kpts: int) -> Dict[str, np.ndarray]:
+    kpts_xy = np.full((num_frames, max_people, num_kpts, 2), np.nan, dtype=np.float32)
+    kpts_conf = np.full((num_frames, max_people, num_kpts), np.nan, dtype=np.float32)
+    person_conf = np.full((num_frames, max_people), np.nan, dtype=np.float32)
+    return {"kpts_xy": kpts_xy, "kpts_conf": kpts_conf, "person_conf": person_conf}
+
+
+def choose_people_order(r) -> np.ndarray:
+    """
+    Choose ordering for people in frame.
+    Prefer box confidence if available, otherwise mean keypoint confidence.
+    """
+    if r.boxes is not None and r.boxes.conf is not None:
+        conf = r.boxes.conf.detach().cpu().numpy()
+        return np.argsort(-conf)
+
+    if r.keypoints is not None and r.keypoints.conf is not None:
+        kc = r.keypoints.conf.detach().cpu().numpy()
+        return np.argsort(-np.nanmean(kc, axis=1))
+
+    return np.array([], dtype=int)
+
+
+def extract_pose_for_frame(r) -> Optional[Dict[str, Any]]:
+    """
+    Return dict with:
+      xy: (P, K, 2)
+      kc: (P, K)
+      box_conf: (P,) or None
+    """
+    if r.keypoints is None:
+        return None
+
+    xy = r.keypoints.xy.detach().cpu().numpy()  # (people, kpts, 2)
+    kc = None
+    if r.keypoints.conf is not None:
+        kc = r.keypoints.conf.detach().cpu().numpy()
+
+    box_conf = None
+    if r.boxes is not None and r.boxes.conf is not None:
+        box_conf = r.boxes.conf.detach().cpu().numpy()
+
+    return {"xy": xy, "kc": kc, "box_conf": box_conf}
+
+
+# ----------------------------- CORE PIPELINE -----------------------------
+
+def run_pose_on_frames(
+    frames_dir: str,
+    out_dir: str,
+    config: PoseExportConfig,
+    pattern: str = "*.png"
+) -> Tuple[str, str, Optional[str]]:
+    """
+    Processes a directory of frames.
+    Writes:
+      - annotated video (mp4)
+      - keypoints (npz)
+      - optional csv
+    Returns paths to outputs.
+    """
+    ensure_dir(out_dir)
+
+    frame_paths = list_frames(frames_dir, pattern=pattern)
+    num_frames = len(frame_paths)
+
+    model = YOLO(config.model_path)
+
+    first = read_image(frame_paths[0])
+    h, w = first.shape[:2]
+
+    out_video = os.path.join(out_dir, "pose_out.mp4")
+    out_npz = os.path.join(out_dir, "keypoints.npz")
+    out_csv = os.path.join(out_dir, "keypoints.csv") if config.save_csv else None
+
+    writer = make_video_writer(out_video, config.fps, (w, h), codec=config.video_codec)
+
+    arrays = init_pose_arrays(num_frames, config.max_people, config.num_kpts)
+
+    csv_rows = []
+    if config.save_csv:
+        csv_rows.append(["frame", "person", "kpt", "x", "y", "kpt_conf", "person_conf", "frame_path"])
+
+    for i, p in enumerate(frame_paths):
+        frame = cv2.imread(p)
+        if frame is None:
+            print(f"Skipping unreadable frame: {p}")
+            continue
+
+        results = model(frame, conf=config.conf_thres, verbose=False)
+        r = results[0]
+
+        annotated = r.plot()
+        writer.write(annotated)
+
+        pose = extract_pose_for_frame(r)
+        if pose is None:
+            continue
+
+        xy = pose["xy"]
+        kc = pose["kc"]
+        box_conf = pose["box_conf"]
+
+        order = choose_people_order(r)
+        for j, idx in enumerate(order[:config.max_people]):
+            arrays["kpts_xy"][i, j] = xy[idx].astype(np.float32)
+
+            if kc is not None:
+                arrays["kpts_conf"][i, j] = kc[idx].astype(np.float32)
+            else:
+                arrays["kpts_conf"][i, j] = np.nan
+
+            if box_conf is not None and idx < len(box_conf):
+                arrays["person_conf"][i, j] = float(box_conf[idx])
+            elif kc is not None:
+                arrays["person_conf"][i, j] = float(np.nanmean(kc[idx]))
+            else:
+                arrays["person_conf"][i, j] = np.nan
+
+            if config.save_csv:
+                for k in range(config.num_kpts):
+                    x, y = arrays["kpts_xy"][i, j, k]
+                    kconf = arrays["kpts_conf"][i, j, k]
+                    pconf = arrays["person_conf"][i, j]
+                    csv_rows.append([i, j, k, float(x), float(y), float(kconf), float(pconf), p])
+
+    writer.release()
+
+    np.savez_compressed(
+        out_npz,
+        kpts_xy=arrays["kpts_xy"],
+        kpts_conf=arrays["kpts_conf"],
+        person_conf=arrays["person_conf"],
+        frame_paths=np.array(frame_paths, dtype=object),
+        fps=np.array([config.fps], dtype=np.int32),
+        model_path=np.array([config.model_path], dtype=object),
+    )
+
+    if config.save_csv:
+        import csv
+        with open(out_csv, "w", newline="") as f:
+            wcsv = csv.writer(f)
+            wcsv.writerows(csv_rows)
+
+    return out_video, out_npz, out_csv
+
+
+def batch_process_folders(
+    input_root: str,
+    output_root: str,
+    config: PoseExportConfig,
+    pattern: str = "*.png"
+) -> List[Tuple[str, str, str]]:
+    """
+    Process all subfolders under input_root that contain frames matching pattern.
+    Writes outputs to output_root/<subfolder_name>/...
+    Returns list of (folder, video_path, npz_path).
+    """
+    ensure_dir(output_root)
+
+    folders = [p for p in glob.glob(os.path.join(input_root, "*")) if os.path.isdir(p)]
+    results = []
+
+    for folder in folders:
+        frames = glob.glob(os.path.join(folder, pattern))
+        if not frames:
+            continue
+
+        name = os.path.basename(folder)
+        out_dir = os.path.join(output_root, name)
+        out_video, out_npz, _ = run_pose_on_frames(folder, out_dir, config, pattern=pattern)
+        results.append((folder, out_video, out_npz))
+
+    return results
+
+
+# ----------------------------- EXAMPLE USAGE -----------------------------
+
+if __name__ == "__main__":
+    cfg = PoseExportConfig(
+        model_path="yolo11l-pose.pt",
+        conf_thres=0.25,
+        fps=30,
+        max_people=1,
+        save_csv=False
+    )
+    frames = "../../Datasets/UP-Fall/Subject1Activity1Trial1Camera1"
+
+    # Single folder
+    run_pose_on_frames(frames_dir=frames, out_dir="outputs/frames_run", config=cfg)
+
+    # Many folders
+    # batch_process_folders(input_root="all_sequences", output_root="outputs", config=cfg)
+
