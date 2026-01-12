@@ -288,6 +288,7 @@ def load_window_labels(csv_path: str) -> pd.DataFrame:
     out["window_id"] = np.arange(len(out), dtype=np.int64)
     return out
 
+
 def batch_process_folders(
     input_root: str,
     output_root: str,
