@@ -3,6 +3,7 @@ import glob
 import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
+import pandas as pd
 
 import cv2
 import numpy as np
@@ -34,12 +35,27 @@ def numeric_suffix_key(path: str) -> float:
     return float(nums[-1]) if nums else 0.0
 
 
+def frame_time_key(path: str) -> pd.Timestamp:
+    return parse_frame_timestamp(path)
+
 def list_frames(frames_dir: str, pattern: str = "*.png") -> List[str]:
     paths = glob.glob(os.path.join(frames_dir, pattern))
-    paths = sorted(paths, key=numeric_suffix_key)
+    paths = sorted(paths, key=frame_time_key)
     if not paths:
         raise FileNotFoundError(f"No frames found in {frames_dir} matching {pattern}")
     return paths
+
+FRAME_TS_RE = re.compile(
+    r"(?P<date>\d{4}-\d{2}-\d{2})T(?P<h>\d{2})_(?P<m>\d{2})_(?P<s>\d{2}(?:\.\d+)?)"
+)
+
+def parse_frame_timestamp(path: str) -> pd.Timestamp:
+    name = os.path.splitext(os.path.basename(path))[0]
+    m = FRAME_TS_RE.search(name)
+    if not m:
+        raise ValueError(f"Cannot parse timestamp from {path}")
+    dt = f"{m.group('date')}T{m.group('h')}:{m.group('m')}:{m.group('s')}"
+    return pd.to_datetime(dt)
 
 
 # ----------------------------- IO HELPERS -----------------------------
@@ -113,6 +129,7 @@ def extract_pose_for_frame(r) -> Optional[Dict[str, Any]]:
 def run_pose_on_frames(
     frames_dir: str,
     out_dir: str,
+    windows_csv: str,
     config: PoseExportConfig,
     pattern: str = "*.png"
 ) -> Tuple[str, str, Optional[str]]:
@@ -145,6 +162,32 @@ def run_pose_on_frames(
     csv_rows = []
     if config.save_csv:
         csv_rows.append(["frame", "person", "kpt", "x", "y", "kpt_conf", "person_conf", "frame_path"])
+    
+
+    #Get frame labels
+    windows_df = load_window_labels(windows_csv)
+    frame_dts = [parse_frame_timestamp(p) for p in frame_paths]
+
+    frames_df = pd.DataFrame({
+        "frame_idx": np.arange(num_frames),
+        "frame_path": frame_paths,
+        "frame_dt": frame_dts,
+    }).sort_values("frame_dt").reset_index(drop=True)
+
+    frames_df = pd.merge_asof(
+        frames_df.sort_values("frame_dt"),
+        windows_df.sort_values("window_start"),
+        left_on="frame_dt",
+        right_on="window_start",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+
+    frames_df["label"] = frames_df["label"].fillna("unknown").to_numpy()
+    frames_df["window_id"] = frames_df["window_id"].fillna(-1).astype(np.int64).to_numpy()
+
+    frame_labels = frames_df["label"].to_numpy()
+    frame_window_ids = frames_df["window_id"].to_numpy()
 
     for i, p in enumerate(frame_paths):
         frame = cv2.imread(p)
@@ -191,12 +234,16 @@ def run_pose_on_frames(
 
     writer.release()
 
+    #Save to .npz file
     np.savez_compressed(
         out_npz,
         kpts_xy=arrays["kpts_xy"],
         kpts_conf=arrays["kpts_conf"],
         person_conf=arrays["person_conf"],
         frame_paths=np.array(frame_paths, dtype=object),
+        frame_labels=frame_labels,
+        window_ids=frame_window_ids,
+        frame_timestamps=np.array(frame_dts, dtype="datetime64[ns]"),
         fps=np.array([config.fps], dtype=np.int32),
         model_path=np.array([config.model_path], dtype=object),
     )
@@ -209,6 +256,37 @@ def run_pose_on_frames(
 
     return out_video, out_npz, out_csv
 
+def load_window_labels(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path, header=1, encoding="utf-8-sig")
+
+    # Clean column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "Timestamp" not in df.columns:
+        raise ValueError(f"'Timestamp' not found. Columns: {df.columns[:10].tolist()}")
+
+    if "Tag" not in df.columns:
+        raise ValueError(f"'Tag' not found. Columns: {df.columns[-10:].tolist()}")
+
+    window_start = pd.to_datetime(
+        df["Timestamp"],
+        format="%Y-%m-%dT%H:%M:%S.%f",
+        errors="coerce"
+    )
+
+    out = pd.DataFrame({
+        "window_start": window_start,
+        "label": df["Tag"].astype(str),
+    })
+
+    out = (
+        out.dropna(subset=["window_start"])
+           .sort_values("window_start")
+           .reset_index(drop=True)
+    )
+
+    out["window_id"] = np.arange(len(out), dtype=np.int64)
+    return out
 
 def batch_process_folders(
     input_root: str,
@@ -250,9 +328,10 @@ if __name__ == "__main__":
         save_csv=False
     )
     frames = "../../Datasets/UP-Fall/Subject1Activity1Trial1Camera1"
+    windows_csv = "../../Datasets/UP-Fall/Subject1Activity1Trial1Features1&0.5.csv"
 
     # Single folder
-    run_pose_on_frames(frames_dir=frames, out_dir="outputs/frames_run", config=cfg)
+    run_pose_on_frames(frames_dir=frames, out_dir="outputs/frames_run", windows_csv=windows_csv, config=cfg)
 
     # Many folders
     # batch_process_folders(input_root="all_sequences", output_root="outputs", config=cfg)
