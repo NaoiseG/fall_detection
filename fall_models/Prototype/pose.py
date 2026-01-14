@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 import pandas as pd
+import torch
 
 import cv2
 import numpy as np
@@ -14,7 +15,7 @@ from ultralytics import YOLO
 
 @dataclass
 class PoseExportConfig:
-    model_path: str = "yolo11l-pose.pt"
+    model_path: str = "Prototype/yolo11l-pose.pt"
     conf_thres: float = 0.25
     fps: int = 30
     max_people: int = 1
@@ -24,16 +25,6 @@ class PoseExportConfig:
 
 
 # ----------------------------- SORTING -----------------------------
-
-def numeric_suffix_key(path: str) -> float:
-    """
-    Extract the last number from the filename and sort by it.
-    Works for: 2018-07-04T12_04_17.783869.png
-    """
-    name = os.path.splitext(os.path.basename(path))[0]
-    nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", name)
-    return float(nums[-1]) if nums else 0.0
-
 
 def frame_time_key(path: str) -> pd.Timestamp:
     return parse_frame_timestamp(path)
@@ -147,6 +138,9 @@ def run_pose_on_frames(
     num_frames = len(frame_paths)
 
     model = YOLO(config.model_path)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    print("Using device:", device)
 
     first = read_image(frame_paths[0])
     h, w = first.shape[:2]
@@ -183,8 +177,8 @@ def run_pose_on_frames(
         allow_exact_matches=True,
     )
 
-    frames_df["label"] = frames_df["label"].fillna("unknown").to_numpy()
-    frames_df["window_id"] = frames_df["window_id"].fillna(-1).astype(np.int64).to_numpy()
+    frames_df["label"] = frames_df["label"].fillna("unknown")
+    frames_df["window_id"] = frames_df["window_id"].fillna(-1).astype(np.int64)
 
     frame_labels = frames_df["label"].to_numpy()
     frame_window_ids = frames_df["window_id"].to_numpy()
@@ -288,52 +282,82 @@ def load_window_labels(csv_path: str) -> pd.DataFrame:
     out["window_id"] = np.arange(len(out), dtype=np.int64)
     return out
 
+def find_camera_folders(root: str, camera: int = 1) -> List[str]:
+    pat = os.path.join(root, "**", f"*Camera{camera}")
+    folders = [p for p in glob.glob(pat, recursive=True) if os.path.isdir(p)]
+    folders = [p for p in folders if re.search(rf"Camera{camera}$", os.path.basename(p))]
+    return folders
 
-def batch_process_folders(
-    input_root: str,
+
+def find_features_csv(trial_dir: str, features_suffix: str = "Features1&0.5.csv") -> str:
+    cands = glob.glob(os.path.join(trial_dir, f"*{features_suffix}"))
+    if not cands:
+        raise FileNotFoundError(f"No *{features_suffix} found in {trial_dir}")
+    if len(cands) > 1:
+        # usually only one; pick first but warn
+        print(f"Warning: multiple feature CSVs in {trial_dir}, using {cands[0]}")
+    return cands[0]
+
+def batch_process_upfall_tree(
+    upfall_root: str,
     output_root: str,
     config: PoseExportConfig,
-    pattern: str = "*.png"
+    camera: int = 1,
+    features_suffix: str = "Features1&0.5.csv",
+    pattern: str = "*.png",
 ) -> List[Tuple[str, str, str]]:
-    """
-    Process all subfolders under input_root that contain frames matching pattern.
-    Writes outputs to output_root/<subfolder_name>/...
-    Returns list of (folder, video_path, npz_path).
-    """
     ensure_dir(output_root)
 
-    folders = [p for p in glob.glob(os.path.join(input_root, "*")) if os.path.isdir(p)]
+    cam_folders = find_camera_folders(upfall_root, camera=camera)
     results = []
 
-    for folder in folders:
-        frames = glob.glob(os.path.join(folder, pattern))
-        if not frames:
+    for frames_dir in cam_folders:
+        trial_dir = os.path.dirname(frames_dir)  # .../TrialZ/
+        try:
+            windows_csv = find_features_csv(trial_dir, features_suffix=features_suffix)
+        except FileNotFoundError as e:
+            print(f"Skipping {frames_dir}: {e}")
             continue
 
-        name = os.path.basename(folder)
-        out_dir = os.path.join(output_root, name)
-        out_video, out_npz, _ = run_pose_on_frames(folder, out_dir, config, pattern=pattern)
-        results.append((folder, out_video, out_npz))
+        # Make a unique output folder name from the relative path
+        rel = os.path.relpath(frames_dir, upfall_root)
+        out_dir = os.path.join(output_root, rel)
+        ensure_dir(out_dir)
+
+        # Skip if already processed (resume-friendly)
+        if os.path.exists(os.path.join(out_dir, "keypoints.npz")):
+            continue
+
+        out_video, out_npz, _ = run_pose_on_frames(
+            frames_dir=frames_dir,
+            out_dir=out_dir,
+            windows_csv=windows_csv,
+            config=config,
+            pattern=pattern,
+        )
+        results.append((frames_dir, out_video, out_npz))
 
     return results
 
 
+
+
 # ----------------------------- EXAMPLE USAGE -----------------------------
 
-if __name__ == "__main__":
-    cfg = PoseExportConfig(
-        model_path="yolo11l-pose.pt",
-        conf_thres=0.25,
-        fps=30,
-        max_people=1,
-        save_csv=False
-    )
-    frames = "../../Datasets/UP-Fall/Subject1Activity1Trial1Camera1"
-    windows_csv = "../../Datasets/UP-Fall/Subject1Activity1Trial1Features1&0.5.csv"
+# if __name__ == "__main__":
+#     cfg = PoseExportConfig(
+#         model_path="yolo11l-pose.pt",
+#         conf_thres=0.25,
+#         fps=30,
+#         max_people=1,
+#         save_csv=False
+#     )
+#     frames = "../../Datasets/UP-Fall/Subject1Activity1Trial1Camera1"
+#     windows_csv = "../../Datasets/UP-Fall/Subject1Activity1Trial1Features1&0.5.csv"
 
-    # Single folder
-    run_pose_on_frames(frames_dir=frames, out_dir="outputs/frames_run", windows_csv=windows_csv, config=cfg)
+#     # Single folder
+#     run_pose_on_frames(frames_dir=frames, out_dir="outputs/frames_run", windows_csv=windows_csv, config=cfg)
 
-    # Many folders
-    # batch_process_folders(input_root="all_sequences", output_root="outputs", config=cfg)
+#     # Many folders
+#     # batch_process_folders(input_root="all_sequences", output_root="outputs", config=cfg)
 

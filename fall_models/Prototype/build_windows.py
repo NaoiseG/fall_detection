@@ -24,11 +24,15 @@ def make_window_tensors(
     kconf = data["kpts_conf"][:, person_idx]   # (N, K)
     window_ids = data["window_ids"]             # (N,)
     labels = data["frame_labels"]               # (N,)
+    labels = labels.astype(np.int64)
 
     if use_conf:
         Xf = np.concatenate([kxy, kconf[..., None]], axis=-1)  # (N, K, 3)
     else:
         Xf = kxy  # (N, K, 2)
+    
+    # Prevent NaNs
+    Xf = np.nan_to_num(Xf, nan=0.0, posinf=0.0, neginf=0.0)
 
     # group frames by window
     frames_by_window = defaultdict(list)
@@ -70,7 +74,7 @@ def make_window_tensors(
 
 if __name__ == "__main__":
     X, y, T = make_window_tensors(
-        "outputs/frames_run/keypoints.npz",
+        "../../Datasets/UPFall_keypoints/outputs_npz/Subject1/Activity8/Trial2/Subject1Activity8Trial2Camera1/keypoints.npz",
         T=None,
         use_conf=True
     )
@@ -78,3 +82,5 @@ if __name__ == "__main__":
     print("Window tensor shape:", X.shape)
     print("Frames per window:", T)
     print("Label distribution:", dict(zip(*np.unique(y, return_counts=True))))
+    print("Label datatype = ", y.dtype)   
+    print(np.unique(y))
