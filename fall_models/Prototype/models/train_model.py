@@ -7,15 +7,13 @@ from dataclasses import dataclass
 from typing import Tuple
 import argparse
 from pathlib import Path
-import glob
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from dataset import WindowTensorDataset
-from build_windows import make_window_tensors
+from dataset import WindowTensorDataset, load_windows_from_npzs, find_keypoints_npzs_subjects
 
 from .tcn.simple_tcn import TCNBaseline
 from .lstm.simple_lstm import LSTMBaseline
@@ -46,51 +44,6 @@ class TrainConfig:
 def accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
     preds = logits.argmax(dim=1)
     return (preds == y).float().mean().item()
-
-
-# ----------------------------
-# Data discovery / loading
-# ----------------------------
-
-def find_keypoints_npzs_subjects(output_root: Path, camera: int = 1, subjects=range(1, 6)):
-    """
-    Matches:
-      Subject{s}/Activity*/Trial*/Subject{s}Activity*Trial*Camera{camera}/keypoints.npz
-    """
-    npzs = []
-    for s in subjects:
-        subj_root = output_root / f"Subject{s}"
-        if not subj_root.exists():
-            continue
-
-        pat = subj_root / "Activity*" / "Trial*" / f"Subject{s}Activity*Trial*Camera{camera}" / "keypoints.npz"
-        npzs.extend(glob.glob(str(pat), recursive=True))
-
-    return sorted(npzs)
-
-
-def load_windows_from_npzs(npz_paths, T=None, use_conf: bool = True):
-    """
-    Loads multiple trial NPZs, converts each to (W, T, K, C) windows,
-    then concatenates across trials. Ensures the same T is used for all files.
-    """
-    X_all, y_all = [], []
-    T_used = T
-
-    for i, p in enumerate(npz_paths):
-        if i == 0 and T_used is None:
-            X, y, T_used = make_window_tensors(p, T=None, use_conf=use_conf)
-        else:
-            X, y, _ = make_window_tensors(p, T=T_used, use_conf=use_conf)
-
-        X_all.append(X)
-        y_all.append(y)
-
-    if not X_all:
-        raise RuntimeError("No NPZs found / no windows loaded.")
-
-    return np.concatenate(X_all, axis=0), np.concatenate(y_all, axis=0), T_used
-
 
 # ----------------------------
 # Model factory
