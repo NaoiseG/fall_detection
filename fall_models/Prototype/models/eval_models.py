@@ -121,6 +121,7 @@ def get_model(
     num_classes: int,
     device: str,
     T_used: Optional[int] = None,
+    node_features: Optional[int] = None,
 ):
     model_name = model_name.lower().strip()
 
@@ -159,7 +160,7 @@ def get_model(
     elif model_name == "gcn":
         model = GCNBaseline(
             num_nodes=17,
-            node_features=3,
+            node_features=node_features,
             num_classes=num_classes,
             hidden_size=64,
             dropout=0.1,
@@ -179,7 +180,7 @@ def get_model(
     elif model_name == "stgcn":
         model = STGCNBaseline(
             num_nodes=17,
-            node_features=3,
+            node_features=node_features,
             num_classes=num_classes,
             hidden_channels=128,
             num_blocks=4,
@@ -328,7 +329,15 @@ def main():
         required=True,
         help="Fall class ids in ORIGINAL label space (1-based). Example: --fall-class-ids 9 10 11",
     )
+    #Preprocessing options
+    parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
+    parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
+    parser.add_argument("--conf-thres", type=float, default=0.2, help="Conf threshold for missing joints.")
+    parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for interpolation.")
     args = parser.parse_args()
+
+    normalize_cli = bool(args.normalize)
+    add_vel_cli = bool(args.add_vel)
 
     model_list = [m.lower().strip() for m in args.models]
     unknown = sorted(set(model_list) - set(ALL_MODELS))
@@ -389,25 +398,54 @@ def main():
             in_features = int(ckpt["in_features"])
             num_classes = int(ckpt["num_classes"])
             use_conf_ckpt = bool(ckpt.get("use_conf", True))
-        else:
-            # old checkpoints: can't infer T_used/in_features safely for MLP
-            state = ckpt
-            use_conf_ckpt = use_conf  # fall back to CLI/default
-            # You should keep the old eval behaviour here (T=None) or block MLP.
-            T_used = None
 
-        # IMPORTANT: load windows using checkpoint metadata (if available)
-        if T_used is None:
-            X_test, y_test_tags, T_used_now = load_windows_from_npzs(test_npzs, T=None, use_conf=use_conf_ckpt)
-            T_used = T_used_now
+            normalize_ckpt = bool(ckpt.get("normalize", normalize_cli))
+            add_vel_ckpt = bool(ckpt.get("add_vel", add_vel_cli))
+            conf_thres_ckpt = float(ckpt.get("conf_thres", args.conf_thres))
+            max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
         else:
-            X_test, y_test_tags, _ = load_windows_from_npzs(test_npzs, T=T_used, use_conf=use_conf_ckpt)
+            state = ckpt
+            T_used = None
+            use_conf_ckpt = use_conf
+            normalize_ckpt = normalize_cli
+            add_vel_ckpt = add_vel_cli
+            conf_thres_ckpt = float(args.conf_thres)
+            max_interp_gap_ckpt = int(args.max_interp_gap)
+
+       # Load windows using ckpt settings
+        if T_used is None:
+            X_test, y_test_tags, T_used = load_windows_from_npzs(
+                test_npzs, T=None,
+                use_conf=use_conf_ckpt,
+                normalize=normalize_ckpt,
+                add_vel=add_vel_ckpt,
+                conf_thres=conf_thres_ckpt,
+                max_interp_gap=max_interp_gap_ckpt,
+            )
+        else:
+            X_test, y_test_tags, _ = load_windows_from_npzs(
+                test_npzs, T=T_used,
+                use_conf=use_conf_ckpt,
+                normalize=normalize_ckpt,
+                add_vel=add_vel_ckpt,
+                conf_thres=conf_thres_ckpt,
+                max_interp_gap=max_interp_gap_ckpt,
+            )
 
         print("Window length (T):", T_used)
 
         y_test = (y_test_tags.astype(int) - 1).astype(np.int64)
 
         test_ds = WindowTensorDataset(X_test, y_test)
+
+        sample_X0, _ = test_ds[0]
+        in_features_now = int(sample_X0.shape[-1])
+        if "state_dict" in ckpt and in_features_now != in_features:
+            raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
+
+        in_features_final = in_features if "state_dict" in ckpt else in_features_now
+        node_features_final = (in_features_final // 17) if (in_features_final % 17 == 0) else None
+
         test_loader = DataLoader(
             test_ds,
             batch_size=args.batch_size,
@@ -419,10 +457,11 @@ def main():
 
         model = get_model(
             m,
-            in_features=in_features if "state_dict" in ckpt else int(test_ds[0][0].shape[-1]),
+            in_features=in_features_now if "state_dict" not in ckpt else in_features,
             num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
             device=args.device,
             T_used=T_used,
+            node_features=node_features_final,
         )
 
         model.load_state_dict(state, strict=False)
