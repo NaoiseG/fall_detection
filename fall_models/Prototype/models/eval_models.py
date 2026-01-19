@@ -24,9 +24,19 @@ python -m models.eval_models --models tcn lstm gru \
 Notes:
 - Labels are mapped like training: original 1..N -> 0..N-1.
   So pass fall class ids in the ORIGINAL label space (1-based); this script shifts by -1.
+
+Choosing model weights:
+    - By default, the latest run folder under each model's checkpoint folder is used.If you pass nothing: each model uses its own latest timestamped folder
+
+    If you pass --ckpt tcn=...: only tcn is pinned, others still use latest
+
+    If you pass model=latest: explicitly forces latest for that model
 """  # noqa: E501
 
 from __future__ import annotations
+
+from datetime import datetime
+import re
 
 import argparse
 from pathlib import Path
@@ -50,6 +60,49 @@ from .gcn.simple_gcn import GCNBaseline
 from .mlp.simple_mlp import MLPBaseline
 from .stgcn.simple_stgcn import STGCNBaseline
 
+
+def slug_models(models: List[str], max_len: int = 80) -> str:
+    # safe folder component: letters, numbers, underscore and dash only
+    s = "-".join(models)
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "_", s)
+    return s[:max_len]
+
+_TS_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?$")
+
+def pick_latest_run_dir(model_dir: Path) -> Path:
+    run_dirs = [p for p in model_dir.iterdir() if p.is_dir() and _TS_DIR_RE.match(p.name)]
+    if not run_dirs:
+        raise FileNotFoundError(f"No timestamped run folders under: {model_dir.as_posix()}")
+    return sorted(run_dirs, key=lambda p: p.name)[-1]
+
+def parse_ckpt_overrides(items: Optional[List[str]]) -> Dict[str, str]:
+    """
+    Parses ['tcn=2026-...', 'lstm=latest'] -> {'tcn': '2026-...', 'lstm': 'latest'}
+    """
+    out: Dict[str, str] = {}
+    if not items:
+        return out
+    for s in items:
+        if "=" not in s:
+            raise SystemExit(f"--ckpt entries must be like model=RUNFOLDER or model=latest, got: {s}")
+        k, v = s.split("=", 1)
+        out[k.lower().strip()] = v.strip()
+    return out
+
+def resolve_run_dir(model_dir: Path, override: Optional[str]) -> Path:
+    """
+    override:
+      - None -> latest
+      - 'latest' -> latest
+      - otherwise -> model_dir/override
+    """
+    if override is None or override.lower() == "latest":
+        return pick_latest_run_dir(model_dir)
+
+    run_dir = model_dir / override
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run folder not found: {run_dir.as_posix()}")
+    return run_dir
 
 def parse_range(r: str) -> List[int]:
     a, b = r.split("-")
@@ -256,7 +309,13 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (default: 0)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--ckpt-root", type=str, default="models", help="Checkpoint root (default: models)")
-    parser.add_argument("--ckpt-subdir", type=str, default="test_run", help="Subdir under each model folder (default: test_run)")
+    parser.add_argument(
+        "--ckpt",
+        nargs="*",
+        default=None,
+        help="Optional per-model run folder overrides. Use: --ckpt tcn=2026-... lstm=latest. "
+            "If omitted for a model, latest is used.",
+    )
     parser.add_argument("--weights-name", type=str, default=None,
                         help="Override weights filename. If omitted uses '<model>_best.pt'.")
     parser.add_argument("--out-dir", type=str, default="eval_outputs", help="Output directory")
@@ -290,47 +349,81 @@ def main():
     if not test_npzs:
         raise RuntimeError("No test NPZs found. Check OUTPUT_ROOT, camera, and test subjects.")
 
-    X_test, y_test_tags, T_used = load_windows_from_npzs(test_npzs, T=None, use_conf=use_conf)
-
-    # Same label mapping as training: 1..N -> 0..N-1
-    y_test = (y_test_tags.astype(int) - 1).astype(np.int64)
-
-    test_ds = WindowTensorDataset(X_test, y_test)
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        drop_last=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-
-    sample_X, _ = test_ds[0]
-    in_features = int(sample_X.shape[-1])
-    num_classes = int(y_test.max() + 1)
-
     fall_class_ids_0based = [int(x) - 1 for x in args.fall_class_ids]
 
-    out_dir = Path(args.out_dir).resolve()
+    # One unique output folder per eval run, includes timestamp + models list
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    models_tag = slug_models(model_list)
+    base_out = Path(args.out_dir).resolve()
+
+    out_dir = base_out / f"{ts}__models_{models_tag}"
     plots_dir = out_dir / "plots"
     ensure_dir(out_dir)
     ensure_dir(plots_dir)
+
+    print("Eval output dir:", out_dir.as_posix())
 
     summary_rows: List[Dict[str, object]] = []
     f1_rows: List[Dict[str, object]] = []
 
     ckpt_root = Path(args.ckpt_root)
 
+    ckpt_overrides = parse_ckpt_overrides(args.ckpt)
+
     for m in model_list:
         weights_name = args.weights_name or f"{m}_best.pt"
-        ckpt_path = ckpt_root / m / args.ckpt_subdir / weights_name
+
+        model_dir = ckpt_root / m
+        run_dir = resolve_run_dir(model_dir, ckpt_overrides.get(m))
+        ckpt_path = run_dir / weights_name
+
+        print(f"[{m}] Using run folder: {run_dir.name}")
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Weights not found for {m}: {ckpt_path.as_posix()}")
 
-        model = get_model(m, in_features=in_features, num_classes=num_classes, device=args.device, T_used=T_used)
-        state = torch.load(ckpt_path, map_location="cpu")
-        if not isinstance(state, dict):
-            raise ValueError(f"Unexpected checkpoint format for {m} (expected state_dict dict).")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+
+        if "state_dict" in ckpt:
+            state = ckpt["state_dict"]
+            T_used = int(ckpt["T_used"])
+            in_features = int(ckpt["in_features"])
+            num_classes = int(ckpt["num_classes"])
+            use_conf_ckpt = bool(ckpt.get("use_conf", True))
+        else:
+            # old checkpoints: can't infer T_used/in_features safely for MLP
+            state = ckpt
+            use_conf_ckpt = use_conf  # fall back to CLI/default
+            # You should keep the old eval behaviour here (T=None) or block MLP.
+            T_used = None
+
+        # IMPORTANT: load windows using checkpoint metadata (if available)
+        if T_used is None:
+            X_test, y_test_tags, T_used_now = load_windows_from_npzs(test_npzs, T=None, use_conf=use_conf_ckpt)
+            T_used = T_used_now
+        else:
+            X_test, y_test_tags, _ = load_windows_from_npzs(test_npzs, T=T_used, use_conf=use_conf_ckpt)
+
+        print("Window length (T):", T_used)
+
+        y_test = (y_test_tags.astype(int) - 1).astype(np.int64)
+
+        test_ds = WindowTensorDataset(X_test, y_test)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+        model = get_model(
+            m,
+            in_features=in_features if "state_dict" in ckpt else int(test_ds[0][0].shape[-1]),
+            num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
+            device=args.device,
+            T_used=T_used,
+        )
 
         model.load_state_dict(state, strict=False)
         y_true, y_pred = predict_all(model, test_loader, device=args.device)
