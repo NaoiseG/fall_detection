@@ -186,31 +186,14 @@ def _add_velocity_channels(xy_norm: np.ndarray) -> np.ndarray:
     vel[1:] = xy_norm[1:] - xy_norm[:-1]
     return vel
 
-
-def _pad_seq(seq: np.ndarray, T: int, use_conf: bool, has_vel: bool) -> np.ndarray:
+def _add_acceleration_channels(vel: np.ndarray) -> np.ndarray:
     """
-    Pads a (L,K,C) sequence to length T.
-    Strategy:
-      - repeat last frame for xy (stable)
-      - set conf=0 on padded frames (so model knows it's padded)
-      - set vel=0 on padded frames
+    vel: (N,K,2)
+    acc[0]=0, acc[1]=0, acc[t]=vel[t]-vel[t-1]
     """
-    L, K, C = seq.shape
-    if L >= T:
-        return seq[:T]
-
-    pad_len = T - L
-    pad = np.repeat(seq[-1:, :, :], repeats=pad_len, axis=0).astype(seq.dtype, copy=False)
-
-    # conf is at channel 2 when use_conf=True and features are [x,y,conf,(vx,vy)]
-    if use_conf:
-        pad[:, :, 2] = 0.0
-    if has_vel:
-        # velocities are last two channels
-        pad[:, :, -2:] = 0.0
-
-    return np.concatenate([seq, pad], axis=0)
-
+    acc = np.zeros_like(vel, dtype=np.float32)
+    acc[2:] = vel[2:] - vel[1:-1]
+    return acc
 
 # ----------------------------
 # Window building
@@ -222,8 +205,16 @@ def load_windows_from_npzs(
     use_conf: bool = True,
     normalize: bool = True,
     add_vel: bool = True,
+    add_acc: bool = True,
+    add_global: bool = True,
     conf_thres: float = 0.2,
     max_interp_gap: int = 5,
+    stride: int = 16,
+    label_mode: str = "majority", #center or majority
+    binary_any_fall: bool = False,
+    fall_ids_0based: Optional[list[int]] = None,
+    min_valid_frac: float = 0.3,
+    add_mask_channel: bool = True,
 ):
     """
     Loads multiple trial NPZs, converts each to (W, T, K, C) windows,
@@ -240,8 +231,16 @@ def load_windows_from_npzs(
                 use_conf=use_conf,
                 normalize=normalize,
                 add_vel=add_vel,
+                add_acc=add_acc,
+                add_global=add_global,
                 conf_thres=conf_thres,
                 max_interp_gap=max_interp_gap,
+                stride=stride,
+                label_mode=label_mode,
+                binary_any_fall=binary_any_fall,
+                fall_ids_0based=fall_ids_0based,
+                min_valid_frac=min_valid_frac,
+                add_mask_channel=add_mask_channel,
             )
         else:
             X, y, _ = make_window_tensors(
@@ -250,8 +249,16 @@ def load_windows_from_npzs(
                 use_conf=use_conf,
                 normalize=normalize,
                 add_vel=add_vel,
+                add_acc=add_acc,
+                add_global=add_global,
                 conf_thres=conf_thres,
                 max_interp_gap=max_interp_gap,
+                stride=stride,
+                label_mode=label_mode,
+                binary_any_fall=binary_any_fall,
+                fall_ids_0based=fall_ids_0based,
+                min_valid_frac=min_valid_frac,
+                add_mask_channel=add_mask_channel,
             )
 
         X_all.append(X)
@@ -262,6 +269,136 @@ def load_windows_from_npzs(
 
     return np.concatenate(X_all, axis=0), np.concatenate(y_all, axis=0), int(T_used)
 
+#For sliding windows
+def _make_sliding_windows(
+    Xf: np.ndarray,          # (N, K, C)
+    labels: np.ndarray,      # (N,)
+    conf: np.ndarray,        # (N, K)  (needed for validity)
+    T: int,
+    stride: int,
+    conf_thres: float,
+    min_valid_frac: float,
+    label_mode: str,         # "center" or "majority"
+    binary_any_fall: bool,
+    fall_ids_0based: Optional[set[int]],
+    add_mask_channel: bool,
+    layout: dict
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Returns:
+      X_windows: (W, T, K, C(+1 if mask))
+      y_windows: (W,)
+      T_used: int (same T)
+    """
+    N, K, C = Xf.shape
+    stride = max(1, int(stride))
+
+    # Frame validity
+    frac_valid = (conf > conf_thres).mean(axis=1)  # (N,)
+    frame_valid = frac_valid >= float(min_valid_frac)  # (N,)
+
+    # number of windows: include last partial window
+    starts = list(range(0, max(1, N), stride))
+    X_windows = []
+    y_windows = []
+
+    for s in starts:
+        e = s + T
+        seq = Xf[s:e]                      # (L,K,C)
+        labs = labels[s:e]                 # (L,)
+        valid = frame_valid[s:e]           # (L,)
+
+        L = seq.shape[0]
+        if L < T:
+            # pad by repeating last frame (stable), but mask will mark padded steps
+            pad = np.repeat(seq[-1:, :, :], repeats=(T - L), axis=0) if L > 0 else np.zeros((T, K, C), np.float32)
+
+            if layout.get("conf_idx") is not None:
+                pad[:, :, layout["conf_idx"]] = 0.0
+            if layout.get("vel_slice") is not None:
+                pad[:, :, layout["vel_slice"]] = 0.0
+            if layout.get("acc_slice") is not None:
+                pad[:, :, layout["acc_slice"]] = 0.0
+
+            seq = np.concatenate([seq, pad], axis=0)
+            labs = np.concatenate([labs, np.full((T - L,), labs[-1] if L > 0 else 0, dtype=labs.dtype)], axis=0)
+            valid = np.concatenate([valid, np.zeros((T - L,), dtype=bool)], axis=0)
+            L = T
+
+        # Build mask: 1 only where frame_valid is True (and non-padded)
+        mask_t = valid.astype(np.float32)  # (T,)
+
+        # Label assignment
+        if binary_any_fall:
+            assert fall_ids_0based is not None
+            # only consider valid frames
+            any_fall = np.any([(int(l) in fall_ids_0based) for l, v in zip(labs, valid) if v])
+            y = 1 if any_fall else 0
+        else:
+            if label_mode == "center":
+                # pick center valid frame if possible, else nearest valid, else center raw
+                c = T // 2
+                if valid[c]:
+                    y = int(labs[c])
+                else:
+                    idxs = np.where(valid)[0]
+                    y = int(labs[idxs[len(idxs)//2]]) if idxs.size > 0 else int(labs[c])
+            else:
+                # majority vote over valid frames only
+                labs_valid = labs[valid]
+                if labs_valid.size == 0:
+                    y = int(labs[T // 2])
+                else:
+                    vals, counts = np.unique(labs_valid, return_counts=True)
+                    y = int(vals[np.argmax(counts)])
+
+        if add_mask_channel:
+            # broadcast mask to (T,K,1)
+            m = mask_t[:, None, None].repeat(K, axis=1)
+            seq = np.concatenate([seq, m], axis=-1)  # (T,K,C+1)
+
+        X_windows.append(seq)
+        y_windows.append(y)
+
+        # Stop once we can no longer start a new meaningful window
+        if s + stride >= N and s >= N - 1:
+            break
+
+    return np.stack(X_windows), np.array(y_windows, dtype=np.int64), int(T)
+
+def _global_features(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
+    """
+    xy: (N,K,2), conf: (N,K)
+    Returns g: (N, G) where G=4:
+      com_x, com_y, com_v, aspect
+    com_v = ||com[t]-com[t-1]||
+    aspect = bbox_h / (bbox_w + eps) over valid joints
+    """
+    N, K, _ = xy.shape
+    g = np.zeros((N, 4), dtype=np.float32)
+    eps = 1e-6
+
+    for t in range(N):
+        valid = conf[t] > 0.0
+        if not np.any(valid):
+            continue
+        pts = xy[t, valid]  # (M,2)
+
+        com = pts.mean(axis=0)  # (2,)
+        g[t, 0:2] = com
+
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+        w = float(mx[0] - mn[0])
+        h = float(mx[1] - mn[1])
+        g[t, 3] = h / (w + eps)
+
+    # COM speed
+    dcom = np.zeros((N, 2), dtype=np.float32)
+    dcom[1:] = g[1:, 0:2] - g[:-1, 0:2]
+    g[:, 2] = np.linalg.norm(dcom, axis=1)
+
+    return g
 
 def make_window_tensors(
     npz_path: str,
@@ -270,8 +407,16 @@ def make_window_tensors(
     person_idx: int = 0,
     normalize: bool = True,
     add_vel: bool = True,
+    add_acc: bool = True,
+    add_global: bool = True,
     conf_thres: float = 0.2,
     max_interp_gap: int = 5,
+    stride: int = 16,
+    label_mode: str = "majority",
+    binary_any_fall: bool = False,
+    fall_ids_0based: Optional[list[int]] = None,
+    min_valid_frac: float = 0.3,
+    add_mask_channel: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Converts frame-level pose data into window-level tensors.
@@ -285,73 +430,98 @@ def make_window_tensors(
 
     kxy = data["kpts_xy"][:, person_idx]       # (N, K, 2)
     kconf = data["kpts_conf"][:, person_idx]   # (N, K)
-    window_ids = data["window_ids"]            # (N,)
     labels = data["frame_labels"].astype(np.int64)  # (N,)
 
     # (1) Fill missing keypoints + keep a clean confidence mask
     xy_filled, conf_filled = _fill_and_mask_kpts(kxy, kconf, conf_thres=conf_thres, max_interp_gap=max_interp_gap)
 
-    # (2) Normalise xy (recommended for generalisation)
-    if normalize:
-        xy_used = _normalize_xy(xy_filled, conf_filled)
-    else:
-        xy_used = xy_filled.astype(np.float32, copy=False)
+    # (2) normalise
+    xy_used = _normalize_xy(xy_filled, conf_filled) if normalize else xy_filled.astype(np.float32, copy=False)
 
-    # (3) Add velocity channels (dynamics)
+    # (3) velocity
     has_vel = bool(add_vel)
     if has_vel:
-        vel = _add_velocity_channels(xy_used)  # (N,K,2)
+        vel = _add_velocity_channels(xy_used)
+    
+    #Acceleration
+    has_acc = bool(add_acc)
+    if has_acc:
+        if not has_vel:
+            raise ValueError("add_acc=True requires add_vel=True")
+        acc = _add_acceleration_channels(vel)
 
-    # Build per-frame feature tensor Xf: (N,K,C)
-    if use_conf and has_vel:
-        # [x, y, conf, vx, vy]
-        Xf = np.concatenate([xy_used, conf_filled[..., None], vel], axis=-1).astype(np.float32, copy=False)
-    elif use_conf and (not has_vel):
-        # [x, y, conf]
-        Xf = np.concatenate([xy_used, conf_filled[..., None]], axis=-1).astype(np.float32, copy=False)
-    elif (not use_conf) and has_vel:
-        # [x, y, vx, vy]
-        Xf = np.concatenate([xy_used, vel], axis=-1).astype(np.float32, copy=False)
-    else:
-        # [x, y]
-        Xf = xy_used.astype(np.float32, copy=False)
+    # Build Xf
+    parts = [xy_used]  # always (N,K,2)
 
-    # Prevent NaNs (should be none, but keep safe)
-    Xf = np.nan_to_num(Xf, nan=0.0, posinf=0.0, neginf=0.0)
+    if use_conf:
+        parts.append(conf_filled[..., None])  # (N,K,1)
 
-    # group frames by window
-    frames_by_window = defaultdict(list)
-    for i, wid in enumerate(window_ids):
-        if wid >= 0:
-            frames_by_window[int(wid)].append(i)
+    if has_vel:
+        parts.append(vel)  # (N,K,2)
 
-    lengths = [len(v) for v in frames_by_window.values()]
-    if not lengths:
-        raise RuntimeError("No valid windows found")
+    if has_acc:
+        parts.append(acc)  # (N,K,2)
 
+    if add_global:
+        g = _global_features(xy_used, conf_filled)  # (N,4)
+        gk = np.repeat(g[:, None, :], repeats=xy_used.shape[1], axis=1)  # (N,K,4)
+        parts.append(gk)
+
+    Xf = np.concatenate(parts, axis=-1).astype(np.float32, copy=False)
+
+    idx = 2
+    conf_idx = None
+    if use_conf:
+        conf_idx = idx
+        idx += 1
+
+    vel_slice = None
+    if has_vel:
+        vel_slice = slice(idx, idx + 2)
+        idx += 2
+
+    acc_slice = None
+    if has_acc:
+        acc_slice = slice(idx, idx + 2)
+        idx += 2
+
+    global_slice = None
+    if add_global:
+        global_slice = slice(idx, idx + 4)  # because _global_features returns 4
+        idx += 4
+
+    mask_idx = idx if add_mask_channel else None  # mask is appended later in sliding windows
+
+    layout = {
+        "conf_idx": conf_idx,
+        "vel_slice": vel_slice,
+        "acc_slice": acc_slice,
+        "global_slice": global_slice,
+        "mask_idx": mask_idx,
+    }
+
+    # Now build sliding windows (A/B/C)
     if T is None:
-        T = int(np.median(lengths))
-        T = max(1, T)
+        T = 64  # choose default to match the CNN+LSTM-style pipeline
 
-    X_windows = []
-    y_windows = []
+    X_windows, y_windows, T_used = _make_sliding_windows(
+        Xf=Xf,
+        labels=labels.astype(np.int64),
+        conf=conf_filled,
+        T=int(T),
+        stride=int(stride),                # you need to add stride to function signature
+        conf_thres=float(conf_thres),
+        min_valid_frac=float(min_valid_frac),
+        label_mode=str(label_mode),
+        binary_any_fall=bool(binary_any_fall),
+        fall_ids_0based=set(fall_ids_0based) if fall_ids_0based is not None else None,
+        add_mask_channel=bool(add_mask_channel),
+        layout=layout
+    )
 
-    for wid in sorted(frames_by_window.keys()):
-        idxs = frames_by_window[wid]
-        seq = Xf[idxs]  # (L,K,C)
+    return X_windows, y_windows, T_used
 
-        # majority vote label
-        labs = labels[idxs]
-        vals, counts = np.unique(labs, return_counts=True)
-        y = vals[np.argmax(counts)]
-
-        # pad or trim (padding uses last pose, conf=0, vel=0)
-        seq = _pad_seq(seq, T=T, use_conf=use_conf, has_vel=has_vel)
-
-        X_windows.append(seq)
-        y_windows.append(y)
-
-    return np.stack(X_windows), np.array(y_windows), int(T)
+    
 
 
 # ----------------------------
@@ -367,6 +537,8 @@ def make_loader(
     use_conf: bool = True,
     normalize: bool = True,
     add_vel: bool = True,
+    add_acc: bool = True,
+    add_global: bool = True,
     conf_thres: float = 0.2,
     max_interp_gap: int = 5,
 ):
@@ -381,6 +553,8 @@ def make_loader(
         use_conf=use_conf,
         normalize=normalize,
         add_vel=add_vel,
+        add_acc=add_acc,
+        add_global=add_global,
         conf_thres=conf_thres,
         max_interp_gap=max_interp_gap,
     )

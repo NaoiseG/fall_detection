@@ -21,13 +21,15 @@ from pathlib import Path
 import glob
 import time
 import csv
+from datetime import datetime
+
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from dataset import make_loader, load_windows_from_npzs, find_keypoints_npzs_subjects, WindowTensorDataset
+from dataset import load_windows_from_npzs, find_keypoints_npzs_subjects, WindowTensorDataset
 
 
 
@@ -62,7 +64,7 @@ class RunResult:
     best_val_acc: float
     best_val_loss: float
     best_epoch: int
-    final_val_acc: floatgit 
+    final_val_acc: float
     final_val_loss: float
     params_m: float
     train_seconds: float
@@ -89,6 +91,7 @@ def get_model(
     num_classes: int,
     device: str,
     T_used: Optional[int] = None,
+    node_features: Optional[int] = None,
 ):
     # strip() avoids weird CLI whitespace issues
     model_name = model_name.lower().strip()
@@ -126,9 +129,11 @@ def get_model(
         )
 
     elif model_name == "gcn":
+        if node_features is None:
+            raise ValueError("node_features must be provided for GCN.")
         model = GCNBaseline(
             num_nodes=17,
-            node_features=3,  # x,y,conf
+            node_features=node_features,
             num_classes=num_classes,
             hidden_size=64,
             dropout=0.1,
@@ -146,9 +151,11 @@ def get_model(
         )
 
     elif model_name == "stgcn":
+        if node_features is None:
+            raise ValueError("node_features must be provided for STGCN.")
         model = STGCNBaseline(
             num_nodes=17,
-            node_features=3,  # x, y, conf
+            node_features=node_features,
             num_classes=num_classes,
             hidden_channels=128,
             num_blocks=4,
@@ -224,14 +231,28 @@ def train_model_once(
     cfg: TrainConfig,
     in_features: int,
     num_classes: int,
+    use_conf: bool,
+    normalize: bool,
+    add_vel: bool,
+    add_acc: bool,
+    add_global: bool,
     T_used: int,
     train_loader: DataLoader,
     val_loader: DataLoader,
     ckpt_root: Path,
+    run_id: str,
+    conf_thres: float,
+    max_interp_gap: int,
+    stride: int,
+    label_mode: str,
+    min_valid_frac: float,
+    add_mask_channel: bool,
+    node_features: Optional[int] = None,
 ) -> RunResult:
     model_name = model_name.lower().strip()
 
-    ckpt_path = ckpt_root / model_name / "test_run" / f"{model_name}_best.pt"
+    run_dir = ckpt_root / model_name / run_id
+    ckpt_path = run_dir / f"{model_name}_best.pt"
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
     model = get_model(
@@ -240,6 +261,7 @@ def train_model_once(
         num_classes=num_classes,
         device=cfg.device,
         T_used=T_used,
+        node_features=node_features,
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -262,7 +284,24 @@ def train_model_once(
             best_va = va_acc
             best_vl = va_loss
             best_epoch = epoch
-            torch.save(model.state_dict(), ckpt_path)
+            torch.save({
+                "state_dict": model.state_dict(),
+                "in_features": in_features,
+                "num_classes": num_classes,
+                "use_conf": bool(use_conf),
+                "normalize": bool(normalize),
+                "add_vel": bool(add_vel),
+                "add_acc": bool(add_acc),
+                "add_global": bool(add_global),
+                "conf_thres": conf_thres,
+                "max_interp_gap": max_interp_gap,
+                "T_used": T_used,
+                "stride": stride,
+                "label_mode": label_mode,
+                "min_valid_frac": min_valid_frac,
+                "add_mask_channel": bool(add_mask_channel),
+                "node_features": int(node_features) if node_features is not None else None,
+            }, ckpt_path)
 
         print(
             f"{model_name.upper()} | Epoch {epoch:02d} | "
@@ -356,6 +395,9 @@ def save_results_csv(results: List[RunResult], path: Path) -> None:
 # ----------------------------
 
 if __name__ == "__main__":
+    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")  # e.g. 2026-01-19_14-03-22_123456
+    print("Run ID:", run_id)
+
     ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn"]
 
     parser = argparse.ArgumentParser(description="Train one or more models on UP-Fall windowed pose tensors.")
@@ -374,7 +416,7 @@ if __name__ == "__main__":
     parser.add_argument("--camera", type=int, default=1, help="Camera index to train on (default: 1)")
     parser.add_argument("--train-subjects", type=str, default="16-17", help="Train subject range like '1-12' or '16-17'")
     parser.add_argument("--val-subjects", type=str, default="1-1", help="Val subject range like '13-16' or '1-1'")
-    parser.add_argument("--epochs", type=int, default=20, help="Epochs per model (default: 20)")
+    parser.add_argument("--epochs", type=int, default=50, help="Epochs per model (default: 20)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64)")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay (default: 1e-4)")
@@ -384,7 +426,30 @@ if __name__ == "__main__":
         default=None,
         help="Path to save results as CSV, e.g. --save-results results/summary.csv",
     )
+    #Data preprocessing options
+    parser.add_argument("--use-conf", type=int, default=1, help="Include keypoint confidence channel (0/1).")
+    parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
+    parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
+    parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")
+    parser.add_argument("--add-global", type=int, default=1, help="Add global features (0/1).")
+    parser.add_argument("--conf-thres", type=float, default=0.2, help="Conf threshold below which joints are treated as missing.")
+    parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for linear interpolation of missing joints.")
+    parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
+    parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
+    parser.add_argument("--label-mode", type=str, default="majority", choices=["center", "majority"])
+    parser.add_argument("--min-valid-frac", type=float, default=0.3, help="Min fraction of joints above conf_thres for a frame to be valid.")
+    parser.add_argument("--add-mask-channel", type=int, default=1, help="Append mask channel (0/1).")
+    
     args = parser.parse_args()
+
+    use_conf = bool(args.use_conf)
+    normalize = bool(args.normalize)
+    add_vel = bool(args.add_vel)
+    add_acc = bool(args.add_acc)
+    if add_acc and not add_vel:
+        raise SystemExit("--add-acc 1 requires --add-vel 1 (acc is computed from vel).")
+    add_global = bool(args.add_global)
+    add_mask_channel = bool(args.add_mask_channel)
 
     # Decide which models to run
     if args.all:
@@ -429,11 +494,38 @@ if __name__ == "__main__":
     print("Val sequences:", len(val_npzs))
     print("Models to train:", model_list)
 
-    # Load windows once to get T_used and labels range (keeps behaviour identical to your old code)
-    X_train, y_train_tags, T_used = load_windows_from_npzs(train_npzs, T=None, use_conf=True)
-    X_val,   y_val_tags,   _      = load_windows_from_npzs(val_npzs,   T=T_used, use_conf=True)
+    X_train, y_train_tags, T_used = load_windows_from_npzs(
+        train_npzs,
+        T=int(args.T),
+        use_conf=use_conf,
+        normalize=normalize,
+        add_vel=add_vel,
+        add_acc=add_acc,
+        add_global=add_global,
+        conf_thres=float(args.conf_thres),
+        max_interp_gap=int(args.max_interp_gap),
+        stride=args.stride,
+        label_mode=args.label_mode,
+        min_valid_frac=args.min_valid_frac,
+        add_mask_channel=add_mask_channel,
+    )
 
-    # Multiclass: 1..11 -> 0..10
+    X_val, y_val_tags, _ = load_windows_from_npzs(
+        val_npzs,
+        T=int(T_used),
+        use_conf=use_conf,
+        normalize=normalize,
+        add_vel=add_vel,
+        add_acc=add_acc,
+        add_global=add_global,
+        conf_thres=float(args.conf_thres),
+        max_interp_gap=int(args.max_interp_gap),
+        stride=args.stride,
+        label_mode=args.label_mode,
+        min_valid_frac=args.min_valid_frac,
+        add_mask_channel=add_mask_channel,
+    )
+
     y_train = (y_train_tags.astype(int) - 1).astype(np.int64)
     y_val   = (y_val_tags.astype(int) - 1).astype(np.int64)
 
@@ -446,6 +538,11 @@ if __name__ == "__main__":
 
     sample_X, _ = train_ds[0]
     in_features = int(sample_X.shape[-1])
+
+    K = 17
+    node_features = int(in_features // K)
+    if node_features * K != in_features:
+        node_features = None
 
     cfg = TrainConfig(
         batch_size=args.batch_size,
@@ -473,8 +570,22 @@ if __name__ == "__main__":
             train_loader=train_loader,
             val_loader=val_loader,
             ckpt_root=ckpt_root,
+            run_id=run_id,
+            node_features=node_features,
+            use_conf=use_conf,
+            normalize=normalize,
+            add_vel=add_vel,
+            add_acc=add_acc,
+            add_global=add_global,
+            conf_thres=float(args.conf_thres),
+            max_interp_gap=int(args.max_interp_gap),
+            stride=int(args.stride),
+            label_mode=str(args.label_mode),
+            min_valid_frac=float(args.min_valid_frac),
+            add_mask_channel=add_mask_channel,
         )
         results.append(res)
+        
 
     # Print table
     print_results_table(results)

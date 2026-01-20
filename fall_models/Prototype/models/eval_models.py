@@ -158,6 +158,8 @@ def get_model(
         )
 
     elif model_name == "gcn":
+        if node_features is None:
+            raise ValueError("node_features is required for GCN (load from ckpt).")
         model = GCNBaseline(
             num_nodes=17,
             node_features=node_features,
@@ -178,6 +180,8 @@ def get_model(
         )
 
     elif model_name == "stgcn":
+        if node_features is None:
+            raise ValueError("node_features is required for STGCN (load from ckpt).")
         model = STGCNBaseline(
             num_nodes=17,
             node_features=node_features,
@@ -332,12 +336,22 @@ def main():
     #Preprocessing options
     parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
+    parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")
+    parser.add_argument("--add-global", type=int, default=1, help="Add global features (0/1).")
     parser.add_argument("--conf-thres", type=float, default=0.2, help="Conf threshold for missing joints.")
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for interpolation.")
+    parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
+    parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
+    parser.add_argument("--label-mode", type=str, default="majority", choices=["center", "majority"])
+    parser.add_argument("--min-valid-frac", type=float, default=0.3)
+    parser.add_argument("--add-mask-channel", type=int, default=1)
     args = parser.parse_args()
 
     normalize_cli = bool(args.normalize)
     add_vel_cli = bool(args.add_vel)
+    add_acc_cli = bool(args.add_acc)
+    add_global_cli = bool(args.add_global)
+    add_mask_channel_cli = bool(args.add_mask_channel)
 
     model_list = [m.lower().strip() for m in args.models]
     unknown = sorted(set(model_list) - set(ALL_MODELS))
@@ -401,36 +415,73 @@ def main():
 
             normalize_ckpt = bool(ckpt.get("normalize", normalize_cli))
             add_vel_ckpt = bool(ckpt.get("add_vel", add_vel_cli))
+            add_acc_ckpt = bool(ckpt.get("add_acc", add_acc_cli))
+            add_global_ckpt = bool(ckpt.get("add_global", add_global_cli))
             conf_thres_ckpt = float(ckpt.get("conf_thres", args.conf_thres))
             max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
+            T_ckpt = int(ckpt.get("T", ckpt.get("T_used", args.T)))  # support both keys
+            stride_ckpt = int(ckpt.get("stride", args.stride))
+            label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
+            min_valid_frac_ckpt = float(ckpt.get("min_valid_frac", args.min_valid_frac))
+            add_mask_channel_ckpt = bool(ckpt.get("add_mask_channel", add_mask_channel_cli))
+            node_features_ckpt = ckpt.get("node_features", None)
+            if node_features_ckpt is None and (in_features % 17 == 0):
+                node_features_ckpt = in_features // 17
+            if node_features_ckpt is not None:
+                node_features_ckpt = int(node_features_ckpt)
         else:
             state = ckpt
             T_used = None
             use_conf_ckpt = use_conf
             normalize_ckpt = normalize_cli
             add_vel_ckpt = add_vel_cli
+            add_acc_ckpt = add_acc_cli
+            add_global_ckpt = add_global_cli
             conf_thres_ckpt = float(args.conf_thres)
             max_interp_gap_ckpt = int(args.max_interp_gap)
+            T_ckpt = int(args.T)
+            stride_ckpt = int(args.stride)
+            label_mode_ckpt = str(args.label_mode)
+            min_valid_frac_ckpt = float(args.min_valid_frac)
+            add_mask_channel_ckpt = add_mask_channel_cli
+            node_features_ckpt = None
+            num_classes = int(np.max(y_test) + 1)
 
        # Load windows using ckpt settings
         if T_used is None:
-            X_test, y_test_tags, T_used = load_windows_from_npzs(
-                test_npzs, T=None,
+            X_test, y_test_tags, _T_used = load_windows_from_npzs(
+                test_npzs,
+                T=T_ckpt,                       # IMPORTANT: always pass T for sliding windows
                 use_conf=use_conf_ckpt,
                 normalize=normalize_ckpt,
                 add_vel=add_vel_ckpt,
+                add_acc=add_acc_ckpt,
+                add_global=add_global_ckpt,
                 conf_thres=conf_thres_ckpt,
                 max_interp_gap=max_interp_gap_ckpt,
+                stride=stride_ckpt,
+                label_mode=label_mode_ckpt,
+                min_valid_frac=min_valid_frac_ckpt,
+                add_mask_channel=add_mask_channel_ckpt,
             )
+            T_used = int(_T_used)
         else:
-            X_test, y_test_tags, _ = load_windows_from_npzs(
-                test_npzs, T=T_used,
+            X_test, y_test_tags, _T_used = load_windows_from_npzs(
+                test_npzs,
+                T=T_ckpt,                       # IMPORTANT: always pass T for sliding windows
                 use_conf=use_conf_ckpt,
                 normalize=normalize_ckpt,
                 add_vel=add_vel_ckpt,
+                add_acc=add_acc_ckpt,
+                add_global=add_global_ckpt,
                 conf_thres=conf_thres_ckpt,
                 max_interp_gap=max_interp_gap_ckpt,
-            )
+                stride=stride_ckpt,
+                label_mode=label_mode_ckpt,
+                min_valid_frac=min_valid_frac_ckpt,
+                add_mask_channel=add_mask_channel_ckpt,
+                )
+            T_used = int(_T_used)
 
         print("Window length (T):", T_used)
 
@@ -440,11 +491,13 @@ def main():
 
         sample_X0, _ = test_ds[0]
         in_features_now = int(sample_X0.shape[-1])
+        if node_features_ckpt is None and (in_features_now % 17 == 0):
+            node_features_ckpt = in_features_now // 17
+
         if "state_dict" in ckpt and in_features_now != in_features:
             raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
 
         in_features_final = in_features if "state_dict" in ckpt else in_features_now
-        node_features_final = (in_features_final // 17) if (in_features_final % 17 == 0) else None
 
         test_loader = DataLoader(
             test_ds,
@@ -457,11 +510,11 @@ def main():
 
         model = get_model(
             m,
-            in_features=in_features_now if "state_dict" not in ckpt else in_features,
+            in_features=in_features_final,
             num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
             device=args.device,
             T_used=T_used,
-            node_features=node_features_final,
+            node_features=node_features_ckpt,
         )
 
         model.load_state_dict(state, strict=False)
