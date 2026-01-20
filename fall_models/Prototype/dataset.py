@@ -215,6 +215,8 @@ def load_windows_from_npzs(
     fall_ids_0based: Optional[list[int]] = None,
     min_valid_frac: float = 0.3,
     add_mask_channel: bool = True,
+    drop_ambig_share: float = 0.0,
+    drop_ambig_nonfall_only: bool = True,
 ):
     """
     Loads multiple trial NPZs, converts each to (W, T, K, C) windows,
@@ -241,6 +243,8 @@ def load_windows_from_npzs(
                 fall_ids_0based=fall_ids_0based,
                 min_valid_frac=min_valid_frac,
                 add_mask_channel=add_mask_channel,
+                drop_ambig_share=drop_ambig_share,
+                drop_ambig_nonfall_only=drop_ambig_nonfall_only,
             )
         else:
             X, y, _ = make_window_tensors(
@@ -259,6 +263,8 @@ def load_windows_from_npzs(
                 fall_ids_0based=fall_ids_0based,
                 min_valid_frac=min_valid_frac,
                 add_mask_channel=add_mask_channel,
+                drop_ambig_share=drop_ambig_share,
+                drop_ambig_nonfall_only=drop_ambig_nonfall_only,
             )
 
         X_all.append(X)
@@ -282,6 +288,8 @@ def _make_sliding_windows(
     binary_any_fall: bool,
     fall_ids_0based: Optional[set[int]],
     add_mask_channel: bool,
+    drop_ambig_share: float,
+    drop_ambig_nonfall_only: bool,
     layout: dict
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
@@ -325,8 +333,28 @@ def _make_sliding_windows(
             valid = np.concatenate([valid, np.zeros((T - L,), dtype=bool)], axis=0)
             L = T
 
+
         # Build mask: 1 only where frame_valid is True (and non-padded)
         mask_t = valid.astype(np.float32)  # (T,)
+
+        # Optional: drop ambiguous windows (train-time only).
+        # Ambiguity is measured on *valid* frames only. If drop_ambig_nonfall_only is True,
+        # we only drop ambiguous windows that contain no fall frames (fall_ids_0based must be provided).
+        if drop_ambig_share and drop_ambig_share > 0.0:
+            labs_valid = labs[valid]
+            if labs_valid.size > 0:
+                vals_v, counts_v = np.unique(labs_valid, return_counts=True)
+                top_share = float(counts_v.max()) / float(labs_valid.size)
+                if top_share < float(drop_ambig_share):
+                    if bool(drop_ambig_nonfall_only) and (fall_ids_0based is not None):
+                        has_any_fall = any(int(v) in fall_ids_0based for v in labs_valid)
+                        if not has_any_fall:
+                            continue
+                    else:
+                        continue
+
+        # HARD MASK: zero all features on invalid frames so padding/low-valid frames can't leak pose.
+        seq[~valid] = 0.0
 
         # Label assignment
         if binary_any_fall:
@@ -417,6 +445,8 @@ def make_window_tensors(
     fall_ids_0based: Optional[list[int]] = None,
     min_valid_frac: float = 0.3,
     add_mask_channel: bool = True,
+    drop_ambig_share: float = 0.0,
+    drop_ambig_nonfall_only: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Converts frame-level pose data into window-level tensors.
@@ -516,6 +546,8 @@ def make_window_tensors(
         binary_any_fall=bool(binary_any_fall),
         fall_ids_0based=set(fall_ids_0based) if fall_ids_0based is not None else None,
         add_mask_channel=bool(add_mask_channel),
+        drop_ambig_share=float(drop_ambig_share),
+        drop_ambig_nonfall_only=bool(drop_ambig_nonfall_only),
         layout=layout
     )
 

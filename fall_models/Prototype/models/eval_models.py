@@ -31,7 +31,60 @@ Choosing model weights:
     If you pass --ckpt tcn=...: only tcn is pinned, others still use latest
 
     If you pass model=latest: explicitly forces latest for that model
-"""  # noqa: E501
+""" 
+# -----------------------------------------------------------------------------
+# Binary fall decision args (used for fall vs no-fall metrics)
+#
+# This eval script supports two ways to convert model outputs into a binary
+# "fall" decision:
+#
+#   --binary-mode threshold
+#     Computes P(fall) = sum of softmax probabilities over the classes listed in
+#     --fall-class-ids, then predicts fall if P(fall) >= --threshold.
+#
+#   --binary-mode argmax
+#     Uses the model's argmax class and predicts fall if that class is in
+#     --fall-class-ids. This matches the older, stricter behaviour but gives you
+#     no operating point control.
+#
+# Threshold selection:
+#   --threshold <float>
+#     Used only when --binary-mode threshold. Default is typically 0.5.
+#
+# Automatic threshold tuning (recommended):
+#   --tune-subjects <range/list>
+#     If provided, the script will run a PR-curve sweep on the tuning split and
+#     pick the threshold that maximises F_beta (see --beta). This chosen value is
+#     written to tuned_threshold in metrics_summary.csv.
+#
+#   --beta <float>
+#     Controls the recall vs precision tradeoff during tuning:
+#       beta > 1 prioritises recall (eg beta=2)
+#       beta = 1 is standard F1
+#       beta < 1 prioritises precision
+#
+# Output columns in metrics_summary.csv:
+#   binary_mode, threshold, beta, tune_subjects
+#     These record the mode and values used for the run.
+#
+#   tuned_threshold, tuned_precision_fall, tuned_recall_fall, tuned_fbeta
+#     These are only filled when --tune-subjects is used. If you see "None" in
+#     these columns then no tuning was run and the script used --threshold.
+#
+# Suggested workflow:
+#   1) Tune on validation subjects:
+#        python -m models.eval_models ... \
+#          --binary-mode threshold --beta 2 \
+#          --tune-subjects <VAL_SUBJECTS> \
+#          --fall-class-ids <FALL_CLASS_IDS>
+#
+#   2) Re-run on test subjects using the tuned threshold (no tuning):
+#        python -m models.eval_models ... \
+#          --binary-mode threshold --threshold <TUNED_THRESHOLD> \
+#          --fall-class-ids <FALL_CLASS_IDS>
+#
+# Tip: run with --help to see the exact accepted format for subject ranges/lists.
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -47,7 +100,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from sklearn.metrics import precision_recall_fscore_support, f1_score
+from sklearn.metrics import precision_recall_fscore_support, f1_score, precision_recall_curve
 
 # Same dataset pipeline as training
 from dataset import find_keypoints_npzs_subjects, load_windows_from_npzs, WindowTensorDataset
@@ -212,9 +265,52 @@ def predict_all(model: torch.nn.Module, loader: DataLoader, device: str) -> Tupl
     return np.concatenate(y_true_all), np.concatenate(y_pred_all)
 
 
+@torch.no_grad()
+def predict_probs(model: torch.nn.Module, loader: DataLoader, device: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      y_true: (N,)
+      probs:  (N,C) softmax probabilities
+    """
+    model.eval()
+    y_true_all, probs_all = [], []
+    for X, y in loader:
+        X = X.to(device)
+        y = y.to(device)
+        logits = model(X)
+        probs = torch.softmax(logits, dim=1)
+        y_true_all.append(y.detach().cpu().numpy())
+        probs_all.append(probs.detach().cpu().numpy())
+    return np.concatenate(y_true_all), np.concatenate(probs_all)
+
+
 def collapse_to_binary(y: np.ndarray, fall_class_ids_0based: List[int]) -> np.ndarray:
     fall = set(int(x) for x in fall_class_ids_0based)
     return np.array([1 if int(v) in fall else 0 for v in y], dtype=int)
+
+
+
+
+def p_fall_from_probs(probs: np.ndarray, fall_class_ids_0based: List[int]) -> np.ndarray:
+    idx = [int(i) for i in fall_class_ids_0based if 0 <= int(i) < probs.shape[1]]
+    if len(idx) == 0:
+        return np.zeros((probs.shape[0],), dtype=np.float32)
+    return probs[:, idx].sum(axis=1)
+
+
+def pick_threshold_fbeta(y_true_bin: np.ndarray, p_fall: np.ndarray, beta: float = 2.0) -> Tuple[float, float, float, float]:
+    """
+    Returns: (best_threshold, precision_at_best, recall_at_best, fbeta_at_best)
+    Uses sklearn precision_recall_curve.
+    """
+    prec, rec, th = precision_recall_curve(y_true_bin, p_fall)
+    # th has len = len(prec) - 1
+    denom = (beta * beta * prec + rec + 1e-9)
+    fbeta = (1.0 + beta * beta) * (prec * rec) / denom
+    if th.size == 0:
+        return 0.5, float(prec[-1] if prec.size else 0.0), float(rec[-1] if rec.size else 0.0), 0.0
+    best_i = int(np.nanargmax(fbeta[:-1]))
+    return float(th[best_i]), float(prec[best_i]), float(rec[best_i]), float(fbeta[best_i])
 
 
 def ensure_dir(p: Path):
@@ -333,6 +429,34 @@ def main():
         required=True,
         help="Fall class ids in ORIGINAL label space (1-based). Example: --fall-class-ids 9 10 11",
     )
+
+    # Binary decision options (deployment-style)
+    parser.add_argument(
+        "--binary-mode",
+        type=str,
+        default="threshold",
+        choices=["threshold", "argmax"],
+        help="How to form fall/no-fall decision. 'threshold' uses P(fall)=sum fall-class probs.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Fall threshold on P(fall). If omitted and --binary-mode threshold, uses --tune-subjects if provided else 0.5.",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=2.0,
+        help="Fbeta to optimise when tuning threshold (beta>1 prioritises recall).",
+    )
+    parser.add_argument(
+        "--tune-subjects",
+        type=str,
+        default=None,
+        help="Optional subject range (e.g. 13-16) to tune threshold on. Uses same preprocessing as test.",
+    )
+
     #Preprocessing options
     parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
@@ -342,7 +466,7 @@ def main():
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for interpolation.")
     parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
     parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
-    parser.add_argument("--label-mode", type=str, default="majority", choices=["center", "majority"])
+    parser.add_argument("--label-mode", type=str, default="center", choices=["center", "majority"])
     parser.add_argument("--min-valid-frac", type=float, default=0.3)
     parser.add_argument("--add-mask-channel", type=int, default=1)
     args = parser.parse_args()
@@ -445,7 +569,6 @@ def main():
             min_valid_frac_ckpt = float(args.min_valid_frac)
             add_mask_channel_ckpt = add_mask_channel_cli
             node_features_ckpt = None
-            num_classes = int(np.max(y_test) + 1)
 
        # Load windows using ckpt settings
         if T_used is None:
@@ -487,6 +610,11 @@ def main():
 
         y_test = (y_test_tags.astype(int) - 1).astype(np.int64)
 
+        # Finalise dims for no-metadata checkpoints
+        if "state_dict" not in ckpt:
+            num_classes = int(y_test.max() + 1)
+
+
         test_ds = WindowTensorDataset(X_test, y_test)
 
         sample_X0, _ = test_ds[0]
@@ -518,7 +646,10 @@ def main():
         )
 
         model.load_state_dict(state, strict=False)
-        y_true, y_pred = predict_all(model, test_loader, device=args.device)
+
+        # Multi-class predictions
+        y_true, probs_test = predict_probs(model, test_loader, device=args.device)
+        y_pred = probs_test.argmax(axis=1).astype(int)
 
         labels_present = np.unique(y_true).astype(int).tolist()
         per_class_f1 = f1_score(y_true, y_pred, labels=labels_present, average=None, zero_division=0)
@@ -528,7 +659,68 @@ def main():
             f1_rows.append({"model": m, "class_id": int(lab), "f1": float(f1v)})
 
         y_true_bin = collapse_to_binary(y_true, fall_class_ids_0based)
-        y_pred_bin = collapse_to_binary(y_pred, fall_class_ids_0based)
+
+        # Binary fall score
+        p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based)
+
+        tuned_thr = None
+        tuned_prec = None
+        tuned_rec = None
+        tuned_fbeta = None
+
+        if str(args.binary_mode).lower() == "argmax":
+            y_pred_bin = collapse_to_binary(y_pred, fall_class_ids_0based)
+            thr = None
+        else:
+            # Thresholded decision on P(fall)
+            if args.threshold is not None:
+                thr = float(args.threshold)
+            elif args.tune_subjects is not None:
+                tune_subjects = parse_range(args.tune_subjects)
+                tune_npzs = find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=tune_subjects)
+                if not tune_npzs:
+                    raise RuntimeError("No tune NPZs found. Check OUTPUT_ROOT, camera, and tune subjects.")
+
+                X_tune, y_tune_tags, _ = load_windows_from_npzs(
+                    tune_npzs,
+                    T=T_ckpt,
+                    use_conf=use_conf_ckpt,
+                    normalize=normalize_ckpt,
+                    add_vel=add_vel_ckpt,
+                    add_acc=add_acc_ckpt,
+                    add_global=add_global_ckpt,
+                    conf_thres=conf_thres_ckpt,
+                    max_interp_gap=max_interp_gap_ckpt,
+                    stride=stride_ckpt,
+                    label_mode=label_mode_ckpt,
+                    min_valid_frac=min_valid_frac_ckpt,
+                    add_mask_channel=add_mask_channel_ckpt,
+                )
+
+                y_tune = (y_tune_tags.astype(int) - 1).astype(np.int64)
+                tune_ds = WindowTensorDataset(X_tune, y_tune)
+                tune_loader = DataLoader(
+                    tune_ds,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    drop_last=False,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                )
+
+                y_tune_true, probs_tune = predict_probs(model, tune_loader, device=args.device)
+                y_tune_bin = collapse_to_binary(y_tune_true, fall_class_ids_0based)
+                p_fall_tune = p_fall_from_probs(probs_tune, fall_class_ids_0based)
+
+                thr, tuned_prec, tuned_rec, tuned_fbeta = pick_threshold_fbeta(y_tune_bin, p_fall_tune, beta=float(args.beta))
+                tuned_thr = thr
+            else:
+                thr = 0.5
+
+            y_pred_bin = (p_fall_test >= float(thr)).astype(int)
+
+        # Keep for reporting
+        chosen_thr = float(thr) if thr is not None else None
 
         pr, rc, _, _ = precision_recall_fscore_support(
             y_true_bin, y_pred_bin, labels=[0, 1], average=None, zero_division=0
@@ -539,6 +731,14 @@ def main():
             "n_samples": int(len(y_true)),
             "params_m": float(count_params_m(model)),
             "macro_f1": float(macro_f1),
+            "binary_mode": str(args.binary_mode).lower(),
+            "threshold": chosen_thr,
+            "beta": float(args.beta) if str(args.binary_mode).lower() == "threshold" else None,
+            "tune_subjects": str(args.tune_subjects) if args.tune_subjects is not None else None,
+            "tuned_threshold": tuned_thr,
+            "tuned_precision_fall": tuned_prec,
+            "tuned_recall_fall": tuned_rec,
+            "tuned_fbeta": tuned_fbeta,
             "binary_precision_avg": float(np.mean(pr)),
             "binary_sensitivity_avg": float(np.mean(rc)),
             "binary_precision_fall": float(pr[1]),

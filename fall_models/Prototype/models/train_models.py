@@ -247,6 +247,9 @@ def train_model_once(
     label_mode: str,
     min_valid_frac: float,
     add_mask_channel: bool,
+    drop_ambig_share: float,
+    drop_ambig_nonfall_only: bool,
+    fall_class_ids_raw: Optional[List[int]] = None,
     node_features: Optional[int] = None,
 ) -> RunResult:
     model_name = model_name.lower().strip()
@@ -300,6 +303,9 @@ def train_model_once(
                 "label_mode": label_mode,
                 "min_valid_frac": min_valid_frac,
                 "add_mask_channel": bool(add_mask_channel),
+                "drop_ambig_share": float(drop_ambig_share),
+                "drop_ambig_nonfall_only": bool(drop_ambig_nonfall_only),
+                "fall_class_ids_raw": list(fall_class_ids_raw) if fall_class_ids_raw is not None else None,
                 "node_features": int(node_features) if node_features is not None else None,
             }, ckpt_path)
 
@@ -416,7 +422,7 @@ if __name__ == "__main__":
     parser.add_argument("--camera", type=int, default=1, help="Camera index to train on (default: 1)")
     parser.add_argument("--train-subjects", type=str, default="16-17", help="Train subject range like '1-12' or '16-17'")
     parser.add_argument("--val-subjects", type=str, default="1-1", help="Val subject range like '13-16' or '1-1'")
-    parser.add_argument("--epochs", type=int, default=50, help="Epochs per model (default: 20)")
+    parser.add_argument("--epochs", type=int, default=20, help="Epochs per model (default: 20)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64)")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay (default: 1e-4)")
@@ -436,9 +442,15 @@ if __name__ == "__main__":
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for linear interpolation of missing joints.")
     parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
     parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
-    parser.add_argument("--label-mode", type=str, default="majority", choices=["center", "majority"])
+    parser.add_argument("--label-mode", type=str, default="center", choices=["center", "majority"])
     parser.add_argument("--min-valid-frac", type=float, default=0.3, help="Min fraction of joints above conf_thres for a frame to be valid.")
     parser.add_argument("--add-mask-channel", type=int, default=1, help="Append mask channel (0/1).")
+    parser.add_argument("--drop-ambig-share", type=float, default=0.6,
+                        help="Train-only: drop windows where top-label share < this value. 0 disables.")
+    parser.add_argument("--drop-ambig-nonfall-only", type=int, default=1,
+                        help="Train-only: if 1, only drop ambiguous windows that contain no fall frames (requires --fall-class-ids).")
+    parser.add_argument("--fall-class-ids", nargs="+", type=int, default=None,
+                        help="Fall class ids in ORIGINAL label space (1-based), used for non-fall-only ambiguity dropping / future mining. Example: --fall-class-ids 9 10 11")
     
     args = parser.parse_args()
 
@@ -450,6 +462,11 @@ if __name__ == "__main__":
         raise SystemExit("--add-acc 1 requires --add-vel 1 (acc is computed from vel).")
     add_global = bool(args.add_global)
     add_mask_channel = bool(args.add_mask_channel)
+
+    fall_class_ids_raw = None
+    if args.fall_class_ids is not None and len(args.fall_class_ids) > 0:
+        fall_class_ids_raw = [int(x) for x in args.fall_class_ids]
+
 
     # Decide which models to run
     if args.all:
@@ -508,6 +525,9 @@ if __name__ == "__main__":
         label_mode=args.label_mode,
         min_valid_frac=args.min_valid_frac,
         add_mask_channel=add_mask_channel,
+        fall_ids_0based=fall_class_ids_raw,
+        drop_ambig_share=float(args.drop_ambig_share),
+        drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
     )
 
     X_val, y_val_tags, _ = load_windows_from_npzs(
@@ -524,6 +544,9 @@ if __name__ == "__main__":
         label_mode=args.label_mode,
         min_valid_frac=args.min_valid_frac,
         add_mask_channel=add_mask_channel,
+        fall_ids_0based=fall_class_ids_raw,
+        drop_ambig_share=0.0,
+        drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
     )
 
     y_train = (y_train_tags.astype(int) - 1).astype(np.int64)
@@ -583,6 +606,9 @@ if __name__ == "__main__":
             label_mode=str(args.label_mode),
             min_valid_frac=float(args.min_valid_frac),
             add_mask_channel=add_mask_channel,
+            drop_ambig_share=float(args.drop_ambig_share),
+            drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
+            fall_class_ids_raw=fall_class_ids_raw,
         )
         results.append(res)
         
