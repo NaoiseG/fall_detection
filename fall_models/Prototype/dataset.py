@@ -213,6 +213,7 @@ def load_windows_from_npzs(
     label_mode: str = "majority", #center or majority
     binary_any_fall: bool = False,
     fall_ids_0based: Optional[list[int]] = None,
+    fall_pct: float = 0.25, #For new window labelling
     min_valid_frac: float = 0.3,
     add_mask_channel: bool = True,
     drop_ambig_share: float = 0.0,
@@ -241,6 +242,7 @@ def load_windows_from_npzs(
                 label_mode=label_mode,
                 binary_any_fall=binary_any_fall,
                 fall_ids_0based=fall_ids_0based,
+                fall_pct=fall_pct,
                 min_valid_frac=min_valid_frac,
                 add_mask_channel=add_mask_channel,
                 drop_ambig_share=drop_ambig_share,
@@ -261,6 +263,7 @@ def load_windows_from_npzs(
                 label_mode=label_mode,
                 binary_any_fall=binary_any_fall,
                 fall_ids_0based=fall_ids_0based,
+                fall_pct=fall_pct,
                 min_valid_frac=min_valid_frac,
                 add_mask_channel=add_mask_channel,
                 drop_ambig_share=drop_ambig_share,
@@ -287,6 +290,7 @@ def _make_sliding_windows(
     label_mode: str,         # "center" or "majority"
     binary_any_fall: bool,
     fall_ids_0based: Optional[set[int]],
+    fall_pct: float,
     add_mask_channel: bool,
     drop_ambig_share: float,
     drop_ambig_nonfall_only: bool,
@@ -359,26 +363,46 @@ def _make_sliding_windows(
         # Label assignment
         if binary_any_fall:
             assert fall_ids_0based is not None
-            # only consider valid frames
             any_fall = np.any([(int(l) in fall_ids_0based) for l, v in zip(labs, valid) if v])
             y = 1 if any_fall else 0
+
         else:
-            if label_mode == "center":
-                # pick center valid frame if possible, else nearest valid, else center raw
-                c = T // 2
-                if valid[c]:
-                    y = int(labs[c])
-                else:
-                    idxs = np.where(valid)[0]
-                    y = int(labs[idxs[len(idxs)//2]]) if idxs.size > 0 else int(labs[c])
+            # helper: robust center label (prefer valid center, else median valid, else raw center)
+            c = T // 2
+            if valid[c]:
+                center_y = int(labs[c])
             else:
-                # majority vote over valid frames only
+                idxs = np.where(valid)[0]
+                center_y = int(labs[idxs[len(idxs)//2]]) if idxs.size > 0 else int(labs[c])
+
+            if label_mode == "center":
+                y = center_y
+
+            elif label_mode == "majority":
                 labs_valid = labs[valid]
                 if labs_valid.size == 0:
-                    y = int(labs[T // 2])
+                    y = center_y
                 else:
                     vals, counts = np.unique(labs_valid, return_counts=True)
                     y = int(vals[np.argmax(counts)])
+
+            elif label_mode == "hybrid_center_fallpct":
+                assert fall_ids_0based is not None, "hybrid_center_fallpct requires fall_ids_0based (use --fall-class-ids)"
+                labs_valid = labs[valid]
+                if labs_valid.size == 0:
+                    y = center_y
+                else:
+                    is_fall = np.isin(labs_valid, list(fall_ids_0based))
+                    fall_share = float(is_fall.mean())
+                    if fall_share >= float(fall_pct) and np.any(is_fall):
+                        fall_labs = labs_valid[is_fall].astype(np.int64)
+                        vals, counts = np.unique(fall_labs, return_counts=True)
+                        y = int(vals[np.argmax(counts)])
+                    else:
+                        y = center_y
+
+            else:
+                raise ValueError(f"Unknown label_mode: {label_mode}")
 
         if add_mask_channel:
             # broadcast mask to (T,K,1)
@@ -443,6 +467,7 @@ def make_window_tensors(
     label_mode: str = "majority",
     binary_any_fall: bool = False,
     fall_ids_0based: Optional[list[int]] = None,
+    fall_pct: float = 0.25,
     min_valid_frac: float = 0.3,
     add_mask_channel: bool = True,
     drop_ambig_share: float = 0.0,
@@ -545,6 +570,7 @@ def make_window_tensors(
         label_mode=str(label_mode),
         binary_any_fall=bool(binary_any_fall),
         fall_ids_0based=set(fall_ids_0based) if fall_ids_0based is not None else None,
+        fall_pct=fall_pct,
         add_mask_channel=bool(add_mask_channel),
         drop_ambig_share=float(drop_ambig_share),
         drop_ambig_nonfall_only=bool(drop_ambig_nonfall_only),

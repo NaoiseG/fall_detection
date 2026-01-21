@@ -2,38 +2,29 @@
 """
 Real-time pose -> temporal action/fall inference on video.
 
-This version is updated to MATCH your NEW training pipeline:
-- confidence thresholding + short-gap interpolation for missing joints
-- per-frame skeleton normalisation (center + scale)
-- optional velocity + acceleration
-- optional global features (COM speed + aspect)
-- optional mask channel (valid-frame indicator)
+Key fixes vs your previous script:
+- CLASS_NAMES now matches your dataset (11 classes in the order shown in your screenshot)
+- Optional class-name loading from checkpoint or from a labels txt file
+- Safer fall-probability computation (auto fall-class detection if fall ids not provided)
+- Skip inference until enough valid frames exist in the T-window (prevents early "confident garbage")
+- Robust handling if model outputs logits shaped (B,T,C)
+- MLPBaseline now gets the correct T (T_final)
 
-It also fixes a bug in person selection (conf indexing) and removes hard-coded
-node_features=3 for GCN/STGCN. node_features is inferred from in_features.
-
-Run examples (from project root):
-
-  python realtime_infer.py --temporal-model tcn --ckpt-root models --ckpt-subdir <RUN_DIR> --source 0
-  python realtime_infer.py --temporal-model stgcn --ckpt-root models --ckpt-subdir <RUN_DIR> --source input.mp4 --out out.mp4 --show 0
-
-Notes:
-- If your checkpoint contains preprocessing metadata, this script will use it.
-- If not, it falls back to CLI defaults.
+Based on your uploaded script.  :contentReference[oaicite:1]{index=1}
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from collections import deque
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import numpy as np
 import torch
 import cv2
 from ultralytics import YOLO
 
-# Same model definitions as training/eval
+# Same model definitions as training/
 from models.tcn.simple_tcn import TCNBaseline
 from models.lstm.simple_lstm import LSTMBaseline
 from models.gru.simple_gru import GRUBaseline
@@ -42,408 +33,309 @@ from models.mlp.simple_mlp import MLPBaseline
 from models.stgcn.simple_stgcn import STGCNBaseline
 
 # -----------------------------
-# Labels (11 classes)
+# Labels (DEFAULT)
 # -----------------------------
-CLASS_NAMES = [
-    "Falling forward using hands",
-    "Falling forward using knees",
-    "Falling backwards",
-    "Falling sideward",
-    "Falling sitting in an empty chair",
-    "Walking",
-    "Standing",
-    "Sitting",
-    "Picking up an object",
-    "Jumping",
-    "Laying",
+# Must match the training label order.
+# Your screenshot shows these 11 classes in this order:
+CLASS_NAMES_DEFAULT = [
+    "Falling forward using hands",        # 0
+    "Falling forward using knees",        # 1
+    "Falling backwards",                  # 2
+    "Falling sideward",                   # 3
+    "Falling sitting in an empty chair",  # 4
+    "Walking",                            # 5
+    "Standing",                           # 6
+    "Sitting",                            # 7
+    "Picking up an object",               # 8
+    "Jumping",                            # 9
+    "Laying",                             # 10
 ]
 
-K = 17  # COCO-17 keypoints
+# COCO keypoint order for YOLO pose (17 joints)
+K = 17
 
-# COCO-17 skeleton edges (0-based indices)
-COCO17_SKELETON = [
+SKELETON = [
     (5, 7), (7, 9),        # left arm
     (6, 8), (8, 10),       # right arm
-    (5, 6),                # shoulders
-    (5, 11), (6, 12),      # torso
-    (11, 12),              # hips
     (11, 13), (13, 15),    # left leg
     (12, 14), (14, 16),    # right leg
-    (0, 1), (0, 2),        # nose to eyes
-    (1, 3), (2, 4),        # eyes to ears
-    (3, 5), (4, 6),        # ears to shoulders (approx)
+    (5, 6),                # shoulders
+    (11, 12),              # hips
+    (5, 11), (6, 12),      # torso sides
 ]
-
-# For normalisation helpers (COCO indices)
-L_SHOULDER, R_SHOULDER = 5, 6
-L_HIP, R_HIP = 11, 12
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
-def parse_source(source_arg: str):
-    """
-    --source can be:
-      - "0" (or other integer) for webcam index
-      - a file path
-      - a GStreamer pipeline string
-    """
-    s = str(source_arg)
-    if s.isdigit() and len(s) <= 2:
-        return int(s)
-    return s
-
-
-def pick_device(device_arg: Optional[str]):
-    if device_arg:
-        return device_arg
-    return "cuda" if torch.cuda.is_available() else "cpu"
+def pick_device(device: Optional[str]) -> str:
+    if device is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    d = device.lower()
+    if d.startswith("cuda") and not torch.cuda.is_available():
+        return "cpu"
+    return device
 
 
 def resolve_ckpt_path(args) -> Path:
     ckpt_root = Path(args.ckpt_root)
-    ckpt_subdir = Path(args.ckpt_subdir)
-    weights_name = args.weights_name.strip() if args.weights_name else ""
-    if not weights_name:
-        weights_name = f"{args.temporal_model.lower()}_best.pt"
-    return ckpt_root / ckpt_subdir / weights_name
+    run_dir = ckpt_root / args.ckpt_subdir
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run folder not found: {run_dir.as_posix()}")
+
+    weights_name = args.weights_name or f"{args.temporal_model}_best.pt"
+    ckpt_path = run_dir / weights_name
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path.as_posix()}")
+    return ckpt_path
 
 
-def overlay_text(frame, text, fps_text=None):
-    x, y = 10, 30
-    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-    if fps_text is not None:
-        cv2.putText(frame, fps_text, (x, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    return frame
+def load_class_names(num_classes: int, ckpt: object, has_meta: bool, labels_file: Optional[str]) -> List[str]:
+    """
+    Priority:
+    1) --labels-file (one label per line)
+    2) checkpoint metadata key 'class_names' or 'classes' if present
+    3) CLASS_NAMES_DEFAULT
+    """
+    # (1) CLI file
+    if labels_file:
+        p = Path(labels_file)
+        if not p.exists():
+            raise FileNotFoundError(f"--labels-file not found: {p.as_posix()}")
+        names = [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    else:
+        names = []
+
+    # (2) checkpoint
+    if not names and has_meta and isinstance(ckpt, dict):
+        for key in ("class_names", "classes", "labels"):
+            v = ckpt.get(key, None)
+            if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+                names = list(v)
+                break
+
+    # (3) default
+    if not names:
+        names = list(CLASS_NAMES_DEFAULT)
+
+    # Make length match num_classes
+    if len(names) != int(num_classes):
+        print(f"[WARN] class_names length ({len(names)}) != num_classes ({num_classes}).")
+        if len(names) > int(num_classes):
+            names = names[: int(num_classes)]
+        else:
+            # pad generic names
+            for i in range(len(names), int(num_classes)):
+                names.append(f"class_{i}")
+
+    return names
 
 
-def draw_pose(frame, kpts_xy, kpts_conf=None, conf_thres=0.2, draw_skeleton=True):
-    """Draw keypoints and optional skeleton. Skips points/edges with low conf."""
-    if kpts_xy is None:
+def infer_fall_indices(class_names: List[str]) -> List[int]:
+    """
+    Auto-detect fall classes by name. This matches your dataset:
+    first 5 are falls, but we also support name-based detection.
+    """
+    fall_idx = []
+    for i, n in enumerate(class_names):
+        s = n.lower()
+        if s.startswith("fall") or "falling" in s:
+            fall_idx.append(i)
+    return fall_idx
+
+
+def draw_hud(frame, lines, org=(10, 10), font=cv2.FONT_HERSHEY_SIMPLEX,
+             font_scale=0.7, thickness=2, pad=8, line_gap=6,
+             bg_color=(0, 0, 0), bg_alpha=0.6, text_color=(255, 255, 255)):
+    if not lines:
         return frame
 
-    h, w = frame.shape[:2]
+    x0, y0 = org
+    sizes = [cv2.getTextSize(s, font, font_scale, thickness)[0] for s in lines]
+    max_w = max(w for w, h in sizes)
+    total_h = sum(h for w, h in sizes) + line_gap * (len(lines) - 1)
 
-    def in_bounds(x, y):
-        return 0 <= x < w and 0 <= y < h
+    box_w = max_w + 2 * pad
+    box_h = total_h + 2 * pad
 
-    if draw_skeleton and kpts_xy.shape[0] >= K:
-        for a, b in COCO17_SKELETON:
-            xa, ya = kpts_xy[a]
-            xb, yb = kpts_xy[b]
-            ca = kpts_conf[a] if kpts_conf is not None else 1.0
-            cb = kpts_conf[b] if kpts_conf is not None else 1.0
-            if ca < conf_thres or cb < conf_thres:
-                continue
-            xa_i, ya_i = int(round(float(xa))), int(round(float(ya)))
-            xb_i, yb_i = int(round(float(xb))), int(round(float(yb)))
-            if in_bounds(xa_i, ya_i) and in_bounds(xb_i, yb_i):
-                cv2.line(frame, (xa_i, ya_i), (xb_i, yb_i), (0, 255, 0), 2, cv2.LINE_AA)
+    h_img, w_img = frame.shape[:2]
+    x1 = min(w_img - 1, x0 + box_w)
+    y1 = min(h_img - 1, y0 + box_h)
 
-    for i in range(min(K, kpts_xy.shape[0])):
-        x, y = kpts_xy[i]
-        c = kpts_conf[i] if kpts_conf is not None else 1.0
-        if c < conf_thres:
-            continue
-        xi, yi = int(round(float(x))), int(round(float(y)))
-        if in_bounds(xi, yi):
-            cv2.circle(frame, (xi, yi), 3, (0, 0, 255), -1, cv2.LINE_AA)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), bg_color, -1)
+    frame = cv2.addWeighted(overlay, bg_alpha, frame, 1.0 - bg_alpha, 0)
+
+    y = y0 + pad
+    for (w, h), s in zip(sizes, lines):
+        y += h
+        cv2.putText(frame, s, (x0 + pad, y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+        y += line_gap
 
     return frame
 
 
-# -----------------------------
-# Ultralytics keypoints extraction (FIXED)
-# -----------------------------
-def extract_top_person_kpts(result, max_people: int = 1):
-    """
-    Returns:
-      kpts_xy: (K,2) float32
-      kpts_conf: (K,) float32
-      found: bool
-    """
-    if result is None or getattr(result, "keypoints", None) is None:
-        return None, None, False
-
-    kps = result.keypoints
-    if kps is None or len(kps) == 0:
-        return None, None, False
-
-    if getattr(kps, "xy", None) is None or kps.xy.numel() == 0:
-        return None, None, False
-
-    # pick person with highest mean confidence
-    if getattr(kps, "conf", None) is not None and kps.conf is not None and kps.conf.numel() > 0:
-        idx = int(np.argmax(kps.conf.mean(dim=1).detach().cpu().numpy()))
-    else:
-        idx = 0
-
-    xy0 = kps.xy[idx].detach().cpu().float().numpy()  # (K,2)
-
-    if getattr(kps, "conf", None) is not None and kps.conf is not None and kps.conf.numel() > 0:
-        conf0 = kps.conf[idx].detach().cpu().float().numpy()  # (K,)
-    else:
-        conf0 = np.ones((xy0.shape[0],), dtype=np.float32)
-
-    # Ensure K=17
-    if xy0.shape[0] != K:
-        out_xy = np.zeros((K, 2), dtype=np.float32)
-        out_conf = np.zeros((K,), dtype=np.float32)
-        kk = min(K, xy0.shape[0])
-        out_xy[:kk] = xy0[:kk].astype(np.float32, copy=False)
-        out_conf[:kk] = conf0[:kk].astype(np.float32, copy=False)
-        return out_xy, out_conf, True
-
-    return xy0.astype(np.float32, copy=False), conf0.astype(np.float32, copy=False), True
+def draw_pose(frame, xy: np.ndarray, conf: np.ndarray, conf_thres: float = 0.2, draw_skeleton: bool = True):
+    for i in range(K):
+        if conf[i] > conf_thres:
+            x, y = int(xy[i, 0]), int(xy[i, 1])
+            cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
+    if draw_skeleton:
+        for a, b in SKELETON:
+            if conf[a] > conf_thres and conf[b] > conf_thres:
+                ax, ay = int(xy[a, 0]), int(xy[a, 1])
+                bx, by = int(xy[b, 0]), int(xy[b, 1])
+                cv2.line(frame, (ax, ay), (bx, by), (0, 255, 255), 2)
+    return frame
 
 
-# -----------------------------
-# Preprocessing (self-contained, mirrors dataset.py)
-# -----------------------------
-def _interp_short_gaps_1d(x: np.ndarray, valid: np.ndarray, max_gap: int) -> np.ndarray:
-    """Interpolate short gaps, hold for long gaps."""
-    N = x.shape[0]
+def _interp_1d(x: np.ndarray, mask: np.ndarray, max_gap: int) -> np.ndarray:
     out = x.copy()
-
-    idx_valid = np.where(valid)[0]
-    if idx_valid.size == 0:
-        return np.zeros_like(out)
-
-    # ffill
-    last = idx_valid[0]
-    for i in range(N):
-        if valid[i]:
-            last = i
-        out[i] = out[last]
-
-    # bfill
-    last = idx_valid[-1]
-    for i in range(N - 1, -1, -1):
-        if valid[i]:
-            last = i
-        out[i] = out[last]
-
-    # linear interpolate short gaps
-    for a, b in zip(idx_valid[:-1], idx_valid[1:]):
-        gap = b - a - 1
-        if gap <= 0:
+    n = len(x)
+    i = 0
+    while i < n:
+        if mask[i]:
+            i += 1
             continue
-        if gap <= max_gap:
-            ya, yb = out[a], out[b]
-            for j in range(1, gap + 1):
-                t = j / (gap + 1)
-                out[a + j] = (1 - t) * ya + t * yb
-
+        j = i
+        while j < n and not mask[j]:
+            j += 1
+        gap = j - i
+        left_ok = (i - 1) >= 0 and mask[i - 1]
+        right_ok = j < n and mask[j]
+        if gap <= max_gap and left_ok and right_ok:
+            x0 = out[i - 1]
+            x1 = out[j]
+            for k in range(gap):
+                t = (k + 1) / (gap + 1)
+                out[i + k] = (1 - t) * x0 + t * x1
+        i = j
     return out
 
 
-def _fill_and_mask_kpts(
-    kxy: np.ndarray, kconf: np.ndarray, conf_thres: float, max_interp_gap: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    kxy: (T,K,2), kconf: (T,K)
-    - missing if conf < conf_thres
-    - fill xy by interpolation/hold
-    - set conf=0 where missing
-    """
-    T, K_, _ = kxy.shape
-    xy = kxy.astype(np.float32, copy=True)
-    conf = kconf.astype(np.float32, copy=True)
+def _fill_and_mask_kpts(xy: np.ndarray, conf: np.ndarray, conf_thres: float, max_interp_gap: int) -> Tuple[np.ndarray, np.ndarray]:
+    T, K_, _ = xy.shape
+    xy = xy.astype(np.float32, copy=False)
+    conf = conf.astype(np.float32, copy=False)
 
-    xy = np.nan_to_num(xy, nan=0.0, posinf=0.0, neginf=0.0)
-    conf = np.nan_to_num(conf, nan=0.0, posinf=0.0, neginf=0.0)
+    valid = conf > conf_thres  # (T,K)
 
-    missing = conf < conf_thres  # (T,K)
+    xy_filled = xy.copy()
+    conf_filled = conf.copy()
+    xy_filled[~valid] = 0.0
+    conf_filled[~valid] = 0.0
 
-    for j in range(K_):
-        v = ~missing[:, j]
-        xj = xy[:, j, 0]
-        yj = xy[:, j, 1]
-        xy[:, j, 0] = _interp_short_gaps_1d(xj, v, max_gap=max_interp_gap)
-        xy[:, j, 1] = _interp_short_gaps_1d(yj, v, max_gap=max_interp_gap)
-        conf[missing[:, j], j] = 0.0
+    if max_interp_gap > 0:
+        for j in range(K_):
+            m = valid[:, j]
+            if m.sum() < 2:
+                continue
+            for c in range(2):
+                seq = xy_filled[:, j, c]
+                xy_filled[:, j, c] = _interp_1d(seq, m, max_gap=max_interp_gap)
 
-    return xy, conf
-
-
-def _frame_center_scale(xy_t: np.ndarray, conf_t: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Robust per-frame center+scale."""
-    valid = conf_t > 0.0
-
-    def safe_mid(a: int, b: int):
-        if a < xy_t.shape[0] and b < xy_t.shape[0] and valid[a] and valid[b]:
-            return 0.5 * (xy_t[a] + xy_t[b]), True
-        return np.zeros((2,), dtype=np.float32), False
-
-    center, ok = safe_mid(L_HIP, R_HIP)
-    if not ok:
-        center, ok = safe_mid(L_SHOULDER, R_SHOULDER)
-    if not ok:
-        center = xy_t[valid].mean(axis=0).astype(np.float32) if valid.any() else np.zeros((2,), np.float32)
-
-    scale = 1.0
-    if valid[L_SHOULDER] and valid[R_SHOULDER]:
-        scale = float(np.linalg.norm(xy_t[L_SHOULDER] - xy_t[R_SHOULDER]))
-    elif valid[L_HIP] and valid[R_HIP]:
-        scale = float(np.linalg.norm(xy_t[L_HIP] - xy_t[R_HIP]))
-    else:
-        sh, ok_sh = safe_mid(L_SHOULDER, R_SHOULDER)
-        hp, ok_hp = safe_mid(L_HIP, R_HIP)
-        if ok_sh and ok_hp:
-            scale = float(np.linalg.norm(sh - hp))
-
-    if not np.isfinite(scale) or scale < 1e-6:
-        scale = 1.0
-
-    return center, scale
+    return xy_filled, conf_filled
 
 
 def _normalize_xy(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
-    """Per-frame translation + scale normalisation."""
-    T, K_, _ = xy.shape
-    out = np.empty_like(xy, dtype=np.float32)
+    xy = xy.astype(np.float32, copy=False)
+    conf = conf.astype(np.float32, copy=False)
+    T = xy.shape[0]
+    out = xy.copy()
+
     for t in range(T):
-        center, scale = _frame_center_scale(xy[t], conf[t])
-        out[t] = (xy[t] - center[None, :]) / float(scale)
+        m = conf[t] > 0
+        if m.sum() == 0:
+            continue
+
+        if conf[t, 11] > 0 and conf[t, 12] > 0:
+            center = 0.5 * (xy[t, 11] + xy[t, 12])
+        else:
+            center = xy[t, m].mean(axis=0)
+
+        out[t] = out[t] - center[None, :]
+
+        scale = None
+        if (conf[t, 5] > 0 and conf[t, 6] > 0) and (conf[t, 11] > 0 and conf[t, 12] > 0):
+            sh = 0.5 * (xy[t, 5] + xy[t, 6])
+            hp = 0.5 * (xy[t, 11] + xy[t, 12])
+            scale = np.linalg.norm(sh - hp)
+        if scale is None or scale < 1e-6:
+            pts = out[t, m]
+            scale = np.sqrt((pts**2).sum(axis=1).mean())
+        if scale < 1e-6:
+            scale = 1.0
+
+        out[t] = out[t] / scale
+
     return out
 
 
-def _add_velocity_channels(xy_norm: np.ndarray) -> np.ndarray:
-    vel = np.zeros_like(xy_norm, dtype=np.float32)
-    vel[1:] = xy_norm[1:] - xy_norm[:-1]
-    return vel
+def _vel(xy: np.ndarray) -> np.ndarray:
+    v = np.zeros_like(xy, dtype=np.float32)
+    v[1:] = xy[1:] - xy[:-1]
+    return v
 
 
-def _add_acceleration_channels(vel: np.ndarray) -> np.ndarray:
-    acc = np.zeros_like(vel, dtype=np.float32)
-    acc[2:] = vel[2:] - vel[1:-1]
-    return acc
+def _acc(v: np.ndarray) -> np.ndarray:
+    a = np.zeros_like(v, dtype=np.float32)
+    a[2:] = v[2:] - v[1:-1]
+    return a
 
 
-def _global_features(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
-    """
-    Returns g: (T,4): com_x, com_y, com_speed, aspect(h/(w+eps))
-    """
-    T, K_, _ = xy.shape
-    g = np.zeros((T, 4), dtype=np.float32)
-    eps = 1e-6
+def _global_feats(xy: np.ndarray) -> np.ndarray:
+    com = xy.mean(axis=1)  # (T,2)
+    vcom = np.zeros_like(com, dtype=np.float32)
+    vcom[1:] = com[1:] - com[:-1]
 
-    for t in range(T):
-        valid = conf[t] > 0.0
-        if not np.any(valid):
-            continue
-        pts = xy[t, valid]
-        com = pts.mean(axis=0)
-        g[t, 0:2] = com
+    xmin = xy[:, :, 0].min(axis=1)
+    xmax = xy[:, :, 0].max(axis=1)
+    ymin = xy[:, :, 1].min(axis=1)
+    ymax = xy[:, :, 1].max(axis=1)
+    w = (xmax - xmin).astype(np.float32)
+    h = (ymax - ymin).astype(np.float32)
 
-        mn = pts.min(axis=0)
-        mx = pts.max(axis=0)
-        w = float(mx[0] - mn[0])
-        h = float(mx[1] - mn[1])
-        g[t, 3] = h / (w + eps)
-
-    dcom = np.zeros((T, 2), dtype=np.float32)
-    dcom[1:] = g[1:, 0:2] - g[:-1, 0:2]
-    g[:, 2] = np.linalg.norm(dcom, axis=1)
+    g = np.stack([vcom[:, 0], vcom[:, 1], w, h], axis=1).astype(np.float32)  # (T,4)
     return g
 
 
-# -----------------------------
-# Model factory (node_features-aware)
-# -----------------------------
-def get_model(
-    model_name: str,
-    in_features: int,
-    num_classes: int,
-    device: str,
-    T_used: int | None = None,
-    node_features: int | None = None,
-):
+def get_model(model_name: str, in_features: int, num_classes: int, T_for_mlp: int, node_features: Optional[int] = None) -> torch.nn.Module:
     model_name = model_name.lower().strip()
 
     if model_name == "tcn":
-        model = TCNBaseline(
-            in_features=in_features,
-            num_classes=num_classes,
-            hidden_channels=128,
-            num_blocks=4,
-            kernel_size=3,
-            dropout=0.1,
-        )
+        model = TCNBaseline(in_features=in_features, num_classes=num_classes, hidden_channels=128, num_blocks=4, kernel_size=3, dropout=0.1)
 
     elif model_name == "lstm":
-        model = LSTMBaseline(
-            in_features=in_features,
-            num_classes=num_classes,
-            hidden_size=128,
-            num_layers=2,
-            dropout=0.1,
-            bidirectional=False,
-            pool="last",
-        )
+        model = LSTMBaseline(in_features=in_features, num_classes=num_classes, hidden_size=128, num_layers=2, dropout=0.1, bidirectional=False, pool="last")
 
     elif model_name == "gru":
-        model = GRUBaseline(
-            in_features=in_features,
-            num_classes=num_classes,
-            hidden_size=128,
-            num_layers=2,
-            dropout=0.1,
-            bidirectional=False,
-            pool="last",
-        )
+        model = GRUBaseline(in_features=in_features, num_classes=num_classes, hidden_size=128, num_layers=2, dropout=0.1, bidirectional=False, pool="last")
 
     elif model_name == "gcn":
         if node_features is None:
             raise ValueError("node_features must be provided for GCN.")
-        model = GCNBaseline(
-            num_nodes=17,
-            node_features=node_features,
-            num_classes=num_classes,
-            hidden_size=64,
-            dropout=0.1,
-        )
+        model = GCNBaseline(num_nodes=17, node_features=node_features, num_classes=num_classes, hidden_size=64, dropout=0.1)
 
     elif model_name == "mlp":
-        if T_used is None:
-            raise ValueError("T_used must be provided for MLP.")
-        model = MLPBaseline(
-            T=T_used,
-            in_features=in_features,
-            num_classes=num_classes,
-            hidden_sizes=(256, 128),
-            dropout=0.2,
-        )
+        model = MLPBaseline(T=int(T_for_mlp), in_features=in_features, num_classes=num_classes, hidden_sizes=(256, 128), dropout=0.2)
 
     elif model_name == "stgcn":
         if node_features is None:
             raise ValueError("node_features must be provided for STGCN.")
-        model = STGCNBaseline(
-            num_nodes=17,
-            node_features=node_features,
-            num_classes=num_classes,
-            hidden_channels=128,
-            num_blocks=4,
-            t_kernel=9,
-            dropout=0.1,
-        )
+        model = STGCNBaseline(num_nodes=17, node_features=node_features, num_classes=num_classes, hidden_channels=128, num_blocks=4, t_kernel=9, dropout=0.1)
 
     else:
-        raise ValueError(f"Unknown model '{model_name}'.")
+        raise ValueError(f"Unknown temporal model: {model_name}")
 
-    return model.to(device)
+    return model
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     import argparse
     import time
 
     parser = argparse.ArgumentParser(description="Real-time pose->temporal inference with overlay + video writing.")
-    parser.add_argument("--source", type=str, default="0", help="Webcam index (e.g. 0) or video file path or gstreamer string.")
+    parser.add_argument("--source", type=str, default="0", help='Webcam index (e.g. 0) or video file path.')
     parser.add_argument("--yolo-weights", type=str, default="yolo11l-pose.pt", help="Ultralytics YOLO pose weights.")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size.")
     parser.add_argument("--conf-thres", type=float, default=0.25, help="YOLO confidence threshold.")
@@ -454,58 +346,66 @@ def main():
 
     parser.add_argument("--temporal-model", type=str, required=True, choices=["tcn", "lstm", "gru", "gcn", "mlp", "stgcn"])
     parser.add_argument("--ckpt-root", type=str, default="models")
-    parser.add_argument("--ckpt-subdir", type=str, required=True, help="Timestamped run folder, e.g. 2026-01-20_13-34-50_401623")
-    parser.add_argument("--weights-name", type=str, default=None, help='Override checkpoint filename, else "{temporal_model}_best.pt".')
+    parser.add_argument("--ckpt-subdir", type=str, required=True)
+    parser.add_argument("--weights-name", type=str, default=None)
 
-    # Set default to 0 so ckpt T is used by default
+    parser.add_argument("--labels-file", type=str, default=None, help="Optional: path to a txt file with one class name per line.")
+
     parser.add_argument("--T", type=int, default=0, help="Window length. 0 => use checkpoint T/T_used if present.")
     parser.add_argument("--stride", type=int, default=1, help="Run temporal inference every N frames once buffer full.")
 
-    parser.add_argument("--out", type=str, default="annotated.mp4", help="Output video path.")
-    parser.add_argument("--show", type=int, default=1, help="Show live preview window (0/1).")
+    # If you don't pass fall ids, we'll try to auto-detect fall classes by name.
+    parser.add_argument("--fall-class-ids", nargs="+", type=int, default=None,
+                        help="Fall class ids in ORIGINAL label space (1-based). Example: --fall-class-ids 1 2 3 4 5")
 
-    # If ckpt has no metadata, these are the fallback defaults
-    parser.add_argument("--fallback-use-conf", type=int, default=1, help="Fallback: include conf channel if ckpt lacks metadata.")
-    parser.add_argument("--fallback-normalize", type=int, default=1, help="Fallback: normalise pose per frame if ckpt lacks metadata.")
-    parser.add_argument("--fallback-add-vel", type=int, default=1, help="Fallback: add velocity channels if ckpt lacks metadata.")
-    parser.add_argument("--fallback-add-acc", type=int, default=1, help="Fallback: add acceleration channels if ckpt lacks metadata.")
-    parser.add_argument("--fallback-add-global", type=int, default=1, help="Fallback: add global features if ckpt lacks metadata.")
-    parser.add_argument("--fallback-add-mask", type=int, default=1, help="Fallback: add mask channel if ckpt lacks metadata.")
-    parser.add_argument("--fallback-conf-thres", type=float, default=0.2, help="Fallback: conf threshold for missing joints.")
-    parser.add_argument("--fallback-max-interp-gap", type=int, default=5, help="Fallback: max gap for interpolation.")
-    parser.add_argument("--fallback-min-valid-frac", type=float, default=0.3, help="Fallback: valid-frame threshold (fraction joints above conf).")
+    parser.add_argument("--fall-threshold", type=float, default=0.5)
+    parser.add_argument("--debounce-consecutive", type=int, default=2)
+    parser.add_argument("--debounce-m", type=int, default=3)
+    parser.add_argument("--debounce-n", type=int, default=2)
+
+    parser.add_argument("--min-window-valid", type=float, default=0.5,
+                        help="Skip inference until at least this fraction of frames in the window are valid (0..1). Helps stop early bogus predictions.")
+
+    parser.add_argument("--out", type=str, default="annotated.mp4")
+    parser.add_argument("--show", type=int, default=1)
+    parser.add_argument("--debug", type=int, default=0, help="Enable debug prints (0/1).")
+
+    # Fallback preprocessing flags if ckpt lacks metadata
+    parser.add_argument("--fallback-use-conf", type=int, default=1)
+    parser.add_argument("--fallback-normalize", type=int, default=1)
+    parser.add_argument("--fallback-add-vel", type=int, default=1)
+    parser.add_argument("--fallback-add-acc", type=int, default=1)
+    parser.add_argument("--fallback-add-global", type=int, default=1)
+    parser.add_argument("--fallback-add-mask", type=int, default=1)
+    parser.add_argument("--fallback-conf-thres", type=float, default=0.2)
+    parser.add_argument("--fallback-max-interp-gap", type=int, default=5)
+    parser.add_argument("--fallback-min-valid-frac", type=float, default=0.3)
+
+    parser.add_argument("--pred-align", type=str, default="auto", choices=["auto", "end", "center"])
+    parser.add_argument("--hud-scale", type=float, default=0.7)
+    parser.add_argument("--hud-pos", type=str, default="top", choices=["top", "bottom"])
 
     args = parser.parse_args()
 
     device = pick_device(args.device)
     args.device = device
 
-    # Load YOLO pose model
     pose_model = YOLO(args.yolo_weights)
 
-    # Load checkpoint
     ckpt_path = resolve_ckpt_path(args)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-
+    print("Loading temporal model checkpoint from:", ckpt_path.as_posix())
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
     has_meta = isinstance(ckpt, dict) and ("state_dict" in ckpt)
     state = ckpt["state_dict"] if has_meta else ckpt
 
-    # ---- Read metadata (or fallback) ----
-    # window length
-    if has_meta:
-        T_ckpt = int(ckpt.get("T", ckpt.get("T_used", 0)) or 0)
-    else:
-        T_ckpt = 0
-    T_final = int(args.T) if int(args.T) > 0 else (T_ckpt if T_ckpt > 0 else 64)
-
-    # preprocessing flags
     def _b(key: str, fallback: bool) -> bool:
-        if has_meta:
-            return bool(ckpt.get(key, fallback))
-        return fallback
+        return bool(ckpt.get(key, fallback)) if has_meta else bool(fallback)
+
+    if int(args.T) > 0:
+        T_final = int(args.T)
+    else:
+        T_final = int(ckpt.get("T", ckpt.get("T_used", 64))) if has_meta else 64
 
     use_conf_final = _b("use_conf", bool(args.fallback_use_conf))
     normalize_final = _b("normalize", bool(args.fallback_normalize))
@@ -514,104 +414,134 @@ def main():
     add_global_final = _b("add_global", bool(args.fallback_add_global))
     add_mask_final = _b("add_mask_channel", bool(args.fallback_add_mask))
 
+    # -----------------------------
+    # Prediction-to-frame alignment
+    # -----------------------------
+    # The temporal model consumes a causal window ending at the current frame index.
+    # We must decide which frame inside that window the prediction should be displayed on.
+    #
+    # - align_mode='end'    : prediction is for the window end (frame t), i.e. clip ending at t
+    # - align_mode='center' : prediction is for the window center (frame t - T/2)
+    #
+    # For 'center', we delay display by label_offset frames so that when we show frame i
+    # we have already processed up to i+label_offset and computed its prediction.
+    label_mode_ckpt = str(ckpt.get("label_mode", "end")) if has_meta else "end"
+    if args.pred_align == "end":
+        align_mode = "end"
+    elif args.pred_align == "center":
+        align_mode = "center"
+    else:
+        align_mode = "center" if label_mode_ckpt in ("center", "hybrid_center_fallpct") else "end"
+
+    label_offset = 0 if align_mode == "end" else (T_final // 2)
+    display_delay = int(label_offset)
     conf_thres_final = float(ckpt.get("conf_thres", args.fallback_conf_thres)) if has_meta else float(args.fallback_conf_thres)
     max_interp_gap_final = int(ckpt.get("max_interp_gap", args.fallback_max_interp_gap)) if has_meta else int(args.fallback_max_interp_gap)
     min_valid_frac_final = float(ckpt.get("min_valid_frac", args.fallback_min_valid_frac)) if has_meta else float(args.fallback_min_valid_frac)
 
     if add_acc_final and not add_vel_final:
-        raise RuntimeError("add_acc=True requires add_vel=True (acc is computed from vel).")
+        raise RuntimeError("add_acc=True requires add_vel=True.")
 
-    # model dims
     if has_meta:
         in_features_final = int(ckpt["in_features"])
         num_classes_final = int(ckpt["num_classes"])
     else:
-        # infer layout if no metadata
         cj = 2
-        if use_conf_final:
-            cj += 1
-        if add_vel_final:
-            cj += 2
-        if add_acc_final:
-            cj += 2
-        if add_global_final:
-            cj += 4
-        if add_mask_final:
-            cj += 1
+        if use_conf_final: cj += 1
+        if add_vel_final: cj += 2
+        if add_acc_final: cj += 2
+        if add_global_final: cj += 4
+        if add_mask_final: cj += 1
         in_features_final = int(K * cj)
         num_classes_final = 11
 
+    # Load class names in the right order
+    CLASS_NAMES = load_class_names(num_classes_final, ckpt, has_meta, args.labels_file)
+
+    # Fall indices
+    if args.fall_class_ids:
+        fall_ids_0based = [(int(x) - 1) for x in args.fall_class_ids]
+        fall_idx = [i for i in fall_ids_0based if 0 <= int(i) < int(num_classes_final)]
+        if len(fall_idx) == 0:
+            print("[WARN] --fall-class-ids provided but none are within [1..num_classes]. Disabling P(fall).")
+    else:
+        fall_idx = infer_fall_indices(CLASS_NAMES)
+
+    fall_hist = deque(maxlen=max(1, int(args.debounce_m)))
+    fall_consec = 0
+    last_p_fall: Optional[float] = None
+    last_debounced: Optional[bool] = None
+
     node_features_final = int(in_features_final // 17) if (in_features_final % 17 == 0) else None
 
-    # Instantiate and load model
     model = get_model(
         args.temporal_model,
         in_features=in_features_final,
         num_classes=num_classes_final,
-        device=args.device,
-        T_used=T_final,
+        T_for_mlp=T_final,
         node_features=node_features_final,
     )
     model.load_state_dict(state, strict=False)
     model.eval()
+    model = model.to(device)
 
-    # Optional half precision (CUDA only)
-    use_half = bool(args.half) and str(device).startswith("cuda")
+    use_half = (int(args.half) == 1) and ("cuda" in device)
     if use_half:
         model = model.half()
 
-    # Video capture
-    source = parse_source(args.source)
-    if isinstance(source, str) and ("!" in source or source.strip().startswith("gst-")):
-        cap = cv2.VideoCapture(source, cv2.CAP_GSTREAMER)
-    else:
-        cap = cv2.VideoCapture(source)
+    # Warm up the temporal model once to avoid a slow first prediction (CUDA kernel/JIT init).
+    try:
+        with torch.no_grad():
+            dummy = torch.zeros((1, T_final, in_features_final), device=device)
+            dummy = dummy.half() if use_half else dummy.float()
+            _ = model(dummy)
+    except Exception as e:
+        print(f"[WARN] temporal-model warmup failed (continuing): {e}")
 
+    src = args.source
+    if src.isdigit():
+        src = int(src)
+
+    cap = cv2.VideoCapture(src)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video source: {args.source}")
+        raise RuntimeError(f"Could not open source: {args.source}")
 
-    # infer fps/size
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     src_fps = cap.get(cv2.CAP_PROP_FPS)
-    if src_fps is None or src_fps <= 1e-3 or np.isnan(src_fps):
+    if src_fps is None or src_fps <= 1e-3:
         src_fps = 30.0
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    if width <= 0 or height <= 0:
-        ok, fr = cap.read()
-        if not ok:
-            raise RuntimeError("Could not read initial frame to infer video size.")
-        height, width = fr.shape[:2]
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-    # writer
-    out_path = str(args.out)
+    out_path = str(Path(args.out))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, float(src_fps), (width, height))
     if not writer.isOpened():
         raise RuntimeError(f"Could not open VideoWriter: {out_path}")
 
-    # Buffers store RAW xy/conf so we can compute vel/acc/global/mask over sequence
-    xy_buf = deque(maxlen=T_final)    # each (K,2)
-    cf_buf = deque(maxlen=T_final)    # each (K,)
+    xy_buf = deque(maxlen=T_final)
+    cf_buf = deque(maxlen=T_final)
 
-    # prediction persistence
-    last_pred_idx = None
-    last_pred_conf = 0.0
+    # Frames are buffered so we can display them with the correct aligned prediction.
+    # Each entry: (frame_idx, frame_bgr, found, kpts_xy, kpts_conf)
+    display_q = deque()
 
-    # fps smoothing
+    # Cache predictions by the frame index they should be displayed on.
+    # Value: (pred_idx, pred_conf, p_fall, debounced)
+    pred_cache = {}
+    last_pred = None  # fallback when a frame has no cached prediction (eg. stride > 1)
+
+    # During startup we temporarily ignore --stride until we have a prediction for the first displayable frame.
+    startup_ready = False
+
     fps_ema = None
     ema_alpha = 0.1
     t_prev = time.perf_counter()
-
     frame_idx = 0
     stride = max(1, int(args.stride))
 
-    # zeros for missing frames
     xy_zeros = np.zeros((K, 2), dtype=np.float32)
     cf_zeros = np.zeros((K,), dtype=np.float32)
 
-    # For debug overlay: show what preprocessing is active
     preproc_tag = []
     preproc_tag.append("conf" if use_conf_final else "no-conf")
     preproc_tag.append("norm" if normalize_final else "no-norm")
@@ -621,130 +551,290 @@ def main():
     preproc_tag.append("mask" if add_mask_final else "no-mask")
     preproc_str = ",".join(preproc_tag)
 
+    # Optional lightweight logging to validate timing/alignment.
+    # With --debug, we print (occasionally) the displayed frame index and the index the prediction was produced from.
+    def _stack_left_pad(buf: deque, T: int, pad: np.ndarray) -> np.ndarray:
+        """Return a (T, ...) array built from buf, left-padding with the oldest element if needed."""
+        if len(buf) == 0:
+            return np.stack([pad] * T, axis=0)
+        if len(buf) >= T:
+            return np.stack(list(buf)[-T:], axis=0)
+        pad_elem = buf[0]
+        pads = [pad_elem] * (T - len(buf))
+        return np.stack(pads + list(buf), axis=0)
+
+    def _run_temporal_infer(end_idx: int, warmup: bool):
+        """Run temporal inference on a window ending at end_idx (current frame index)."""
+        nonlocal fall_consec, last_p_fall, last_debounced
+
+        # Build (T,K,2) and (T,K) sequences. If we're still warming up (<T frames seen),
+        # left-pad with the oldest available frame to avoid 'no prediction' on startup.
+        xy_seq = _stack_left_pad(xy_buf, T_final, xy_zeros)
+        cf_seq = _stack_left_pad(cf_buf, T_final, cf_zeros)
+
+        xy_filled, cf_filled = _fill_and_mask_kpts(
+            xy_seq, cf_seq,
+            conf_thres=conf_thres_final,
+            max_interp_gap=max_interp_gap_final,
+        )
+
+        xy_used = _normalize_xy(xy_filled, cf_filled) if normalize_final else xy_filled.astype(np.float32, copy=False)
+
+        feats = [xy_used]
+        if use_conf_final:
+            feats.append(cf_filled[..., None])
+
+        if add_vel_final:
+            v = _vel(xy_used)
+            feats.append(v)
+
+        if add_acc_final:
+            v = _vel(xy_used)
+            a = _acc(v)
+            feats.append(a)
+
+        if add_global_final:
+            g = _global_feats(xy_used)
+            gk = np.repeat(g[:, None, :], repeats=K, axis=1)
+            feats.append(gk)
+
+        Xf = np.concatenate(feats, axis=-1).astype(np.float32, copy=False)
+
+        frac_valid = (cf_filled > conf_thres_final).mean(axis=1)  # (T,)
+        frame_valid = (frac_valid >= min_valid_frac_final).astype(np.float32)  # (T,)
+
+        # If we're still warming up, don't suppress inference (user wants predictions from frame 0).
+        min_window_valid_eff = 0.0 if warmup else float(args.min_window_valid)
+        window_valid_ratio = float(frame_valid.mean())
+        if window_valid_ratio < min_window_valid_eff:
+            return None
+
+        Xf = Xf * frame_valid[:, None, None]
+
+        if add_mask_final:
+            m = np.repeat(frame_valid[:, None, None], repeats=K, axis=1)
+            Xf = np.concatenate([Xf, m], axis=-1)
+
+        window = Xf.reshape(T_final, -1)
+        if window.shape[1] != in_features_final:
+            return None
+
+        X = torch.from_numpy(window).unsqueeze(0).to(device)
+        X = X.half() if use_half else X.float()
+
+        with torch.no_grad():
+            logits = model(X)
+
+            # Robust: if logits is (B,T,C), pool over T
+            if logits.ndim == 3:
+                logits = logits.mean(dim=1)
+
+            probs = torch.softmax(logits, dim=1)
+            pred_idx = int(probs.argmax(dim=1).item())
+            pred_conf = float(probs.max(dim=1).values.item())
+
+            p_fall = None
+            debounced = None
+            if len(fall_idx) > 0:
+                p_fall = float(probs[0, fall_idx].sum().item())
+                is_fall = (p_fall >= float(args.fall_threshold))
+
+                fall_hist.append(1 if is_fall else 0)
+                fall_consec = (fall_consec + 1) if is_fall else 0
+
+                debounced_now = False
+                if int(args.debounce_consecutive) > 1 and fall_consec >= int(args.debounce_consecutive):
+                    debounced_now = True
+                if int(args.debounce_n) > 0 and sum(fall_hist) >= int(args.debounce_n):
+                    debounced_now = True
+
+                last_p_fall = p_fall
+                last_debounced = bool(debounced_now)
+                debounced = bool(debounced_now)
+            else:
+                last_p_fall = None
+                last_debounced = None
+
+        return (pred_idx, pred_conf, p_fall, debounced)
+
+    stop = False
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        # YOLO pose inference
         results = pose_model.predict(
             source=frame,
             imgsz=int(args.imgsz),
             conf=float(args.conf_thres),
             verbose=False,
-            max_det=int(args.max_people),
-            device=0 if str(device).startswith("cuda") else "cpu",
+            device=device,
+            half=use_half,
         )
-        res0 = results[0] if isinstance(results, (list, tuple)) and len(results) > 0 else results
 
-        kpts_xy, kpts_conf, found = extract_top_person_kpts(res0, max_people=int(args.max_people))
+        found = False
+        kpts_xy = xy_zeros
+        kpts_conf = cf_zeros
 
-        if found:
-            # keep raw xy/conf for window-level preprocessing
-            xy_buf.append(np.nan_to_num(kpts_xy, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False))
-            cf_buf.append(np.nan_to_num(kpts_conf, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False))
-        else:
-            xy_buf.append(xy_zeros)
-            cf_buf.append(cf_zeros)
+        if results and len(results) > 0 and results[0].keypoints is not None:
+            kpts = results[0].keypoints
+            xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
+            cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
 
-        # Temporal inference
-        if len(xy_buf) == T_final and (frame_idx % stride == 0):
-            xy_seq = np.stack(xy_buf, axis=0)   # (T,K,2)
-            cf_seq = np.stack(cf_buf, axis=0)   # (T,K)
+            if xy_all.ndim == 3 and xy_all.shape[0] > 0:
+                scores = cf_all.sum(axis=1)
+                best = int(np.argmax(scores))
+                kpts_xy = xy_all[best].astype(np.float32)
+                kpts_conf = cf_all[best].astype(np.float32)
+                found = True
 
-            # (1) fill/mask
-            xy_filled, cf_filled = _fill_and_mask_kpts(
-                xy_seq, cf_seq,
-                conf_thres=conf_thres_final,
-                max_interp_gap=max_interp_gap_final,
-            )
+        # Append for later display (we may delay display for alignment).
+        display_q.append((frame_idx, frame.copy(), found, kpts_xy.copy(), kpts_conf.copy()))
 
-            # (2) normalize
-            xy_used = _normalize_xy(xy_filled, cf_filled) if normalize_final else xy_filled.astype(np.float32, copy=False)
+        # Append to temporal buffers (causal: window ends at current frame_idx).
+        xy_buf.append(kpts_xy if found else xy_zeros)
+        cf_buf.append(kpts_conf if found else cf_zeros)
 
-            feats = [xy_used]  # (T,K,2)
+        warmup = (len(xy_buf) < T_final)
 
-            # conf channel
-            if use_conf_final:
-                feats.append(cf_filled[..., None])  # (T,K,1)
+        # Inference scheduling:
+        # - During startup, force inference each frame until we have a prediction for the first displayable frame.
+        # - After startup, follow --stride (run every N frames).
+        force_infer = not startup_ready
+        do_infer = force_infer or (frame_idx % stride == 0) or (frame_idx == 0)
+        if do_infer:
+            pred = _run_temporal_infer(end_idx=frame_idx, warmup=warmup)
+            if pred is not None:
+                pred_idx, pred_conf, p_fall, debounced = pred
+                target_idx = int(frame_idx) if align_mode == "end" else int(frame_idx - label_offset)
+                if target_idx < 0:
+                    target_idx = 0
+                pred_cache[target_idx] = pred
+                last_pred = pred
 
-            # vel / acc
-            vel = None
-            if add_vel_final:
-                vel = _add_velocity_channels(xy_used)  # (T,K,2)
-                feats.append(vel)
-            if add_acc_final:
-                acc = _add_acceleration_channels(vel)  # (T,K,2)
-                feats.append(acc)
-
-            # global
-            if add_global_final:
-                g = _global_features(xy_used, cf_filled)  # (T,4)
-                gk = np.repeat(g[:, None, :], repeats=K, axis=1)  # (T,K,4)
-                feats.append(gk)
-
-            Xf = np.concatenate(feats, axis=-1).astype(np.float32, copy=False)  # (T,K,Cj)
-
-            # mask channel (valid frame)
-            if add_mask_final:
-                frac_valid = (cf_filled > conf_thres_final).mean(axis=1)  # (T,)
-                frame_valid = (frac_valid >= min_valid_frac_final).astype(np.float32)  # (T,)
-                m = np.repeat(frame_valid[:, None, None], repeats=K, axis=1)  # (T,K,1)
-                Xf = np.concatenate([Xf, m], axis=-1)  # (T,K,Cj+1)
-
-            window = Xf.reshape(T_final, -1)  # (T, F)
-
-            # Safety: feature size should match model expectation
-            if window.shape[1] != in_features_final:
-                # Don’t crash mid-run: keep last prediction and show mismatch
-                last_pred_idx = None
-                last_pred_conf = 0.0
-            else:
-                X = torch.from_numpy(window).unsqueeze(0).to(device)  # (1,T,F)
-                X = X.half() if use_half else X.float()
-
-                with torch.no_grad():
-                    logits = model(X)
-                    probs = torch.softmax(logits, dim=1)
-                    pred_idx = int(probs.argmax(dim=1).item())
-                    pred_conf = float(probs.max(dim=1).values.item())
-
-                last_pred_idx = pred_idx
-                last_pred_conf = pred_conf
-
-        # Overlay pose
-        if found:
-            frame = draw_pose(frame, kpts_xy, kpts_conf, conf_thres=0.2, draw_skeleton=True)
-
-        # FPS estimate
+        # FPS estimate (processing FPS)
         t_now = time.perf_counter()
         dt = max(1e-6, t_now - t_prev)
         inst_fps = 1.0 / dt
         t_prev = t_now
         fps_ema = inst_fps if fps_ema is None else (ema_alpha * inst_fps + (1 - ema_alpha) * fps_ema)
 
-        # Text overlay
-        if last_pred_idx is not None and 0 <= int(last_pred_idx) < len(CLASS_NAMES):
-            label = CLASS_NAMES[int(last_pred_idx)]
-            text = f"{label} (p={last_pred_conf:.2f})"
-        elif len(xy_buf) < T_final:
-            text = f"Buffering... ({len(xy_buf)}/{T_final})"
+        # Decide when we can start emitting frames: we want predictions available from the first displayed frame.
+        if not startup_ready and len(display_q) > display_delay:
+            first_idx = int(display_q[0][0])
+            # In end-mode we also accept last_pred (because it targets the same frame index),
+            # but in center-mode we require a cached prediction for that frame to avoid 'future labels on past frames'.
+            if align_mode == "end":
+                startup_ready = (first_idx in pred_cache) or (first_idx == frame_idx and last_pred is not None)
+            else:
+                startup_ready = (first_idx in pred_cache)
+
+        # Safety: don't deadlock output if predictions can't be produced (eg. feature mismatch / no detections).
+        if not startup_ready and frame_idx >= (display_delay + T_final):
+            startup_ready = True
+
+        # Emit as many frames as possible while keeping the desired display_delay.
+        while startup_ready and len(display_q) > display_delay:
+            out_idx, out_frame, out_found, out_xy, out_conf = display_q.popleft()
+
+            # Pick the prediction that belongs to this specific displayed frame index.
+            pred = pred_cache.pop(int(out_idx), None)
+            if pred is not None:
+                last_pred = pred
+            else:
+                pred = last_pred
+
+            if out_found:
+                out_frame = draw_pose(out_frame, out_xy, out_conf, conf_thres=conf_thres_final, draw_skeleton=True)
+
+            lines = []
+            if pred is not None:
+                pred_idx, pred_conf, p_fall, debounced = pred
+                if 0 <= int(pred_idx) < len(CLASS_NAMES):
+                    activity = CLASS_NAMES[int(pred_idx)]
+                else:
+                    activity = f"class_{int(pred_idx)}"
+                lines.append(f"{activity} (argmax p={pred_conf:.2f})")
+                if p_fall is not None:
+                    lines.append(f"P(fall)={float(p_fall):.2f}  thr={float(args.fall_threshold):.2f}  debounced={int(debounced or 0)}")
+            else:
+                lines.append("No prediction yet")
+
+            # Explicit warmup note for early frames where we had to left-pad history.
+            # Prediction for frame i is produced when the window ends at:
+            #   end_idx = i            (end) or i + label_offset (center)
+            end_idx_for_this_frame = int(out_idx) if align_mode == "end" else int(out_idx + label_offset)
+            if end_idx_for_this_frame < (T_final - 1):
+                lines.append(f"Warmup (padded history): end_idx={end_idx_for_this_frame} < {T_final-1}")
+
+            lines.append(f"FPS: {fps_ema:.1f} | T={T_final} | align={align_mode} | display_delay={display_delay} | {preproc_str}")
+
+            hud_x = 10
+            hud_y = 10 if args.hud_pos == "top" else max(10, out_frame.shape[0] - 110)
+            out_frame = draw_hud(out_frame, lines, org=(hud_x, hud_y), font_scale=float(args.hud_scale))
+
+            if int(args.debug) == 1 and (int(out_idx) % int(max(1, round(src_fps))) == 0):
+                src_end = int(out_idx) if align_mode == "end" else int(out_idx + label_offset)
+                print(f"[debug] display frame={int(out_idx)} | pred_from_window_end={src_end} | align={align_mode}")
+
+            writer.write(out_frame)
+            if int(args.show) == 1:
+                cv2.imshow("realtime_infer", out_frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27 or key == ord("q"):
+                    stop = True
+                    break
+
+            # Prevent unbounded growth in pred_cache if display stalls for any reason.
+            # Keep only a small tail.
+            min_keep = int(out_idx) - (2 * T_final + 50)
+            if min_keep > 0:
+                old_keys = [k for k in pred_cache.keys() if int(k) < min_keep]
+                for k in old_keys:
+                    pred_cache.pop(k, None)
+
+        if stop:
+            break
+
+        frame_idx += 1
+
+    # Flush remaining delayed frames (eg. center alignment at end of file).
+    startup_ready = True
+    while len(display_q) > 0 and not stop:
+        out_idx, out_frame, out_found, out_xy, out_conf = display_q.popleft()
+
+        pred = pred_cache.pop(int(out_idx), None)
+        if pred is not None:
+            last_pred = pred
         else:
-            text = "No prediction (feature mismatch)"
+            pred = last_pred
 
-        # include preprocessing + T for sanity
-        text2 = f"FPS: {fps_ema:.1f} | T={T_final} stride={stride} | {preproc_str}"
-        frame = overlay_text(frame, text, fps_text=text2)
+        if out_found:
+            out_frame = draw_pose(out_frame, out_xy, out_conf, conf_thres=conf_thres_final, draw_skeleton=True)
 
-        writer.write(frame)
+        lines = []
+        if pred is not None:
+            pred_idx, pred_conf, p_fall, debounced = pred
+            activity = CLASS_NAMES[int(pred_idx)] if 0 <= int(pred_idx) < len(CLASS_NAMES) else f"class_{int(pred_idx)}"
+            lines.append(f"{activity} (argmax p={pred_conf:.2f})")
+            if p_fall is not None:
+                lines.append(f"P(fall)={float(p_fall):.2f}  thr={float(args.fall_threshold):.2f}  debounced={int(debounced or 0)}")
+        else:
+            lines.append("No prediction")
 
+        lines.append(f"FPS: {fps_ema:.1f} | T={T_final} | align={align_mode} | display_delay={display_delay} | {preproc_str}")
+
+        hud_x = 10
+        hud_y = 10 if args.hud_pos == "top" else max(10, out_frame.shape[0] - 110)
+        out_frame = draw_hud(out_frame, lines, org=(hud_x, hud_y), font_scale=float(args.hud_scale))
+
+        writer.write(out_frame)
         if int(args.show) == 1:
-            cv2.imshow("Pose + Temporal Inference", frame)
+            cv2.imshow("realtime_infer", out_frame)
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord("q"):
                 break
-
-        frame_idx += 1
 
     cap.release()
     writer.release()

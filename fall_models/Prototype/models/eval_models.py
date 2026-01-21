@@ -456,6 +456,12 @@ def main():
         default=None,
         help="Optional subject range (e.g. 13-16) to tune threshold on. Uses same preprocessing as test.",
     )
+    parser.add_argument(
+        "--fall-pct",
+        type=float,
+        default=0.25,
+        help="Used only when label_mode is hybrid_center_fallpct. Window is labeled fall if >= fall_pct of valid frames are fall."
+    )
 
     #Preprocessing options
     parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
@@ -466,7 +472,12 @@ def main():
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for interpolation.")
     parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
     parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
-    parser.add_argument("--label-mode", type=str, default="center", choices=["center", "majority"])
+    parser.add_argument(
+        "--label-mode",
+        type=str,
+        default="center",
+        choices=["center", "majority", "hybrid_center_fallpct"],
+    )
     parser.add_argument("--min-valid-frac", type=float, default=0.3)
     parser.add_argument("--add-mask-channel", type=int, default=1)
     args = parser.parse_args()
@@ -545,6 +556,8 @@ def main():
             max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
             T_ckpt = int(ckpt.get("T", ckpt.get("T_used", args.T)))  # support both keys
             stride_ckpt = int(ckpt.get("stride", args.stride))
+
+            fall_pct_ckpt = float(ckpt.get("fall_pct", args.fall_pct))
             label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
             min_valid_frac_ckpt = float(ckpt.get("min_valid_frac", args.min_valid_frac))
             add_mask_channel_ckpt = bool(ckpt.get("add_mask_channel", add_mask_channel_cli))
@@ -565,10 +578,18 @@ def main():
             max_interp_gap_ckpt = int(args.max_interp_gap)
             T_ckpt = int(args.T)
             stride_ckpt = int(args.stride)
+
+            fall_pct_ckpt = float(args.fall_pct)
             label_mode_ckpt = str(args.label_mode)
             min_valid_frac_ckpt = float(args.min_valid_frac)
             add_mask_channel_ckpt = add_mask_channel_cli
             node_features_ckpt = None
+
+        #For hybrid window labelling
+        extra = {}
+        if label_mode_ckpt == "hybrid_center_fallpct":
+            extra["fall_ids_0based"] = fall_class_ids_0based
+            extra["fall_pct"] = fall_pct_ckpt
 
        # Load windows using ckpt settings
         if T_used is None:
@@ -586,6 +607,7 @@ def main():
                 label_mode=label_mode_ckpt,
                 min_valid_frac=min_valid_frac_ckpt,
                 add_mask_channel=add_mask_channel_ckpt,
+                **extra,
             )
             T_used = int(_T_used)
         else:
@@ -603,6 +625,7 @@ def main():
                 label_mode=label_mode_ckpt,
                 min_valid_frac=min_valid_frac_ckpt,
                 add_mask_channel=add_mask_channel_ckpt,
+                **extra,
                 )
             T_used = int(_T_used)
 
@@ -695,6 +718,7 @@ def main():
                     label_mode=label_mode_ckpt,
                     min_valid_frac=min_valid_frac_ckpt,
                     add_mask_channel=add_mask_channel_ckpt,
+                    **extra,
                 )
 
                 y_tune = (y_tune_tags.astype(int) - 1).astype(np.int64)

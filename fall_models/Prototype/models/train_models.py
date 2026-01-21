@@ -442,16 +442,32 @@ if __name__ == "__main__":
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for linear interpolation of missing joints.")
     parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
     parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
-    parser.add_argument("--label-mode", type=str, default="center", choices=["center", "majority"])
+    parser.add_argument(
+        "--label-mode",
+        type=str,
+        default="center",
+        choices=["center", "majority", "hybrid_center_fallpct"],
+        help="Window label rule. hybrid_center_fallpct: label window as fall if fall frames >= fall_pct else center."
+    )
     parser.add_argument("--min-valid-frac", type=float, default=0.3, help="Min fraction of joints above conf_thres for a frame to be valid.")
     parser.add_argument("--add-mask-channel", type=int, default=1, help="Append mask channel (0/1).")
     parser.add_argument("--drop-ambig-share", type=float, default=0.6,
                         help="Train-only: drop windows where top-label share < this value. 0 disables.")
     parser.add_argument("--drop-ambig-nonfall-only", type=int, default=1,
                         help="Train-only: if 1, only drop ambiguous windows that contain no fall frames (requires --fall-class-ids).")
-    parser.add_argument("--fall-class-ids", nargs="+", type=int, default=None,
-                        help="Fall class ids in ORIGINAL label space (1-based), used for non-fall-only ambiguity dropping / future mining. Example: --fall-class-ids 9 10 11")
-    
+    parser.add_argument(
+        "--fall-class-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Fall class IDs in the SAME space as frame_labels in the NPZ (typically 1-based), e.g. --fall-class-ids 1 2 3 4 5"
+    )
+    parser.add_argument(
+        "--fall-pct",
+        type=float,
+        default=0.25,
+        help="Used only when --label-mode hybrid_center_fallpct. Window is labeled fall if >= fall_pct of valid frames are fall. Try 0.20-0.30."
+    )
     args = parser.parse_args()
 
     use_conf = bool(args.use_conf)
@@ -466,6 +482,9 @@ if __name__ == "__main__":
     fall_class_ids_raw = None
     if args.fall_class_ids is not None and len(args.fall_class_ids) > 0:
         fall_class_ids_raw = [int(x) for x in args.fall_class_ids]
+    
+    if args.label_mode == "hybrid_center_fallpct" and (args.fall_class_ids is None or len(args.fall_class_ids) == 0):
+        raise SystemExit("--label-mode hybrid_center_fallpct requires --fall-class-ids (e.g. 1 2 3 4 5).")
 
 
     # Decide which models to run
@@ -526,6 +545,7 @@ if __name__ == "__main__":
         min_valid_frac=args.min_valid_frac,
         add_mask_channel=add_mask_channel,
         fall_ids_0based=fall_class_ids_raw,
+        fall_pct=args.fall_pct,
         drop_ambig_share=float(args.drop_ambig_share),
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
     )
@@ -545,6 +565,7 @@ if __name__ == "__main__":
         min_valid_frac=args.min_valid_frac,
         add_mask_channel=add_mask_channel,
         fall_ids_0based=fall_class_ids_raw,
+        fall_pct=args.fall_pct,
         drop_ambig_share=0.0,
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
     )
