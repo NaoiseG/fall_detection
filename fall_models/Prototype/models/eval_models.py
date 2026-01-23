@@ -26,12 +26,14 @@ Notes:
   So pass fall class ids in the ORIGINAL label space (1-based); this script shifts by -1.
 
 Choosing model weights:
-    - By default, the latest run folder under each model's checkpoint folder is used.If you pass nothing: each model uses its own latest timestamped folder
+    - By default, the latest run folder under each model's checkpoint folder is used.
+      If you pass nothing: each model uses its own latest timestamped folder
 
     If you pass --ckpt tcn=...: only tcn is pinned, others still use latest
 
     If you pass model=latest: explicitly forces latest for that model
-""" 
+"""
+
 # -----------------------------------------------------------------------------
 # Binary fall decision args (used for fall vs no-fall metrics)
 #
@@ -39,17 +41,16 @@ Choosing model weights:
 # "fall" decision:
 #
 #   --binary-mode threshold
-#     Computes P(fall) = sum of softmax probabilities over the classes listed in
-#     --fall-class-ids, then predicts fall if P(fall) >= --threshold.
+#     If the model has an explicit fall head (returns (activity_logits, fall_logit)),
+#     then P(fall)=sigmoid(fall_logit) is used.
+#     Otherwise, P(fall)=sum of softmax probabilities over the classes listed in
+#     --fall-class-ids.
+#     Predict fall if P(fall) >= --threshold.
 #
 #   --binary-mode argmax
 #     Uses the model's argmax class and predicts fall if that class is in
 #     --fall-class-ids. This matches the older, stricter behaviour but gives you
 #     no operating point control.
-#
-# Threshold selection:
-#   --threshold <float>
-#     Used only when --binary-mode threshold. Default is typically 0.5.
 #
 # Automatic threshold tuning (recommended):
 #   --tune-subjects <range/list>
@@ -57,33 +58,8 @@ Choosing model weights:
 #     pick the threshold that maximises F_beta (see --beta). This chosen value is
 #     written to tuned_threshold in metrics_summary.csv.
 #
-#   --beta <float>
-#     Controls the recall vs precision tradeoff during tuning:
-#       beta > 1 prioritises recall (eg beta=2)
-#       beta = 1 is standard F1
-#       beta < 1 prioritises precision
-#
-# Output columns in metrics_summary.csv:
-#   binary_mode, threshold, beta, tune_subjects
-#     These record the mode and values used for the run.
-#
-#   tuned_threshold, tuned_precision_fall, tuned_recall_fall, tuned_fbeta
-#     These are only filled when --tune-subjects is used. If you see "None" in
-#     these columns then no tuning was run and the script used --threshold.
-#
-# Suggested workflow:
-#   1) Tune on validation subjects:
-#        python -m models.eval_models ... \
-#          --binary-mode threshold --beta 2 \
-#          --tune-subjects <VAL_SUBJECTS> \
-#          --fall-class-ids <FALL_CLASS_IDS>
-#
-#   2) Re-run on test subjects using the tuned threshold (no tuning):
-#        python -m models.eval_models ... \
-#          --binary-mode threshold --threshold <TUNED_THRESHOLD> \
-#          --fall-class-ids <FALL_CLASS_IDS>
-#
-# Tip: run with --help to see the exact accepted format for subject ranges/lists.
+# The summary CSV includes a "p_fall_source" column which records whether
+# P(fall) came from the model's fall head or from activity softmax mass.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -113,6 +89,9 @@ from .gcn.simple_gcn import GCNBaseline
 from .mlp.simple_mlp import MLPBaseline
 from .stgcn.simple_stgcn import STGCNBaseline
 
+# NEW: CNN + LSTM two-head model
+from .cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
+
 
 def slug_models(models: List[str], max_len: int = 80) -> str:
     # safe folder component: letters, numbers, underscore and dash only
@@ -120,13 +99,16 @@ def slug_models(models: List[str], max_len: int = 80) -> str:
     s = re.sub(r"[^a-zA-Z0-9_-]+", "_", s)
     return s[:max_len]
 
+
 _TS_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?$")
+
 
 def pick_latest_run_dir(model_dir: Path) -> Path:
     run_dirs = [p for p in model_dir.iterdir() if p.is_dir() and _TS_DIR_RE.match(p.name)]
     if not run_dirs:
         raise FileNotFoundError(f"No timestamped run folders under: {model_dir.as_posix()}")
     return sorted(run_dirs, key=lambda p: p.name)[-1]
+
 
 def parse_ckpt_overrides(items: Optional[List[str]]) -> Dict[str, str]:
     """
@@ -141,6 +123,7 @@ def parse_ckpt_overrides(items: Optional[List[str]]) -> Dict[str, str]:
         k, v = s.split("=", 1)
         out[k.lower().strip()] = v.strip()
     return out
+
 
 def resolve_run_dir(model_dir: Path, override: Optional[str]) -> Path:
     """
@@ -157,6 +140,7 @@ def resolve_run_dir(model_dir: Path, override: Optional[str]) -> Path:
         raise FileNotFoundError(f"Run folder not found: {run_dir.as_posix()}")
     return run_dir
 
+
 def parse_range(r: str) -> List[int]:
     a, b = r.split("-")
     a, b = int(a), int(b)
@@ -166,6 +150,17 @@ def parse_range(r: str) -> List[int]:
 def count_params_m(model: torch.nn.Module) -> float:
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return n / 1e6
+
+
+def unpack_model_output(out):
+    """
+    Supports:
+      - single head: logits
+      - two head: (activity_logits, fall_logit)
+    """
+    if isinstance(out, (tuple, list)) and len(out) == 2:
+        return out[0], out[1]
+    return out, None
 
 
 def get_model(
@@ -245,6 +240,20 @@ def get_model(
             dropout=0.1,
         )
 
+    elif model_name == "cnnlstm":
+        # Uses keypoint-CNN path if in_features == 17 * node_features, else auto-falls back
+        model = CNNLSTMTwoHead(
+            in_features=in_features,
+            num_classes=num_classes,
+            embed_dim=128,
+            hidden_size=128,
+            lstm_layers=1,
+            dropout=0.2,
+            num_keypoints=17 if node_features is not None else None,
+            kp_channels=node_features,
+            pool="last",
+        )
+
     else:
         raise ValueError(f"Unknown model '{model_name}'.")
 
@@ -258,37 +267,58 @@ def predict_all(model: torch.nn.Module, loader: DataLoader, device: str) -> Tupl
     for X, y in loader:
         X = X.to(device)
         y = y.to(device)
-        logits = model(X)
-        preds = logits.argmax(dim=1)
+
+        out = model(X)
+        activity_logits, _fall_logit = unpack_model_output(out)
+
+        preds = activity_logits.argmax(dim=1)
         y_true_all.append(y.detach().cpu().numpy())
         y_pred_all.append(preds.detach().cpu().numpy())
     return np.concatenate(y_true_all), np.concatenate(y_pred_all)
 
 
 @torch.no_grad()
-def predict_probs(model: torch.nn.Module, loader: DataLoader, device: str) -> Tuple[np.ndarray, np.ndarray]:
+def predict_probs(model: torch.nn.Module, loader: DataLoader, device: str) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
     Returns:
-      y_true: (N,)
-      probs:  (N,C) softmax probabilities
+      y_true:    (N,)
+      probs:     (N,C) softmax probabilities over activity classes
+      fall_prob: (N,) sigmoid(fall_logit) if model has fall head else None
     """
     model.eval()
     y_true_all, probs_all = [], []
+    fall_prob_all: List[np.ndarray] = []
+
+    has_fall_head = False
+
     for X, y in loader:
         X = X.to(device)
         y = y.to(device)
-        logits = model(X)
-        probs = torch.softmax(logits, dim=1)
+
+        out = model(X)
+        activity_logits, fall_logit = unpack_model_output(out)
+
+        probs = torch.softmax(activity_logits, dim=1)
+
         y_true_all.append(y.detach().cpu().numpy())
         probs_all.append(probs.detach().cpu().numpy())
-    return np.concatenate(y_true_all), np.concatenate(probs_all)
+
+        if fall_logit is not None:
+            has_fall_head = True
+            fp = torch.sigmoid(fall_logit).view(-1).detach().cpu().numpy()
+            fall_prob_all.append(fp)
+
+    y_true_np = np.concatenate(y_true_all)
+    probs_np = np.concatenate(probs_all)
+    if has_fall_head:
+        fall_prob_np = np.concatenate(fall_prob_all)
+        return y_true_np, probs_np, fall_prob_np
+    return y_true_np, probs_np, None
 
 
 def collapse_to_binary(y: np.ndarray, fall_class_ids_0based: List[int]) -> np.ndarray:
     fall = set(int(x) for x in fall_class_ids_0based)
     return np.array([1 if int(v) in fall else 0 for v in y], dtype=int)
-
-
 
 
 def p_fall_from_probs(probs: np.ndarray, fall_class_ids_0based: List[int]) -> np.ndarray:
@@ -362,7 +392,7 @@ def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir:
     html = f"""<!doctype html>
 <html>
 <head>
-  <meta charset=\"utf-8\"/>
+  <meta charset="utf-8"/>
   <title>Model Evaluation Report</title>
   <style>{css}</style>
 </head>
@@ -376,21 +406,21 @@ def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir:
   <h2>Summary</h2>
   {df_to_html(summary_df)}
 
-  <div class=\"grid\">
+  <div class="grid">
     <div>
       <h2>Macro F1</h2>
-      <img src=\"{plots_dir.name}/macro_f1.png\" alt=\"Macro F1\"/>
+      <img src="{plots_dir.name}/macro_f1.png" alt="Macro F1"/>
     </div>
     <div>
       <h2>Binary Sensitivity and Precision</h2>
-      <img src=\"{plots_dir.name}/binary_metrics.png\" alt=\"Binary metrics\"/>
+      <img src="{plots_dir.name}/binary_metrics.png" alt="Binary metrics"/>
     </div>
   </div>
 
   <h2>F1 per class (multi-class)</h2>
   {df_to_html(f1_long)}
 
-  <p style=\"margin-top:24px;font-size:13px;color:#444;\">
+  <p style="margin-top:24px;font-size:13px;color:#444;">
     Generated by <code>models.eval_models</code>.
   </p>
 </body>
@@ -400,7 +430,8 @@ def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir:
 
 
 def main():
-    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn"]
+    # NEW: added "cnnlstm"
+    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm"]
 
     parser = argparse.ArgumentParser(description="Evaluate trained models on UP-Fall windowed pose tensors.")
     parser.add_argument("--models", nargs="+", required=True, help="Models to evaluate, e.g. --models tcn lstm")
@@ -415,10 +446,14 @@ def main():
         nargs="*",
         default=None,
         help="Optional per-model run folder overrides. Use: --ckpt tcn=2026-... lstm=latest. "
-            "If omitted for a model, latest is used.",
+             "If omitted for a model, latest is used.",
     )
-    parser.add_argument("--weights-name", type=str, default=None,
-                        help="Override weights filename. If omitted uses '<model>_best.pt'.")
+    parser.add_argument(
+        "--weights-name",
+        type=str,
+        default=None,
+        help="Override weights filename. If omitted uses '<model>_best.pt'.",
+    )
     parser.add_argument("--out-dir", type=str, default="eval_outputs", help="Output directory")
     parser.add_argument("--use-conf", action="store_true", help="Use confidence channel (x,y,conf).")
     parser.add_argument("--no-conf", action="store_true", help="Disable confidence channel (use x,y only).")
@@ -436,7 +471,7 @@ def main():
         type=str,
         default="threshold",
         choices=["threshold", "argmax"],
-        help="How to form fall/no-fall decision. 'threshold' uses P(fall)=sum fall-class probs.",
+        help="How to form fall/no-fall decision. 'threshold' uses P(fall) score (fall head if present else sum fall-class probs).",
     )
     parser.add_argument(
         "--threshold",
@@ -460,10 +495,10 @@ def main():
         "--fall-pct",
         type=float,
         default=0.25,
-        help="Used only when label_mode is hybrid_center_fallpct. Window is labeled fall if >= fall_pct of valid frames are fall."
+        help="Used only when label_mode is hybrid_center_fallpct. Window is labeled fall if >= fall_pct of valid frames are fall.",
     )
 
-    #Preprocessing options
+    # Preprocessing options
     parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
     parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")
@@ -525,7 +560,6 @@ def main():
     f1_rows: List[Dict[str, object]] = []
 
     ckpt_root = Path(args.ckpt_root)
-
     ckpt_overrides = parse_ckpt_overrides(args.ckpt)
 
     for m in model_list:
@@ -585,17 +619,17 @@ def main():
             add_mask_channel_ckpt = add_mask_channel_cli
             node_features_ckpt = None
 
-        #For hybrid window labelling
+        # For hybrid window labelling
         extra = {}
         if label_mode_ckpt == "hybrid_center_fallpct":
             extra["fall_ids_0based"] = fall_class_ids_0based
             extra["fall_pct"] = fall_pct_ckpt
 
-       # Load windows using ckpt settings
+        # Load windows using ckpt settings
         if T_used is None:
             X_test, y_test_tags, _T_used = load_windows_from_npzs(
                 test_npzs,
-                T=T_ckpt,                       # IMPORTANT: always pass T for sliding windows
+                T=T_ckpt,
                 use_conf=use_conf_ckpt,
                 normalize=normalize_ckpt,
                 add_vel=add_vel_ckpt,
@@ -613,7 +647,7 @@ def main():
         else:
             X_test, y_test_tags, _T_used = load_windows_from_npzs(
                 test_npzs,
-                T=T_ckpt,                       # IMPORTANT: always pass T for sliding windows
+                T=T_ckpt,
                 use_conf=use_conf_ckpt,
                 normalize=normalize_ckpt,
                 add_vel=add_vel_ckpt,
@@ -626,7 +660,7 @@ def main():
                 min_valid_frac=min_valid_frac_ckpt,
                 add_mask_channel=add_mask_channel_ckpt,
                 **extra,
-                )
+            )
             T_used = int(_T_used)
 
         print("Window length (T):", T_used)
@@ -636,7 +670,6 @@ def main():
         # Finalise dims for no-metadata checkpoints
         if "state_dict" not in ckpt:
             num_classes = int(y_test.max() + 1)
-
 
         test_ds = WindowTensorDataset(X_test, y_test)
 
@@ -670,8 +703,8 @@ def main():
 
         model.load_state_dict(state, strict=False)
 
-        # Multi-class predictions
-        y_true, probs_test = predict_probs(model, test_loader, device=args.device)
+        # Multi-class predictions + optional fall head probability
+        y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
         y_pred = probs_test.argmax(axis=1).astype(int)
 
         labels_present = np.unique(y_true).astype(int).tolist()
@@ -683,8 +716,13 @@ def main():
 
         y_true_bin = collapse_to_binary(y_true, fall_class_ids_0based)
 
-        # Binary fall score
-        p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based)
+        # Binary fall score P(fall)
+        if fall_prob_test is not None:
+            p_fall_test = fall_prob_test.astype(np.float32)
+            p_fall_source = "fall_head"
+        else:
+            p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based).astype(np.float32)
+            p_fall_source = "activity_softmax"
 
         tuned_thr = None
         tuned_prec = None
@@ -732,11 +770,17 @@ def main():
                     pin_memory=True,
                 )
 
-                y_tune_true, probs_tune = predict_probs(model, tune_loader, device=args.device)
+                y_tune_true, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
                 y_tune_bin = collapse_to_binary(y_tune_true, fall_class_ids_0based)
-                p_fall_tune = p_fall_from_probs(probs_tune, fall_class_ids_0based)
 
-                thr, tuned_prec, tuned_rec, tuned_fbeta = pick_threshold_fbeta(y_tune_bin, p_fall_tune, beta=float(args.beta))
+                if fall_prob_tune is not None:
+                    p_fall_tune = fall_prob_tune.astype(np.float32)
+                else:
+                    p_fall_tune = p_fall_from_probs(probs_tune, fall_class_ids_0based).astype(np.float32)
+
+                thr, tuned_prec, tuned_rec, tuned_fbeta = pick_threshold_fbeta(
+                    y_tune_bin, p_fall_tune, beta=float(args.beta)
+                )
                 tuned_thr = thr
             else:
                 thr = 0.5
@@ -756,6 +800,7 @@ def main():
             "params_m": float(count_params_m(model)),
             "macro_f1": float(macro_f1),
             "binary_mode": str(args.binary_mode).lower(),
+            "p_fall_source": p_fall_source,  # NEW: records which score was used
             "threshold": chosen_thr,
             "beta": float(args.beta) if str(args.binary_mode).lower() == "threshold" else None,
             "tune_subjects": str(args.tune_subjects) if args.tune_subjects is not None else None,
@@ -789,7 +834,7 @@ def main():
     print(f"Saved: {summary_csv}")
     print(f"Saved: {f1_csv}")
     print(f"Saved: {report_path}")
-    print(f"Plots in: {plots_dir.as_posix()}") 
+    print(f"Plots in: {plots_dir.as_posix()}")
 
 
 if __name__ == "__main__":

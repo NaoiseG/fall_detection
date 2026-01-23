@@ -32,6 +32,12 @@ from models.gcn.simple_gcn import GCNBaseline
 from models.mlp.simple_mlp import MLPBaseline
 from models.stgcn.simple_stgcn import STGCNBaseline
 
+# Optional: CNN+LSTM two-head model (activity + fall)
+try:
+    from models.cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
+except Exception:
+    CNNLSTMTwoHead = None
+
 # -----------------------------
 # Labels (DEFAULT)
 # -----------------------------
@@ -299,6 +305,18 @@ def _global_feats(xy: np.ndarray) -> np.ndarray:
     return g
 
 
+
+def unpack_model_output(out):
+    """
+    Supports:
+      - single head: logits
+      - two head: (activity_logits, fall_logit)
+    """
+    if isinstance(out, (tuple, list)) and len(out) == 2:
+        return out[0], out[1]
+    return out, None
+
+
 def get_model(model_name: str, in_features: int, num_classes: int, T_for_mlp: int, node_features: Optional[int] = None) -> torch.nn.Module:
     model_name = model_name.lower().strip()
 
@@ -324,6 +342,23 @@ def get_model(model_name: str, in_features: int, num_classes: int, T_for_mlp: in
             raise ValueError("node_features must be provided for STGCN.")
         model = STGCNBaseline(num_nodes=17, node_features=node_features, num_classes=num_classes, hidden_channels=128, num_blocks=4, t_kernel=9, dropout=0.1)
 
+
+    elif model_name == "cnnlstm":
+        if CNNLSTMTwoHead is None:
+            raise ImportError("CNNLSTMTwoHead not available. Ensure models/cnnlstm/cnn_lstm_two_head.py exists.")
+        # Uses keypoint-CNN path if node_features provided, else falls back to MLP-like path
+        model = CNNLSTMTwoHead(
+            in_features=in_features,
+            num_classes=num_classes,
+            embed_dim=128,
+            hidden_size=128,
+            lstm_layers=1,
+            dropout=0.2,
+            num_keypoints=17 if node_features is not None else None,
+            kp_channels=node_features,
+            pool="last",
+        )
+
     else:
         raise ValueError(f"Unknown temporal model: {model_name}")
 
@@ -344,7 +379,7 @@ def main():
     parser.add_argument("--device", type=str, default=None, help='Device string, e.g. "cuda" or "cpu". Default: auto.')
     parser.add_argument("--half", type=int, default=0, help="Use FP16 on CUDA for speed (0/1).")
 
-    parser.add_argument("--temporal-model", type=str, required=True, choices=["tcn", "lstm", "gru", "gcn", "mlp", "stgcn"])
+    parser.add_argument("--temporal-model", type=str, required=True, choices=["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm"])
     parser.add_argument("--ckpt-root", type=str, default="models")
     parser.add_argument("--ckpt-subdir", type=str, required=True)
     parser.add_argument("--weights-name", type=str, default=None)
@@ -526,7 +561,7 @@ def main():
     display_q = deque()
 
     # Cache predictions by the frame index they should be displayed on.
-    # Value: (pred_idx, pred_conf, p_fall, debounced)
+    # Value: (pred_idx, pred_conf, p_fall, debounced, p_fall_source)
     pred_cache = {}
     last_pred = None  # fallback when a frame has no cached prediction (eg. stride > 1)
 
@@ -623,20 +658,31 @@ def main():
         X = X.half() if use_half else X.float()
 
         with torch.no_grad():
-            logits = model(X)
+            out = model(X)
+            activity_logits, fall_logit = unpack_model_output(out)
 
-            # Robust: if logits is (B,T,C), pool over T
-            if logits.ndim == 3:
-                logits = logits.mean(dim=1)
+            # Robust: if activity logits is (B,T,C), pool over T
+            if hasattr(activity_logits, "ndim") and activity_logits.ndim == 3:
+                activity_logits = activity_logits.mean(dim=1)
 
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(activity_logits, dim=1)
             pred_idx = int(probs.argmax(dim=1).item())
             pred_conf = float(probs.max(dim=1).values.item())
 
+            # Binary fall score
             p_fall = None
-            debounced = None
-            if len(fall_idx) > 0:
+            p_fall_source = None
+            if fall_logit is not None:
+                # fall_logit may be (B,), (B,1) or (B,T); reduce to (B,)
+                fl = fall_logit.view(fall_logit.shape[0], -1).mean(dim=1)
+                p_fall = float(torch.sigmoid(fl)[0].item())
+                p_fall_source = "fall_head"
+            elif len(fall_idx) > 0:
                 p_fall = float(probs[0, fall_idx].sum().item())
+                p_fall_source = "activity_softmax"
+
+            debounced = None
+            if p_fall is not None:
                 is_fall = (p_fall >= float(args.fall_threshold))
 
                 fall_hist.append(1 if is_fall else 0)
@@ -655,7 +701,7 @@ def main():
                 last_p_fall = None
                 last_debounced = None
 
-        return (pred_idx, pred_conf, p_fall, debounced)
+        return (pred_idx, pred_conf, p_fall, debounced, p_fall_source)
 
     stop = False
 
@@ -706,7 +752,7 @@ def main():
         if do_infer:
             pred = _run_temporal_infer(end_idx=frame_idx, warmup=warmup)
             if pred is not None:
-                pred_idx, pred_conf, p_fall, debounced = pred
+                pred_idx, pred_conf, p_fall, debounced, p_fall_source = pred
                 target_idx = int(frame_idx) if align_mode == "end" else int(frame_idx - label_offset)
                 if target_idx < 0:
                     target_idx = 0
@@ -750,14 +796,14 @@ def main():
 
             lines = []
             if pred is not None:
-                pred_idx, pred_conf, p_fall, debounced = pred
+                pred_idx, pred_conf, p_fall, debounced, p_fall_source = pred
                 if 0 <= int(pred_idx) < len(CLASS_NAMES):
                     activity = CLASS_NAMES[int(pred_idx)]
                 else:
                     activity = f"class_{int(pred_idx)}"
                 lines.append(f"{activity} (argmax p={pred_conf:.2f})")
                 if p_fall is not None:
-                    lines.append(f"P(fall)={float(p_fall):.2f}  thr={float(args.fall_threshold):.2f}  debounced={int(debounced or 0)}")
+                    lines.append(f"P(fall)={float(p_fall):.2f} (src={p_fall_source or 'n/a'})  thr={float(args.fall_threshold):.2f}  debounced={int(debounced or 0)}")
             else:
                 lines.append("No prediction yet")
 
@@ -815,11 +861,11 @@ def main():
 
         lines = []
         if pred is not None:
-            pred_idx, pred_conf, p_fall, debounced = pred
+            pred_idx, pred_conf, p_fall, debounced, p_fall_source = pred
             activity = CLASS_NAMES[int(pred_idx)] if 0 <= int(pred_idx) < len(CLASS_NAMES) else f"class_{int(pred_idx)}"
             lines.append(f"{activity} (argmax p={pred_conf:.2f})")
             if p_fall is not None:
-                lines.append(f"P(fall)={float(p_fall):.2f}  thr={float(args.fall_threshold):.2f}  debounced={int(debounced or 0)}")
+                lines.append(f"P(fall)={float(p_fall):.2f} (src={p_fall_source or 'n/a'})  thr={float(args.fall_threshold):.2f}  debounced={int(debounced or 0)}")
         else:
             lines.append("No prediction")
 

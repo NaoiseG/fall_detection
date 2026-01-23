@@ -8,6 +8,9 @@ Multiple models:
   python -m models.train_models --model tcn lstm gru
 
 All models:
+  python -m models.train_models --model tcn lstm gru
+
+All models:
   python -m models.train_models --all
 
 Save results table:
@@ -15,14 +18,12 @@ Save results table:
 """
 
 from dataclasses import dataclass, asdict
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, List, Optional
 import argparse
 from pathlib import Path
-import glob
 import time
 import csv
 from datetime import datetime
-
 
 import numpy as np
 import torch
@@ -31,14 +32,13 @@ from torch.utils.data import DataLoader
 
 from dataset import load_windows_from_npzs, find_keypoints_npzs_subjects, WindowTensorDataset
 
-
-
 from .tcn.simple_tcn import TCNBaseline
 from .lstm.simple_lstm import LSTMBaseline
 from .gru.simple_gru import GRUBaseline
 from .gcn.simple_gcn import GCNBaseline
 from .mlp.simple_mlp import MLPBaseline
 from .stgcn.simple_stgcn import STGCNBaseline
+from .cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
 
 
 # ----------------------------
@@ -163,6 +163,21 @@ def get_model(
             dropout=0.1,
         )
 
+    elif model_name == "cnnlstm":
+        # If node_features is available and in_features == 17*node_features,
+        # the model can use the keypoint-CNN path. Otherwise it auto-falls back.
+        model = CNNLSTMTwoHead(
+            in_features=in_features,
+            num_classes=num_classes,
+            embed_dim=128,
+            hidden_size=128,
+            lstm_layers=1,
+            dropout=0.2,
+            num_keypoints=17 if node_features is not None else None,
+            kp_channels=node_features,
+            pool="last",
+        )
+
     else:
         raise ValueError(f"Unknown model '{model_name}'.")
 
@@ -179,48 +194,106 @@ def count_params_m(model: torch.nn.Module) -> float:
 # Train / Eval
 # ----------------------------
 
-def train_one_epoch(model, loader, opt, device) -> Tuple[float, float]:
+def unpack_model_output(out):
+    # Supports both:
+    #  - single head: logits
+    #  - two head: (activity_logits, fall_logit)
+    if isinstance(out, (tuple, list)) and len(out) == 2:
+        return out[0], out[1]
+    return out, None
+
+
+def train_one_epoch(
+    model,
+    loader,
+    opt,
+    device,
+    fall_ids_0based: Optional[List[int]] = None,
+    lambda_bin: float = 0.5,
+    pos_weight: Optional[float] = None,
+) -> Tuple[float, float]:
     model.train()
     total_loss = 0.0
     total_acc = 0.0
     n = 0
+
+    if pos_weight is not None:
+        bce = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+    else:
+        bce = torch.nn.BCEWithLogitsLoss()
+
+    fall_ids_t = None
+    if fall_ids_0based is not None and len(fall_ids_0based) > 0:
+        fall_ids_t = torch.tensor(fall_ids_0based, device=device, dtype=torch.long)
 
     for X, y in loader:
         X = X.to(device)
         y = y.to(device)
 
         opt.zero_grad(set_to_none=True)
-        logits = model(X)
-        loss = F.cross_entropy(logits, y)
+
+        out = model(X)
+        activity_logits, fall_logit = unpack_model_output(out)
+
+        loss = F.cross_entropy(activity_logits, y)
+
+        # If the model supports fall head AND we have fall class ids, train it
+        if fall_logit is not None and fall_ids_t is not None:
+            fall_logit = fall_logit.view(-1, 1)  # (B,1)
+            y_fall = torch.isin(y, fall_ids_t).float().view(-1, 1)  # (B,1)
+            loss = loss + lambda_bin * bce(fall_logit, y_fall)
 
         loss.backward()
         opt.step()
 
         b = X.size(0)
         total_loss += loss.item() * b
-        total_acc += accuracy(logits, y) * b
+        total_acc += accuracy(activity_logits, y) * b
         n += b
 
     return total_loss / n, total_acc / n
 
 
 @torch.no_grad()
-def eval_one_epoch(model, loader, device) -> Tuple[float, float]:
+def eval_one_epoch(
+    model,
+    loader,
+    device,
+    fall_ids_0based: Optional[List[int]] = None,
+    lambda_bin: float = 0.5,
+    pos_weight: Optional[float] = None,
+) -> Tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_acc = 0.0
     n = 0
 
+    if pos_weight is not None:
+        bce = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+    else:
+        bce = torch.nn.BCEWithLogitsLoss()
+
+    fall_ids_t = None
+    if fall_ids_0based is not None and len(fall_ids_0based) > 0:
+        fall_ids_t = torch.tensor(fall_ids_0based, device=device, dtype=torch.long)
+
     for X, y in loader:
         X = X.to(device)
         y = y.to(device)
 
-        logits = model(X)
-        loss = F.cross_entropy(logits, y)
+        out = model(X)
+        activity_logits, fall_logit = unpack_model_output(out)
+
+        loss = F.cross_entropy(activity_logits, y)
+
+        if fall_logit is not None and fall_ids_t is not None:
+            fall_logit = fall_logit.view(-1, 1)
+            y_fall = torch.isin(y, fall_ids_t).float().view(-1, 1)
+            loss = loss + lambda_bin * bce(fall_logit, y_fall)
 
         b = X.size(0)
         total_loss += loss.item() * b
-        total_acc += accuracy(logits, y) * b
+        total_acc += accuracy(activity_logits, y) * b
         n += b
 
     return total_loss / n, total_acc / n
@@ -251,6 +324,9 @@ def train_model_once(
     drop_ambig_nonfall_only: bool,
     fall_class_ids_raw: Optional[List[int]] = None,
     node_features: Optional[int] = None,
+    fall_ids_0based: Optional[List[int]] = None,
+    pos_weight: Optional[float] = None,
+    lambda_bin: float = 0.5,
 ) -> RunResult:
     model_name = model_name.lower().strip()
 
@@ -278,8 +354,18 @@ def train_model_once(
 
     t0 = time.time()
     for epoch in range(1, cfg.epochs + 1):
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, opt, cfg.device)
-        va_loss, va_acc = eval_one_epoch(model, val_loader, cfg.device)
+        tr_loss, tr_acc = train_one_epoch(
+            model, train_loader, opt, cfg.device,
+            fall_ids_0based=fall_ids_0based,
+            lambda_bin=lambda_bin,
+            pos_weight=pos_weight,
+        )
+        va_loss, va_acc = eval_one_epoch(
+            model, val_loader, cfg.device,
+            fall_ids_0based=fall_ids_0based,
+            lambda_bin=lambda_bin,
+            pos_weight=pos_weight,
+        )
 
         final_va, final_vl = va_acc, va_loss
 
@@ -296,16 +382,19 @@ def train_model_once(
                 "add_vel": bool(add_vel),
                 "add_acc": bool(add_acc),
                 "add_global": bool(add_global),
-                "conf_thres": conf_thres,
-                "max_interp_gap": max_interp_gap,
-                "T_used": T_used,
-                "stride": stride,
-                "label_mode": label_mode,
-                "min_valid_frac": min_valid_frac,
+                "conf_thres": float(conf_thres),
+                "max_interp_gap": int(max_interp_gap),
+                "T_used": int(T_used),
+                "stride": int(stride),
+                "label_mode": str(label_mode),
+                "min_valid_frac": float(min_valid_frac),
                 "add_mask_channel": bool(add_mask_channel),
                 "drop_ambig_share": float(drop_ambig_share),
                 "drop_ambig_nonfall_only": bool(drop_ambig_nonfall_only),
                 "fall_class_ids_raw": list(fall_class_ids_raw) if fall_class_ids_raw is not None else None,
+                "fall_ids_0based": list(fall_ids_0based) if fall_ids_0based is not None else None,
+                "pos_weight": float(pos_weight) if pos_weight is not None else None,
+                "lambda_bin": float(lambda_bin),
                 "node_features": int(node_features) if node_features is not None else None,
             }, ckpt_path)
 
@@ -384,10 +473,13 @@ def print_results_table(results: List[RunResult]) -> None:
 
 def save_results_csv(results: List[RunResult], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(asdict(results[0]).keys()) if results else list(asdict(RunResult(
-        model="", best_val_acc=0, best_val_loss=0, best_epoch=0,
-        final_val_acc=0, final_val_loss=0, params_m=0, train_seconds=0, ckpt_path=""
-    )).keys())
+    if results:
+        fieldnames = list(asdict(results[0]).keys())
+    else:
+        fieldnames = list(asdict(RunResult(
+            model="", best_val_acc=0, best_val_loss=0, best_epoch=0,
+            final_val_acc=0, final_val_loss=0, params_m=0, train_seconds=0, ckpt_path=""
+        )).keys())
 
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -404,7 +496,7 @@ if __name__ == "__main__":
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")  # e.g. 2026-01-19_14-03-22_123456
     print("Run ID:", run_id)
 
-    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn"]
+    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm"]
 
     parser = argparse.ArgumentParser(description="Train one or more models on UP-Fall windowed pose tensors.")
     parser.add_argument(
@@ -432,7 +524,7 @@ if __name__ == "__main__":
         default=None,
         help="Path to save results as CSV, e.g. --save-results results/summary.csv",
     )
-    #Data preprocessing options
+    # Data preprocessing options
     parser.add_argument("--use-conf", type=int, default=1, help="Include keypoint confidence channel (0/1).")
     parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
@@ -468,6 +560,7 @@ if __name__ == "__main__":
         default=0.25,
         help="Used only when --label-mode hybrid_center_fallpct. Window is labeled fall if >= fall_pct of valid frames are fall. Try 0.20-0.30."
     )
+    parser.add_argument("--lambda-bin", type=float, default=0.5, help="Weight for binary fall head loss (default: 0.5)")
     args = parser.parse_args()
 
     use_conf = bool(args.use_conf)
@@ -482,10 +575,15 @@ if __name__ == "__main__":
     fall_class_ids_raw = None
     if args.fall_class_ids is not None and len(args.fall_class_ids) > 0:
         fall_class_ids_raw = [int(x) for x in args.fall_class_ids]
-    
+
     if args.label_mode == "hybrid_center_fallpct" and (args.fall_class_ids is None or len(args.fall_class_ids) == 0):
         raise SystemExit("--label-mode hybrid_center_fallpct requires --fall-class-ids (e.g. 1 2 3 4 5).")
 
+    # Convert CLI fall IDs (typically 1-based) to 0-based once.
+    # This should match y_train/y_val after you subtract 1.
+    fall_ids_0based = None
+    if fall_class_ids_raw is not None and len(fall_class_ids_raw) > 0:
+        fall_ids_0based = [int(i) - 1 for i in fall_class_ids_raw]
 
     # Decide which models to run
     if args.all:
@@ -513,10 +611,6 @@ if __name__ == "__main__":
     OUTPUT_ROOT = Path("../../Datasets/UPFall_keypoints/outputs_npz")
     ckpt_root = Path("models")  # keeps your existing layout
 
-    # Paths
-    OUTPUT_ROOT = Path("../../Datasets/UPFall_keypoints/outputs_npz")
-    ckpt_root = Path("models")
-
     # ---- Compute T_used + num_classes exactly as before (so results stay comparable) ----
     train_npzs = find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=train_subjects)
     val_npzs   = find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=val_subjects)
@@ -540,12 +634,12 @@ if __name__ == "__main__":
         add_global=add_global,
         conf_thres=float(args.conf_thres),
         max_interp_gap=int(args.max_interp_gap),
-        stride=args.stride,
-        label_mode=args.label_mode,
-        min_valid_frac=args.min_valid_frac,
+        stride=int(args.stride),
+        label_mode=str(args.label_mode),
+        min_valid_frac=float(args.min_valid_frac),
         add_mask_channel=add_mask_channel,
-        fall_ids_0based=fall_class_ids_raw,
-        fall_pct=args.fall_pct,
+        fall_ids_0based=fall_ids_0based,
+        fall_pct=float(args.fall_pct),
         drop_ambig_share=float(args.drop_ambig_share),
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
     )
@@ -560,49 +654,58 @@ if __name__ == "__main__":
         add_global=add_global,
         conf_thres=float(args.conf_thres),
         max_interp_gap=int(args.max_interp_gap),
-        stride=args.stride,
-        label_mode=args.label_mode,
-        min_valid_frac=args.min_valid_frac,
+        stride=int(args.stride),
+        label_mode=str(args.label_mode),
+        min_valid_frac=float(args.min_valid_frac),
         add_mask_channel=add_mask_channel,
-        fall_ids_0based=fall_class_ids_raw,
-        fall_pct=args.fall_pct,
-        drop_ambig_share=0.0,
+        fall_ids_0based=fall_ids_0based,
+        fall_pct=float(args.fall_pct),
+        drop_ambig_share=0.0,  # do not drop in val
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
     )
 
+    # Convert 1-based tags to 0-based class indices for training
     y_train = (y_train_tags.astype(int) - 1).astype(np.int64)
     y_val   = (y_val_tags.astype(int) - 1).astype(np.int64)
 
     num_classes = int(max(y_train.max(), y_val.max()) + 1)
     print("num_classes:", num_classes, "| T_used:", T_used)
 
-    # Build datasets just to infer in_features and to avoid duplicating mapping logic
+    # pos_weight for BCE (neg/pos) computed from y_train (0-based)
+    pos_weight = None
+    if fall_ids_0based is not None and len(fall_ids_0based) > 0:
+        pos = int(np.isin(y_train, np.array(fall_ids_0based)).sum())
+        neg = int(len(y_train) - pos)
+        if pos > 0:
+            pos_weight = neg / pos
+            print(f"Binary fall head pos_weight: {pos_weight:.3f} (neg={neg}, pos={pos})")
+        else:
+            print("Warning: no positive fall windows in y_train. pos_weight not set.")
+
+    # Build datasets to infer in_features and keep mapping consistent
     train_ds = WindowTensorDataset(X_train, y_train)
     val_ds   = WindowTensorDataset(X_val, y_val)
 
     sample_X, _ = train_ds[0]
     in_features = int(sample_X.shape[-1])
 
+    # node_features is used by GCN/STGCN and also to enable keypoint CNN path in CNNLSTM
     K = 17
     node_features = int(in_features // K)
     if node_features * K != in_features:
         node_features = None
 
     cfg = TrainConfig(
-        batch_size=args.batch_size,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        epochs=args.epochs,
+        batch_size=int(args.batch_size),
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
+        epochs=int(args.epochs),
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
-    # ---- Now actually use your loader function ----
-    # NOTE: make_loader currently returns y as raw labels (1..11). We need 0..10.
-    # So we’ll wrap it by creating loaders from the datasets we already built:
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,  drop_last=False, num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, drop_last=False, num_workers=0)
 
-    # Train selected models and collect results
     results: List[RunResult] = []
     for m in model_list:
         res = train_model_once(
@@ -630,14 +733,14 @@ if __name__ == "__main__":
             drop_ambig_share=float(args.drop_ambig_share),
             drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
             fall_class_ids_raw=fall_class_ids_raw,
+            fall_ids_0based=fall_ids_0based,
+            pos_weight=pos_weight,
+            lambda_bin=float(args.lambda_bin),
         )
         results.append(res)
-        
 
-    # Print table
     print_results_table(results)
 
-    # Save table
     if args.save_results:
         out_path = Path(args.save_results)
         save_results_csv(results, out_path)
