@@ -1,1 +1,12 @@
 fall_models/Prototype/venv/
+Datasets/
+Papers/
+**/__pycache__/
+**/2026*
+tests/
+outputs/
+eval_outputs/
+copy_zips.py
+audit_upfall.py
+get_one_npz.py
+models/prompts/
