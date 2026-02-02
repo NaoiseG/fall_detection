@@ -93,6 +93,50 @@ from .stgcn.simple_stgcn import STGCNBaseline
 from .cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
 
 
+import inspect
+import pickle
+
+
+def torch_load_safe(path: Path, map_location: str = "cpu"):
+    """Load a torch checkpoint robustly across PyTorch versions.
+
+    PyTorch 2.6+ defaults torch.load(weights_only=True), which can fail when the
+    checkpoint dict contains NumPy scalar metadata (common in our saved ckpts).
+    We first retry with a small allowlist under weights-only loading, then fall
+    back to a full unpickle load if needed.
+    """
+    try:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError:
+        # Retry with an allowlist for NumPy scalar metadata (PyTorch 2.6+).
+        try:
+            import numpy as _np
+            try:
+                _np_scalar = _np.core.multiarray.scalar
+            except Exception:
+                _np_scalar = _np._core.multiarray.scalar  # type: ignore[attr-defined]
+
+            try:
+                from torch.serialization import safe_globals  # PyTorch 2.6+
+                with safe_globals([_np_scalar]):
+                    return torch.load(path, map_location=map_location)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Final fallback: full unpickle (only safe for trusted checkpoints).
+        try:
+            sig = inspect.signature(torch.load)
+            if "weights_only" in sig.parameters:
+                return torch.load(path, map_location=map_location, weights_only=False)
+        except Exception:
+            pass
+
+        # Older torch versions (or if weights_only isn't a valid kwarg)
+        return torch.load(path, map_location=map_location)
+
+
 def slug_models(models: List[str], max_len: int = 80) -> str:
     # safe folder component: letters, numbers, underscore and dash only
     s = "-".join(models)
@@ -434,7 +478,8 @@ def main():
     ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm"]
 
     parser = argparse.ArgumentParser(description="Evaluate trained models on UP-Fall windowed pose tensors.")
-    parser.add_argument("--models", nargs="+", required=True, help="Models to evaluate, e.g. --models tcn lstm")
+    parser.add_argument("--models", nargs="+", default=None, help="Models to evaluate, e.g. --models tcn lstm")
+    parser.add_argument("--all", action="store_true", help="Evaluate all models (overrides --models).")
     parser.add_argument("--camera", type=int, default=1, help="Camera index (default: 1)")
     parser.add_argument("--test-subjects", type=str, default="1-1", help="Test subject range like '1-5'")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64)")
@@ -523,7 +568,12 @@ def main():
     add_global_cli = bool(args.add_global)
     add_mask_channel_cli = bool(args.add_mask_channel)
 
-    model_list = [m.lower().strip() for m in args.models]
+    if args.all:
+        model_list = ALL_MODELS
+    else:
+        if args.models is None or len(args.models) == 0:
+            raise SystemExit("You must pass --models <one or more> or use --all.")
+        model_list = [m.lower().strip() for m in args.models]
     unknown = sorted(set(model_list) - set(ALL_MODELS))
     if unknown:
         raise SystemExit(f"Unknown model(s): {unknown}. Valid: {ALL_MODELS}")
@@ -573,7 +623,7 @@ def main():
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Weights not found for {m}: {ckpt_path.as_posix()}")
 
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch_load_safe(ckpt_path, map_location="cpu")
 
         if "state_dict" in ckpt:
             state = ckpt["state_dict"]

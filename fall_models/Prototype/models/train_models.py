@@ -61,9 +61,11 @@ class TrainConfig:
 @dataclass
 class RunResult:
     model: str
+    best_val_score: float
     best_val_acc: float
     best_val_loss: float
     best_epoch: int
+    final_val_score: float
     final_val_acc: float
     final_val_loss: float
     params_m: float
@@ -79,6 +81,56 @@ class RunResult:
 def accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
     preds = logits.argmax(dim=1)
     return (preds == y).float().mean().item()
+
+
+@torch.no_grad()
+def _update_confusion_matrix(
+    cm: torch.Tensor,
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    num_classes: int,
+) -> None:
+    """Accumulates into cm (shape [C,C]) on CPU."""
+    y_true = y_true.view(-1).to(torch.int64).cpu()
+    y_pred = y_pred.view(-1).to(torch.int64).cpu()
+    idx = y_true * int(num_classes) + y_pred
+    cm += torch.bincount(
+        idx,
+        minlength=int(num_classes) * int(num_classes),
+    ).view(int(num_classes), int(num_classes))
+
+
+@torch.no_grad()
+def selection_score_from_confusion(
+    cm: torch.Tensor,
+    selection_metric: str,
+    metric_weights: Optional[torch.Tensor] = None,
+) -> float:
+    """Returns a scalar score where larger is better."""
+    # cm: rows = true, cols = pred
+    support = cm.sum(dim=1)  # (C,)
+    tp = cm.diag()
+    recall = tp.float() / support.clamp(min=1).float()
+
+    mask = support > 0
+    if not bool(mask.any()):
+        return 0.0
+
+    recall = recall[mask]
+
+    if selection_metric == "macro_recall":
+        return float(recall.mean().item())
+
+    if selection_metric == "inv_freq_recall":
+        if metric_weights is None:
+            return float(recall.mean().item())
+        w = metric_weights.view(-1).float().cpu()[mask]
+        if float(w.sum().item()) <= 0.0:
+            return float(recall.mean().item())
+        w = w / w.sum()
+        return float((recall * w).sum().item())
+
+    raise ValueError(f"Unknown selection_metric: {selection_metric}")
 
 
 # ----------------------------
@@ -262,7 +314,10 @@ def eval_one_epoch(
     fall_ids_0based: Optional[List[int]] = None,
     lambda_bin: float = 0.5,
     pos_weight: Optional[float] = None,
-) -> Tuple[float, float]:
+    num_classes: Optional[int] = None,
+    selection_metric: str = "inv_freq_recall",
+    metric_weights: Optional[torch.Tensor] = None,
+) -> Tuple[float, float, float]:
     model.eval()
     total_loss = 0.0
     total_acc = 0.0
@@ -276,6 +331,12 @@ def eval_one_epoch(
     fall_ids_t = None
     if fall_ids_0based is not None and len(fall_ids_0based) > 0:
         fall_ids_t = torch.tensor(fall_ids_0based, device=device, dtype=torch.long)
+
+    cm = None
+    if selection_metric in {"macro_recall", "inv_freq_recall"}:
+        if num_classes is None:
+            raise ValueError("num_classes must be provided when using recall-based selection metrics.")
+        cm = torch.zeros((int(num_classes), int(num_classes)), dtype=torch.long)
 
     for X, y in loader:
         X = X.to(device)
@@ -296,7 +357,21 @@ def eval_one_epoch(
         total_acc += accuracy(activity_logits, y) * b
         n += b
 
-    return total_loss / n, total_acc / n
+        if cm is not None:
+            preds = activity_logits.argmax(dim=1)
+            _update_confusion_matrix(cm, y_true=y, y_pred=preds, num_classes=int(num_classes))
+
+    val_loss = total_loss / max(1, n)
+    val_acc = total_acc / max(1, n)
+
+    if selection_metric == "acc":
+        val_score = float(val_acc)
+    else:
+        assert cm is not None
+        val_score = selection_score_from_confusion(cm, selection_metric=selection_metric, metric_weights=metric_weights)
+
+    return val_loss, val_acc, val_score
+
 
 
 def train_model_once(
@@ -327,6 +402,8 @@ def train_model_once(
     fall_ids_0based: Optional[List[int]] = None,
     pos_weight: Optional[float] = None,
     lambda_bin: float = 0.5,
+    selection_metric: str = "inv_freq_recall",
+    metric_weights_np: Optional[np.ndarray] = None,
 ) -> RunResult:
     model_name = model_name.lower().strip()
 
@@ -345,10 +422,18 @@ def train_model_once(
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    metric_weights_t = None
+    if metric_weights_np is not None:
+        metric_weights_t = torch.tensor(metric_weights_np, device=cfg.device, dtype=torch.float32)
+
+    # Best checkpoint is chosen by selection_metric (default: inv_freq_recall),
+    # not by overall accuracy.
+    best_vs = -1.0
     best_va = -1.0
     best_vl = float("inf")
     best_epoch = -1
 
+    final_vs = -1.0
     final_va = -1.0
     final_vl = float("inf")
 
@@ -360,19 +445,23 @@ def train_model_once(
             lambda_bin=lambda_bin,
             pos_weight=pos_weight,
         )
-        va_loss, va_acc = eval_one_epoch(
+        va_loss, va_acc, va_score = eval_one_epoch(
             model, val_loader, cfg.device,
             fall_ids_0based=fall_ids_0based,
             lambda_bin=lambda_bin,
             pos_weight=pos_weight,
+            num_classes=num_classes,
+            selection_metric=selection_metric,
+            metric_weights=metric_weights_t,
         )
 
-        final_va, final_vl = va_acc, va_loss
+        final_vs, final_va, final_vl = va_score, va_acc, va_loss
 
-        if va_acc > best_va:
-            best_va = va_acc
-            best_vl = va_loss
-            best_epoch = epoch
+        if va_score > best_vs:
+            best_vs = float(va_score)
+            best_va = float(va_acc)
+            best_vl = float(va_loss)
+            best_epoch = int(epoch)
             torch.save({
                 "state_dict": model.state_dict(),
                 "in_features": in_features,
@@ -395,21 +484,25 @@ def train_model_once(
                 "fall_ids_0based": list(fall_ids_0based) if fall_ids_0based is not None else None,
                 "pos_weight": float(pos_weight) if pos_weight is not None else None,
                 "lambda_bin": float(lambda_bin),
+                "selection_metric": str(selection_metric),
+                "metric_weights": list(metric_weights_np) if metric_weights_np is not None else None,
                 "node_features": int(node_features) if node_features is not None else None,
             }, ckpt_path)
 
         print(
             f"{model_name.upper()} | Epoch {epoch:02d} | "
             f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
-            f"val loss {va_loss:.4f} acc {va_acc:.3f}"
+            f"val loss {va_loss:.4f} acc {va_acc:.3f} score {va_score:.3f} ({selection_metric})"
         )
 
     dt = time.time() - t0
     res = RunResult(
         model=model_name,
+        best_val_score=float(best_vs),
         best_val_acc=float(best_va),
         best_val_loss=float(best_vl),
         best_epoch=int(best_epoch),
+        final_val_score=float(final_vs),
         final_val_acc=float(final_va),
         final_val_loss=float(final_vl),
         params_m=float(count_params_m(model)),
@@ -424,14 +517,16 @@ def train_model_once(
 # ----------------------------
 
 def print_results_table(results: List[RunResult]) -> None:
-    # Sort by best val acc desc
-    results = sorted(results, key=lambda r: r.best_val_acc, reverse=True)
+    # Sort by best val score desc
+    results = sorted(results, key=lambda r: r.best_val_score, reverse=True)
 
     headers = [
         "model",
+        "best_val_score",
         "best_val_acc",
         "best_val_loss",
         "best_epoch",
+        "final_val_score",
         "final_val_acc",
         "final_val_loss",
         "params(M)",
@@ -443,9 +538,11 @@ def print_results_table(results: List[RunResult]) -> None:
     for r in results:
         rows.append([
             r.model,
+            f"{100.0 * r.best_val_score:.2f}%",
             f"{100.0 * r.best_val_acc:.2f}%",
             f"{r.best_val_loss:.4f}",
             str(r.best_epoch),
+            f"{100.0 * r.final_val_score:.2f}%",
             f"{100.0 * r.final_val_acc:.2f}%",
             f"{r.final_val_loss:.4f}",
             f"{r.params_m:.3f}",
@@ -561,6 +658,13 @@ if __name__ == "__main__":
         help="Used only when --label-mode hybrid_center_fallpct. Window is labeled fall if >= fall_pct of valid frames are fall. Try 0.20-0.30."
     )
     parser.add_argument("--lambda-bin", type=float, default=0.5, help="Weight for binary fall head loss (default: 0.5)")
+    parser.add_argument(
+        "--selection-metric",
+        type=str,
+        default="inv_freq_recall",
+        choices=["inv_freq_recall", "macro_recall", "acc"],
+        help="Metric used to choose the best checkpoint. inv_freq_recall upweights minority classes using inverse train frequency.",
+    )
     args = parser.parse_args()
 
     use_conf = bool(args.use_conf)
@@ -671,6 +775,24 @@ if __name__ == "__main__":
     num_classes = int(max(y_train.max(), y_val.max()) + 1)
     print("num_classes:", num_classes, "| T_used:", T_used)
 
+    print("window:", int(T_used), "frames | stride:", int(args.stride))
+
+    # For checkpoint selection, we can upweight minority classes using inverse train frequency.
+    metric_weights_np = None
+    if args.selection_metric == "inv_freq_recall":
+        counts = np.bincount(y_train, minlength=num_classes).astype(np.float32)
+        w = np.zeros((num_classes,), dtype=np.float32)
+        nz = counts > 0
+        w[nz] = 1.0 / counts[nz]
+        if float(w.sum()) > 0.0:
+            w = w / float(w.sum())
+            metric_weights_np = w
+        print("Selection metric:", args.selection_metric, "(minority-upweighted)")
+    elif args.selection_metric == "macro_recall":
+        print("Selection metric:", args.selection_metric, "(equal weight per class)")
+    else:
+        print("Selection metric:", args.selection_metric, "(overall accuracy)")
+
     # pos_weight for BCE (neg/pos) computed from y_train (0-based)
     pos_weight = None
     if fall_ids_0based is not None and len(fall_ids_0based) > 0:
@@ -736,6 +858,8 @@ if __name__ == "__main__":
             fall_ids_0based=fall_ids_0based,
             pos_weight=pos_weight,
             lambda_bin=float(args.lambda_bin),
+            selection_metric=str(args.selection_metric),
+            metric_weights_np=metric_weights_np,
         )
         results.append(res)
 
