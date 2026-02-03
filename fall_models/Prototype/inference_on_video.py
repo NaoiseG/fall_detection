@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -313,109 +314,6 @@ def draw_pose(frame: np.ndarray, xy: np.ndarray, conf: np.ndarray, conf_thres: f
     return frame
 
 
-def extract_pose_video(
-    video_path: Path,
-    pose_model: YOLO,
-    imgsz: int,
-    yolo_conf: float,
-    device: str,
-    max_people: int,
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    if not np.isfinite(fps) or fps <= 1e-3:
-        fps = 30.0
-
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    prealloc = frame_count > 0 and frame_count < 10_000_000
-
-    if prealloc:
-        xy = np.full((frame_count, K, 2), np.nan, dtype=np.float32)
-        cf = np.full((frame_count, K), np.nan, dtype=np.float32)
-    else:
-        xy_list: List[np.ndarray] = []
-        cf_list: List[np.ndarray] = []
-
-    def pick_top_person(r) -> Tuple[np.ndarray, np.ndarray]:
-        if r.keypoints is None or r.keypoints.xy is None:
-            return np.zeros((K, 2), np.float32), np.zeros((K,), np.float32)
-        xy_all = r.keypoints.xy.detach().cpu().numpy()  # (P,K,2)
-        if xy_all.shape[0] == 0:
-            return np.zeros((K, 2), np.float32), np.zeros((K,), np.float32)
-        if xy_all.shape[1] != K:
-            raise ValueError(f"Expected {K} keypoints, got {xy_all.shape[1]}")
-
-        if r.boxes is not None and r.boxes.conf is not None:
-            pc = r.boxes.conf.detach().cpu().numpy()
-            order = np.argsort(-pc)
-        elif r.keypoints.conf is not None:
-            kc_all = r.keypoints.conf.detach().cpu().numpy()
-            order = np.argsort(-np.nanmean(kc_all, axis=1))
-        else:
-            order = np.arange(xy_all.shape[0])
-
-        idx = int(order[0])
-        xy0 = xy_all[idx].astype(np.float32, copy=False)
-        if r.keypoints.conf is not None:
-            kc = r.keypoints.conf.detach().cpu().numpy()[idx].astype(np.float32, copy=False)
-        else:
-            kc = np.ones((K,), dtype=np.float32)
-        return xy0, kc
-
-    t0 = time.time()
-    i = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        r = pose_model.predict(
-            frame,
-            imgsz=int(imgsz),
-            conf=float(yolo_conf),
-            device=device,
-            verbose=False,
-            max_det=max(1, int(max_people)),
-        )[0]
-        xy0, kc0 = pick_top_person(r)
-
-        if prealloc:
-            xy[i] = xy0
-            cf[i] = kc0
-        else:
-            xy_list.append(xy0)
-            cf_list.append(kc0)
-
-        i += 1
-        if i % 100 == 0:
-            dt = time.time() - t0
-            if prealloc:
-                pct = 100.0 * i / max(1, frame_count)
-                print(f"[pose] {i}/{frame_count} ({pct:.1f}%) | {dt:.1f}s")
-            else:
-                print(f"[pose] {i} frames | {dt:.1f}s")
-
-    cap.release()
-
-    if prealloc:
-        xy = xy[:i]
-        cf = cf[:i]
-    else:
-        if not xy_list:
-            raise RuntimeError("No frames read.")
-        xy = np.stack(xy_list, axis=0)
-        cf = np.stack(cf_list, axis=0)
-
-    if xy.shape[0] == 0:
-        raise RuntimeError("Video had 0 frames.")
-
-    print(f"[pose] Done. frames={xy.shape[0]} time={time.time() - t0:.1f}s")
-    return xy, cf, fps
-
-
 def feature_layout(use_conf: bool, add_vel: bool, add_acc: bool) -> Dict[str, Optional[object]]:
     idx = 2  # xy
     conf_idx = None
@@ -433,11 +331,80 @@ def feature_layout(use_conf: bool, add_vel: bool, add_acc: bool) -> Dict[str, Op
     return {"conf_idx": conf_idx, "vel_slice": vel_slice, "acc_slice": acc_slice}
 
 
-def make_windows(
-    xy_raw: np.ndarray,
-    conf_raw: np.ndarray,
+def expected_in_features(
+    use_conf: bool,
+    add_vel: bool,
+    add_acc: bool,
+    add_global: bool,
+    add_mask: bool,
+) -> int:
+    if add_acc and not add_vel:
+        raise ValueError("add_acc=True requires add_vel=True (acc is computed from vel).")
+    c = 2
+    if use_conf:
+        c += 1
+    if add_vel:
+        c += 2
+    if add_acc:
+        c += 2
+    if add_global:
+        c += 4
+    if add_mask:
+        c += 1
+    return int(K * c)
+
+
+def pose_on_frame(
+    pose_model: YOLO,
+    frame_bgr: np.ndarray,
+    imgsz: int,
+    yolo_conf: float,
+    device: str,
+    max_people: int,
+    use_half: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    xy_zeros = np.zeros((K, 2), dtype=np.float32)
+    cf_zeros = np.zeros((K,), dtype=np.float32)
+
+    results = pose_model.predict(
+        source=frame_bgr,
+        imgsz=int(imgsz),
+        conf=float(yolo_conf),
+        verbose=False,
+        device=device,
+        half=bool(use_half),
+        max_det=max(1, int(max_people)),
+    )
+    if not results or len(results) == 0 or results[0].keypoints is None:
+        return xy_zeros, cf_zeros
+
+    kpts = results[0].keypoints
+    xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
+    cf_all = kpts.conf.cpu().numpy() if (hasattr(kpts, "conf") and hasattr(kpts.conf, "cpu")) else None
+
+    if xy_all.ndim != 3 or xy_all.shape[0] == 0:
+        return xy_zeros, cf_zeros
+    if xy_all.shape[1] != K:
+        raise ValueError(f"Expected {K} keypoints, got {xy_all.shape[1]}")
+
+    if cf_all is not None and cf_all.ndim == 2:
+        scores = cf_all.sum(axis=1)
+        best = int(np.argmax(scores))
+        xy = xy_all[best].astype(np.float32, copy=False)
+        cf = cf_all[best].astype(np.float32, copy=False)
+        return xy, cf
+
+    # No confidences available: treat as all-ones (model will likely ignore if use_conf=False)
+    best = 0
+    xy = xy_all[best].astype(np.float32, copy=False)
+    cf = np.ones((K,), dtype=np.float32)
+    return xy, cf
+
+
+def make_window_features(
+    xy_seq: np.ndarray,      # (L,K,2) in pixel coords
+    conf_seq: np.ndarray,    # (L,K)
     T: int,
-    stride: int,
     use_conf: bool,
     normalize: bool,
     add_vel: bool,
@@ -447,16 +414,19 @@ def make_windows(
     conf_thres: float,
     max_interp_gap: int,
     min_valid_frac: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> np.ndarray:
     """
-    Returns:
-      Xw_flat: (W,T,F)
-      win_starts: (W,)
-      xy_draw, conf_draw: filled pose for drawing (pixel coords)
+    Build a single window feature tensor (T,F) matching dataset.py + train_models.py.
     """
+    T = int(T)
+    L = int(xy_seq.shape[0])
+    if L <= 0:
+        feat_dim = expected_in_features(use_conf, add_vel, add_acc, add_global, add_mask)
+        return np.zeros((T, feat_dim), dtype=np.float32)
+
     xy_filled, conf_filled = ds._fill_and_mask_kpts(
-        xy_raw.astype(np.float32, copy=False),
-        conf_raw.astype(np.float32, copy=False),
+        xy_seq.astype(np.float32, copy=False),
+        conf_seq.astype(np.float32, copy=False),
         conf_thres=float(conf_thres),
         max_interp_gap=int(max_interp_gap),
     )
@@ -475,152 +445,79 @@ def make_windows(
             vel = ds._add_velocity_channels(xy_used)
         parts.append(ds._add_acceleration_channels(vel))
     if add_global:
-        g = ds._global_features(xy_used, conf_filled)  # (N,4)
+        g = ds._global_features(xy_used, conf_filled)  # (L,4)
         parts.append(np.repeat(g[:, None, :], repeats=K, axis=1))
 
-    Xf = np.concatenate(parts, axis=-1).astype(np.float32, copy=False)  # (N,K,C)
-    N = int(Xf.shape[0])
+    Xf = np.concatenate(parts, axis=-1).astype(np.float32, copy=False)  # (L,K,C)
 
     frac_valid = (conf_filled > float(conf_thres)).mean(axis=1)
-    frame_valid = frac_valid >= float(min_valid_frac)
+    valid = frac_valid >= float(min_valid_frac)  # (L,)
 
     layout = feature_layout(use_conf=use_conf, add_vel=add_vel, add_acc=add_acc)
-    stride = max(1, int(stride))
-    starts = list(range(0, max(1, N), stride))
+    seq = Xf
 
-    wins: List[np.ndarray] = []
-    win_starts: List[int] = []
+    if L < T:
+        pad = np.repeat(seq[-1:, :, :], repeats=(T - L), axis=0) if L > 0 else np.zeros((T, K, Xf.shape[2]), np.float32)
+        if layout["conf_idx"] is not None:
+            pad[:, :, int(layout["conf_idx"])] = 0.0
+        if layout["vel_slice"] is not None:
+            pad[:, :, layout["vel_slice"]] = 0.0
+        if layout["acc_slice"] is not None:
+            pad[:, :, layout["acc_slice"]] = 0.0
 
-    for s in starts:
-        seq = Xf[s : s + int(T)].copy()  # (L,K,C)
-        valid = frame_valid[s : s + int(T)].copy()  # (L,)
-        L = int(seq.shape[0])
+        seq = np.concatenate([seq, pad], axis=0)
+        valid = np.concatenate([valid, np.zeros((T - L,), dtype=bool)], axis=0)
 
-        if L < int(T):
-            pad = (
-                np.repeat(seq[-1:, :, :], repeats=(int(T) - L), axis=0)
-                if L > 0
-                else np.zeros((int(T), K, Xf.shape[2]), np.float32)
-            )
-            if layout["conf_idx"] is not None:
-                pad[:, :, int(layout["conf_idx"])] = 0.0
-            if layout["vel_slice"] is not None:
-                pad[:, :, layout["vel_slice"]] = 0.0
-            if layout["acc_slice"] is not None:
-                pad[:, :, layout["acc_slice"]] = 0.0
-            seq = np.concatenate([seq, pad], axis=0)
-            valid = np.concatenate([valid, np.zeros((int(T) - L,), dtype=bool)], axis=0)
+    seq = seq.copy()
+    seq[~valid] = 0.0
+    if add_mask:
+        m = np.repeat(valid.astype(np.float32)[:, None, None], repeats=K, axis=1)
+        seq = np.concatenate([seq, m], axis=-1)
 
-        seq[~valid] = 0.0
-        if add_mask:
-            m = np.repeat(valid.astype(np.float32)[:, None, None], repeats=K, axis=1)
-            seq = np.concatenate([seq, m], axis=-1)
-
-        wins.append(seq)
-        win_starts.append(int(s))
-
-        if s + stride >= N and s >= N - 1:
-            break
-
-    Xw = np.stack(wins, axis=0)  # (W,T,K,C')
-    Xw_flat = Xw.reshape(int(Xw.shape[0]), int(T), int(Xw.shape[2]) * int(Xw.shape[3])).astype(np.float32, copy=False)
-    return Xw_flat, np.array(win_starts, dtype=np.int64), xy_filled, conf_filled
+    # Flatten to (T, F)
+    return seq.reshape(T, int(seq.shape[1]) * int(seq.shape[2])).astype(np.float32, copy=False)
 
 
 @torch.no_grad()
-def infer_windows(
+def infer_one_window(
     model: nn.Module,
-    Xw: np.ndarray,
+    window_feat: np.ndarray,  # (T,F)
     device: str,
-    batch_size: int,
     use_half: bool,
     merge_fall_11_to_7: bool,
-) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> Tuple[int, float, Optional[float]]:
     model.eval()
-    W = int(Xw.shape[0])
-    preds = np.empty((W,), dtype=np.int64)
-    confs = np.empty((W,), dtype=np.float32)
-    fall_probs: Optional[np.ndarray] = None
 
-    for s in range(0, W, int(batch_size)):
-        e = min(W, s + int(batch_size))
-        xb = torch.from_numpy(Xw[s:e]).to(device)
-        xb = xb.half() if use_half else xb.float()
+    xb = torch.from_numpy(window_feat[None, ...]).to(device)
+    xb = xb.half() if use_half else xb.float()
 
-        out = model(xb)
-        fall_logit = None
-        if isinstance(out, (tuple, list)) and len(out) == 2:
-            logits, fall_logit = out[0], out[1]
-        else:
-            logits = out
+    out = model(xb)
+    fall_logit = None
+    if isinstance(out, (tuple, list)) and len(out) == 2:
+        logits, fall_logit = out[0], out[1]
+    else:
+        logits = out
 
-        if logits.ndim == 3:
-            logits = logits[:, -1, :]
+    if logits.ndim == 3:
+        logits = logits[:, -1, :]
 
-        prob = torch.softmax(logits, dim=-1)
-        if merge_fall_11_to_7:
-            if int(prob.shape[-1]) != 11:
-                raise ValueError(f"merge_fall_11_to_7=True expects 11 classes, got {int(prob.shape[-1])}")
-            prob = torch.cat([prob[:, :5].sum(dim=1, keepdim=True), prob[:, 5:]], dim=1)  # (B,7)
+    prob = torch.softmax(logits, dim=-1)
+    if merge_fall_11_to_7:
+        if int(prob.shape[-1]) != 11:
+            raise ValueError(f"merge_fall_11_to_7=True expects 11 classes, got {int(prob.shape[-1])}")
+        prob = torch.cat([prob[:, :5].sum(dim=1, keepdim=True), prob[:, 5:]], dim=1)  # (1,7)
 
-        pconf, pred = torch.max(prob, dim=-1)
-        preds[s:e] = pred.detach().cpu().numpy()
-        confs[s:e] = pconf.detach().cpu().numpy()
+    pconf, pred = torch.max(prob, dim=-1)
 
-        if fall_logit is not None:
-            if fall_probs is None:
-                fall_probs = np.zeros((W,), dtype=np.float32)
-            fall_probs[s:e] = torch.sigmoid(fall_logit.view(-1)).detach().cpu().numpy()
+    p_fall = None
+    if fall_logit is not None:
+        p_fall = float(torch.sigmoid(fall_logit.view(-1))[0].item())
 
-    return preds, confs, fall_probs
-
-
-def assign_to_frames(
-    n_frames: int,
-    win_starts: np.ndarray,
-    win_preds: np.ndarray,
-    win_confs: np.ndarray,
-    win_fall_probs: Optional[np.ndarray],
-    T: int,
-    align: str,
-    backfill: bool,
-) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    pred_f = np.full((n_frames,), -1, dtype=np.int64)
-    conf_f = np.zeros((n_frames,), dtype=np.float32)
-    fall_f = np.zeros((n_frames,), dtype=np.float32) if win_fall_probs is not None else None
-
-    for i, s in enumerate(win_starts.tolist()):
-        idx = min(int(s) + (int(T) - 1 if align == "end" else int(T) // 2), n_frames - 1)
-        pred_f[idx] = int(win_preds[i])
-        conf_f[idx] = float(win_confs[i])
-        if fall_f is not None and win_fall_probs is not None:
-            fall_f[idx] = float(win_fall_probs[i])
-
-    # forward-fill for display
-    last_p, last_c, last_f = -1, 0.0, 0.0
-    for i in range(n_frames):
-        if pred_f[i] >= 0:
-            last_p, last_c = int(pred_f[i]), float(conf_f[i])
-            if fall_f is not None:
-                last_f = float(fall_f[i])
-        else:
-            pred_f[i], conf_f[i] = last_p, last_c
-            if fall_f is not None:
-                fall_f[i] = last_f
-
-    if backfill and bool(np.any(pred_f >= 0)):
-        first = int(np.argmax(pred_f >= 0))
-        if first > 0:
-            pred_f[:first] = pred_f[first]
-            conf_f[:first] = conf_f[first]
-            if fall_f is not None:
-                fall_f[:first] = fall_f[first]
-
-    return pred_f, conf_f, fall_f
+    return int(pred.item()), float(pconf.item()), p_fall
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Infer a temporal pose model on an MP4 with YOLO pose overlay.")
+    ap = argparse.ArgumentParser(description="Stream windowed pose inference on an MP4 with YOLO pose overlay.")
     ap.add_argument("--video", type=str, required=True, help="Path to input .mp4")
     ap.add_argument("--model", type=str, required=True, help="Checkpoint *.pt OR model folder OR model .py")
     ap.add_argument("--arch", type=str, default=None, choices=KNOWN_ARCHES, help="Override model architecture if needed")
@@ -629,14 +526,11 @@ def main() -> int:
     ap.add_argument("--yolo-conf", type=float, default=0.25)
     ap.add_argument("--max-people", type=int, default=1)
     ap.add_argument("--device", type=str, default=None)
-    ap.add_argument("--half", type=int, default=0, help="Use FP16 on CUDA (0/1)")
+    ap.add_argument("--half", type=int, default=0, help="Use FP16 on CUDA for YOLO+temporal model (0/1)")
     ap.add_argument("--T", type=int, default=0, help="0 => use ckpt T_used/T, else override")
     ap.add_argument("--stride", type=int, default=0, help="0 => use ckpt stride, else override")
-    ap.add_argument("--pred-align", type=str, default="auto", choices=["auto", "center", "end"])
     ap.add_argument("--labels-file", type=str, default=None)
-    ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--display-fps", type=float, default=0.0, help="0 => source fps")
-    ap.add_argument("--backfill", type=int, default=1, help="Backfill early frames with first prediction (0/1)")
     args = ap.parse_args()
 
     video_path = Path(args.video).expanduser()
@@ -655,6 +549,8 @@ def main() -> int:
     # Preproc config (prefer checkpoint meta)
     T_final = int(args.T) if int(args.T) > 0 else int(meta.get("T", meta.get("T_used", 64)) or 64)
     stride_final = int(args.stride) if int(args.stride) > 0 else int(meta.get("stride", 18) or 18)
+    T_final = max(1, int(T_final))
+    stride_final = max(1, int(stride_final))
 
     use_conf = bool(meta.get("use_conf", True))
     normalize = bool(meta.get("normalize", True))
@@ -666,12 +562,6 @@ def main() -> int:
     max_interp_gap = int(meta.get("max_interp_gap", 5))
     min_valid_frac = float(meta.get("min_valid_frac", 0.3))
 
-    label_mode = str(meta.get("label_mode", "center"))
-    if args.pred_align == "auto":
-        pred_align = "center" if label_mode in {"center", "hybrid_center_fallpct"} else "end"
-    else:
-        pred_align = str(args.pred_align)
-
     num_classes = int(meta.get("num_classes", 0) or 0)
     in_features_meta = int(meta.get("in_features", 0) or 0)
     if num_classes <= 0:
@@ -681,45 +571,25 @@ def main() -> int:
     display_num_classes = 7 if merge_fall_11_to_7 else int(num_classes)
     class_names = load_class_names(num_classes=display_num_classes, meta=meta, labels_file=args.labels_file)
 
-    pose_model = YOLO(str(Path(args.yolo_weights).expanduser()))
-    xy_raw, conf_raw, src_fps = extract_pose_video(
-        video_path=video_path,
-        pose_model=pose_model,
-        imgsz=int(args.imgsz),
-        yolo_conf=float(args.yolo_conf),
-        device=device,
-        max_people=int(args.max_people),
-    )
-    n_frames = int(xy_raw.shape[0])
-
-    Xw, win_starts, xy_draw, conf_draw = make_windows(
-        xy_raw=xy_raw,
-        conf_raw=conf_raw,
-        T=int(T_final),
-        stride=int(stride_final),
+    in_features = expected_in_features(
         use_conf=use_conf,
-        normalize=normalize,
         add_vel=add_vel,
         add_acc=add_acc,
         add_global=add_global,
         add_mask=add_mask,
-        conf_thres=conf_thres,
-        max_interp_gap=max_interp_gap,
-        min_valid_frac=min_valid_frac,
     )
-    in_features = int(Xw.shape[-1])
-    if in_features_meta > 0 and in_features != in_features_meta:
-        raise ValueError(f"Feature mismatch: built in_features={in_features}, ckpt expects {in_features_meta}")
+    if in_features_meta > 0 and int(in_features) != int(in_features_meta):
+        raise ValueError(f"Feature mismatch: expected in_features={in_features}, ckpt expects {in_features_meta}")
 
     node_features_meta = meta.get("node_features", None)
     if node_features_meta is None:
         nf = int(in_features // K)
-        node_features_meta = nf if nf * K == in_features else None
+        node_features_meta = nf if nf * K == int(in_features) else None
 
     model = build_temporal_model(
         arch=arch,
-        in_features=in_features,
-        num_classes=num_classes,
+        in_features=int(in_features),
+        num_classes=int(num_classes),
         device=device,
         T_used=int(T_final),
         node_features=int(node_features_meta) if node_features_meta is not None else None,
@@ -729,63 +599,211 @@ def main() -> int:
         print("[WARN] missing keys:", missing[:8], "..." if len(missing) > 8 else "")
     if unexpected:
         print("[WARN] unexpected keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
+    model.eval()
 
-    t0 = time.time()
-    win_preds, win_confs, win_fall = infer_windows(
-        model=model,
-        Xw=Xw,
-        device=device,
-        batch_size=int(args.batch_size),
-        use_half=use_half,
-        merge_fall_11_to_7=merge_fall_11_to_7,
-    )
-    print(f"[infer] windows={len(win_preds)} time={time.time() - t0:.2f}s")
-
-    pred_f, conf_f, fall_f = assign_to_frames(
-        n_frames=n_frames,
-        win_starts=win_starts,
-        win_preds=win_preds,
-        win_confs=win_confs,
-        win_fall_probs=win_fall,
-        T=int(T_final),
-        align=pred_align,
-        backfill=bool(int(args.backfill)),
-    )
+    pose_model = YOLO(str(Path(args.yolo_weights).expanduser()))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video for display: {video_path}")
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    src_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(src_fps) or src_fps <= 1e-3:
+        src_fps = 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     fps_play = float(args.display_fps) if float(args.display_fps) > 1e-3 else float(src_fps)
     delay_ms = max(1, int(round(1000.0 / max(1e-6, fps_play))))
 
-    idx = 0
-    while True:
+    frames_buf: deque[np.ndarray] = deque()
+    xy_buf: deque[np.ndarray] = deque()
+    cf_buf: deque[np.ndarray] = deque()
+
+    base_idx = 0        # absolute frame index of frames_buf[0]
+    display_idx = 0     # absolute frame index being displayed
+    processed_total = 0 # absolute count of frames processed by YOLO
+    cap_done = False
+
+    window_preds: Dict[int, Tuple[int, float, Optional[float]]] = {}
+    next_win_start = 0
+
+    t_pose0 = time.time()
+
+    def process_next_frame() -> bool:
+        nonlocal processed_total, cap_done
+
         ok, frame = cap.read()
-        if not ok or idx >= n_frames:
+        if not ok:
+            cap_done = True
+            return False
+
+        xy, cf = pose_on_frame(
+            pose_model=pose_model,
+            frame_bgr=frame,
+            imgsz=int(args.imgsz),
+            yolo_conf=float(args.yolo_conf),
+            device=device,
+            max_people=int(args.max_people),
+            use_half=use_half,
+        )
+
+        frames_buf.append(frame)
+        xy_buf.append(xy)
+        cf_buf.append(cf)
+        processed_total += 1
+
+        if processed_total % 200 == 0:
+            dt = time.time() - t_pose0
+            if frame_count > 0:
+                pct = 100.0 * float(processed_total) / float(frame_count)
+                print(f"[pose] {processed_total}/{frame_count} ({pct:.1f}%) | {dt:.1f}s")
+            else:
+                print(f"[pose] {processed_total} frames | {dt:.1f}s")
+
+        return True
+
+    def compute_window_pred(start: int) -> Tuple[int, float, Optional[float]]:
+        if start in window_preds:
+            return window_preds[start]
+        if start < base_idx:
+            raise RuntimeError(f"Cannot compute window {start}: frames already dropped (base_idx={base_idx}).")
+        if start >= processed_total:
+            raise RuntimeError(f"Cannot compute window {start}: frame not processed yet (processed_total={processed_total}).")
+
+        off = int(start - base_idx)
+        avail = int(processed_total - start)
+        L = int(min(int(T_final), max(0, avail)))
+        if L <= 0:
+            raise RuntimeError(f"Window start {start} has no available frames (processed_total={processed_total}).")
+
+        xy_seq = np.stack([xy_buf[off + i] for i in range(L)], axis=0)
+        conf_seq = np.stack([cf_buf[off + i] for i in range(L)], axis=0)
+
+        window_feat = make_window_features(
+            xy_seq=xy_seq,
+            conf_seq=conf_seq,
+            T=int(T_final),
+            use_conf=use_conf,
+            normalize=normalize,
+            add_vel=add_vel,
+            add_acc=add_acc,
+            add_global=add_global,
+            add_mask=add_mask,
+            conf_thres=conf_thres,
+            max_interp_gap=max_interp_gap,
+            min_valid_frac=min_valid_frac,
+        )
+        pred, pconf, p_fall = infer_one_window(
+            model=model,
+            window_feat=window_feat,
+            device=device,
+            use_half=use_half,
+            merge_fall_11_to_7=merge_fall_11_to_7,
+        )
+        window_preds[start] = (pred, pconf, p_fall)
+        return window_preds[start]
+
+    def compute_ready_windows() -> None:
+        nonlocal next_win_start
+
+        while True:
+            if next_win_start in window_preds:
+                next_win_start += int(stride_final)
+                continue
+
+            if cap_done:
+                if next_win_start >= processed_total:
+                    break
+                compute_window_pred(int(next_win_start))
+                next_win_start += int(stride_final)
+                continue
+
+            if processed_total >= int(next_win_start) + int(T_final):
+                compute_window_pred(int(next_win_start))
+                next_win_start += int(stride_final)
+                continue
+
             break
 
-        p = int(pred_f[idx])
-        pconf = float(conf_f[idx])
-        label = class_names[p] if 0 <= p < len(class_names) else "..."
+    # Warm up: read enough frames to make the FIRST window prediction, then start display.
+    while processed_total < int(T_final) and not cap_done:
+        process_next_frame()
+    if processed_total <= 0:
+        raise RuntimeError("Video had 0 frames.")
 
+    compute_window_pred(0)
+    next_win_start = int(stride_final)
+
+    # Main loop: keep a small lookahead so each next-window prediction is ready in time.
+    window_name = "inference_on_video"
+    fps_ema: Optional[float] = None
+    ema_alpha = 0.1
+    t_prev = time.perf_counter()
+    while True:
+        if not frames_buf and cap_done:
+            break
+
+        # Keep a lead of ~T frames (plus 1) so we can predict the next window before it is displayed.
+        target_processed = int(display_idx) + int(T_final) + 1
+        while not cap_done and processed_total < target_processed:
+            process_next_frame()
+
+        compute_ready_windows()
+
+        if not frames_buf:
+            continue
+
+        win_start = (int(display_idx) // int(stride_final)) * int(stride_final)
+        if win_start not in window_preds:
+            # If we're behind (slow device), wait until we can compute it, then continue.
+            while not cap_done and processed_total < int(win_start) + int(T_final):
+                process_next_frame()
+                compute_ready_windows()
+            if win_start not in window_preds:
+                compute_window_pred(int(win_start))
+
+        pred, pconf, p_fall = window_preds.get(int(win_start), (-1, 0.0, None))
+        label = class_names[pred] if 0 <= int(pred) < len(class_names) else "..."
+
+        frame = frames_buf[0].copy()
+        xy = xy_buf[0]
+        cf = cf_buf[0]
+
+        frame = draw_pose(frame, xy, cf, conf_thres=conf_thres)
+
+        frame_info = f"frame {int(display_idx) + 1}"
+        if frame_count > 0:
+            frame_info += f"/{frame_count}"
+
+        t_now = time.perf_counter()
+        dt = max(1e-6, float(t_now - t_prev))
+        inst_fps = 1.0 / dt
+        fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+        t_prev = t_now
+
+        win_id = int(win_start) // max(1, int(stride_final))
         hud = [
-            f"frame {idx + 1}/{n_frames}",
-            f"pred: {label} ({pconf:.2f})" if p >= 0 else "pred: ...",
-            f"T={T_final} stride={stride_final} align={pred_align}",
+            frame_info,
+            f"fps: {float(fps_ema):.1f} (target {float(fps_play):.1f})",
+            f"window {win_id} (start={win_start})",
+            f"pred: {label} ({float(pconf):.2f})" if int(pred) >= 0 else "pred: ...",
+            f"T={int(T_final)} stride={int(stride_final)}",
         ]
-        if fall_f is not None:
-            hud.append(f"fall_prob: {float(fall_f[idx]):.2f}")
+        if p_fall is not None:
+            hud.append(f"fall_prob: {float(p_fall):.2f}")
 
-        frame = draw_pose(frame, xy_draw[idx], conf_draw[idx], conf_thres=conf_thres)
         frame = draw_hud(frame, hud)
 
-        cv2.imshow("inference_on_video", frame)
+        cv2.imshow(window_name, frame)
         key = cv2.waitKey(delay_ms) & 0xFF
         if key in (ord("q"), 27):
             break
 
-        idx += 1
+        frames_buf.popleft()
+        xy_buf.popleft()
+        cf_buf.popleft()
+        base_idx += 1
+        display_idx += 1
 
     cap.release()
     cv2.destroyAllWindows()
