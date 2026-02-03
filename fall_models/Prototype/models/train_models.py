@@ -24,13 +24,23 @@ from pathlib import Path
 import time
 import csv
 from datetime import datetime
+import json
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from dataset import load_windows_from_npzs, find_keypoints_npzs_subjects, WindowTensorDataset
+from dataset import (
+    load_windows_from_npzs,
+    find_keypoints_npzs_subjects,
+    WindowTensorDataset,
+    detect_label_convention_from_npzs,
+    get_new_label_names,
+    detect_label_convention as _detect_label_convention,
+    remap_label as _remap_label,
+    get_fall_merge_set as _get_fall_merge_set,
+)
 
 from .tcn.simple_tcn import TCNBaseline
 from .lstm.simple_lstm import LSTMBaseline
@@ -40,6 +50,36 @@ from .mlp.simple_mlp import MLPBaseline
 from .stgcn.simple_stgcn import STGCNBaseline
 from .cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
 
+
+# =============================================================================
+# Label scheme: merge fall subclasses into a single "Fall" class (7 classes total)
+#
+# The window labels produced by dataset.load_windows_from_npzs are now *already*
+# remapped into the merged 7-class space (0..6). Training and evaluation must
+# therefore NOT shift labels by -1.
+#
+# Auto-detection of raw NPZ label convention:
+#   - If any label 11 exists => raw convention is 1–11
+#   - Else if label 0 exists and max label is 10 => raw convention is 0–10
+# =============================================================================
+NUM_CLASSES_MERGED = 7
+FALL_CLASS_ID = 0
+
+# FALL_MERGE_SET and NEW_LABEL_NAMES are filled after we scan NPZ labels.
+FALL_MERGE_SET: set[int] = set()
+NEW_LABEL_NAMES: list[str] = []
+
+def detect_label_convention(observed_labels) -> str:
+    """Wrapper that calls the shared implementation in dataset.py."""
+    return _detect_label_convention(observed_labels)
+
+def remap_label(original_label: int, convention: str) -> int:
+    """Wrapper that calls the shared implementation in dataset.py."""
+    return _remap_label(original_label, convention)
+
+def fall_merge_set(convention: str) -> set[int]:
+    """Return the raw fall ID set for the detected convention."""
+    return _get_fall_merge_set(convention)
 
 # ----------------------------
 # Config
@@ -379,6 +419,8 @@ def train_model_once(
     cfg: TrainConfig,
     in_features: int,
     num_classes: int,
+    label_convention: str,
+    new_label_names: List[str],
     use_conf: bool,
     normalize: bool,
     add_vel: bool,
@@ -410,6 +452,17 @@ def train_model_once(
     run_dir = ckpt_root / model_name / run_id
     ckpt_path = run_dir / f"{model_name}_best.pt"
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Save a human-readable label map alongside checkpoints
+    try:
+        label_map_path = run_dir / "label_map_fallmerged.json"
+        if not label_map_path.exists():
+            label_map_path.write_text(
+                json.dumps({"label_scheme": "fall_merged_7c", "label_convention": label_convention, "id_to_name": new_label_names}, indent=2),
+                encoding="utf-8",
+            )
+    except Exception as e:
+        print(f"Warning: failed to write label map JSON: {e}")
 
     model = get_model(
         model_name=model_name,
@@ -466,6 +519,10 @@ def train_model_once(
                 "state_dict": model.state_dict(),
                 "in_features": in_features,
                 "num_classes": num_classes,
+                "label_scheme": "fall_merged_7c",
+                "label_convention": str(label_convention),
+                "new_label_names": list(new_label_names),
+                "fall_class_id": int(FALL_CLASS_ID),
                 "use_conf": bool(use_conf),
                 "normalize": bool(normalize),
                 "add_vel": bool(add_vel),
@@ -649,7 +706,7 @@ if __name__ == "__main__":
         nargs="+",
         type=int,
         default=None,
-        help="Fall class IDs in the SAME space as frame_labels in the NPZ (typically 1-based), e.g. --fall-class-ids 1 2 3 4 5"
+        help="(Optional) Raw fall class IDs in the NPZ label space (either 1..5 or 0..4). With the merged 7-class scheme this is usually unnecessary, but it is kept for backward compatibility."
     )
     parser.add_argument(
         "--fall-pct",
@@ -675,27 +732,21 @@ if __name__ == "__main__":
         raise SystemExit("--add-acc 1 requires --add-vel 1 (acc is computed from vel).")
     add_global = bool(args.add_global)
     add_mask_channel = bool(args.add_mask_channel)
-
     fall_class_ids_raw = None
     if args.fall_class_ids is not None and len(args.fall_class_ids) > 0:
         fall_class_ids_raw = [int(x) for x in args.fall_class_ids]
 
-    if args.label_mode == "hybrid_center_fallpct" and (args.fall_class_ids is None or len(args.fall_class_ids) == 0):
-        raise SystemExit("--label-mode hybrid_center_fallpct requires --fall-class-ids (e.g. 1 2 3 4 5).")
+    # NOTE: hybrid_center_fallpct no longer requires --fall-class-ids because
+    # the dataset loader auto-detects the raw label convention and knows which
+    # raw IDs correspond to fall frames.
 
-    # Convert CLI fall IDs (typically 1-based) to 0-based once.
-    # This should match y_train/y_val after you subtract 1.
-    fall_ids_0based = None
-    if fall_class_ids_raw is not None and len(fall_class_ids_raw) > 0:
-        fall_ids_0based = [int(i) - 1 for i in fall_class_ids_raw]
-
-    # Decide which models to run
     if args.all:
         model_list = ALL_MODELS
-    else:
-        if args.model is None or len(args.model) == 0:
-            raise SystemExit("You must pass --model <one or more> or use --all.")
+    elif args.model is not None:
         model_list = [m.lower().strip() for m in args.model]
+    else:
+        model_list = ["tcn"]
+
 
     # Validate model names early
     unknown = sorted(set(model_list) - set(ALL_MODELS))
@@ -728,6 +779,13 @@ if __name__ == "__main__":
     print("Val sequences:", len(val_npzs))
     print("Models to train:", model_list)
 
+    
+    # ---- Detect raw label convention once (1-11 vs 0-10), then keep it consistent ----
+    label_convention, label_stats = detect_label_convention_from_npzs(train_npzs + val_npzs)
+    NEW_LABEL_NAMES = get_new_label_names(label_convention)
+    FALL_MERGE_SET = fall_merge_set(label_convention)
+    print(f"[labels] Using raw convention: {label_convention} | New labels: {NEW_LABEL_NAMES}")
+    fall_ids_0based = [int(FALL_CLASS_ID)]
     X_train, y_train_tags, T_used = load_windows_from_npzs(
         train_npzs,
         T=int(args.T),
@@ -746,6 +804,7 @@ if __name__ == "__main__":
         fall_pct=float(args.fall_pct),
         drop_ambig_share=float(args.drop_ambig_share),
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
+        label_convention=label_convention,
     )
 
     X_val, y_val_tags, _ = load_windows_from_npzs(
@@ -766,13 +825,16 @@ if __name__ == "__main__":
         fall_pct=float(args.fall_pct),
         drop_ambig_share=0.0,  # do not drop in val
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
+        label_convention=label_convention,
     )
 
-    # Convert 1-based tags to 0-based class indices for training
-    y_train = (y_train_tags.astype(int) - 1).astype(np.int64)
-    y_val   = (y_val_tags.astype(int) - 1).astype(np.int64)
+    # Labels are already remapped to the merged 7-class space (0..6)
+    y_train = y_train_tags.astype(np.int64, copy=False)
+    y_val   = y_val_tags.astype(np.int64, copy=False)
 
-    num_classes = int(max(y_train.max(), y_val.max()) + 1)
+    num_classes = int(NUM_CLASSES_MERGED)
+    if int(y_train.max()) >= num_classes or int(y_val.max()) >= num_classes:
+        raise RuntimeError(f"Unexpected label id >= {num_classes}. Check label remap.")
     print("num_classes:", num_classes, "| T_used:", T_used)
 
     print("window:", int(T_used), "frames | stride:", int(args.stride))
@@ -780,7 +842,7 @@ if __name__ == "__main__":
     # For checkpoint selection, we can upweight minority classes using inverse train frequency.
     metric_weights_np = None
     if args.selection_metric == "inv_freq_recall":
-        counts = np.bincount(y_train, minlength=num_classes).astype(np.float32)
+        counts = np.bincount(y_train, minlength=int(num_classes)).astype(np.float32)
         w = np.zeros((num_classes,), dtype=np.float32)
         nz = counts > 0
         w[nz] = 1.0 / counts[nz]
@@ -796,7 +858,7 @@ if __name__ == "__main__":
     # pos_weight for BCE (neg/pos) computed from y_train (0-based)
     pos_weight = None
     if fall_ids_0based is not None and len(fall_ids_0based) > 0:
-        pos = int(np.isin(y_train, np.array(fall_ids_0based)).sum())
+        pos = int((y_train == int(FALL_CLASS_ID)).sum())
         neg = int(len(y_train) - pos)
         if pos > 0:
             pos_weight = neg / pos
@@ -835,6 +897,8 @@ if __name__ == "__main__":
             cfg=cfg,
             in_features=in_features,
             num_classes=num_classes,
+            label_convention=label_convention,
+            new_label_names=NEW_LABEL_NAMES,
             T_used=T_used,
             train_loader=train_loader,
             val_loader=val_loader,
