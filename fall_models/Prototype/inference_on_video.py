@@ -137,7 +137,13 @@ def resolve_ckpt_and_arch(model_arg: str, arch_arg: Optional[str]) -> Tuple[Path
 
 
 def load_checkpoint(ckpt_path: Path) -> Tuple[Dict[str, torch.Tensor], Dict[str, object]]:
-    ckpt_obj = torch.load(ckpt_path, map_location="cpu")
+    # PyTorch >=2.6 defaults `weights_only=True`, which can fail on our training checkpoints
+    # because they include non-tensor metadata (e.g., NumPy scalars). We trained these
+    # checkpoints ourselves, so we opt into the legacy behavior for compatibility.
+    try:
+        ckpt_obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt_obj = torch.load(ckpt_path, map_location="cpu")
     if isinstance(ckpt_obj, dict) and "state_dict" in ckpt_obj and isinstance(ckpt_obj["state_dict"], dict):
         return ckpt_obj["state_dict"], ckpt_obj
     if isinstance(ckpt_obj, dict):

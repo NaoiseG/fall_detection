@@ -29,7 +29,7 @@ import json
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dataset import (
     load_windows_from_npzs,
@@ -64,6 +64,7 @@ from .cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
 # =============================================================================
 NUM_CLASSES_MERGED = 7
 FALL_CLASS_ID = 0
+RARE_CLASS_IDS_MERGED = [0, 4]
 
 # FALL_MERGE_SET and NEW_LABEL_NAMES are filled after we scan NPZ labels.
 FALL_MERGE_SET: set[int] = set()
@@ -123,6 +124,47 @@ def accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
     return (preds == y).float().mean().item()
 
 
+def compute_class_weights(
+    y: np.ndarray,
+    num_classes: int,
+    mode: str = "inv_sqrt",
+    eps: float = 1e-6,
+    rare_boost: float = 1.0,
+    rare_class_ids: Optional[List[int]] = None,
+) -> np.ndarray:
+    """
+    Compute per-class weights for CrossEntropyLoss.
+
+    mode:
+      - 'none'     : uniform weights
+      - 'inv'      : weight ~ 1 / count
+      - 'inv_sqrt' : weight ~ 1 / sqrt(count)   (usually more stable)
+
+    Weights are normalised to mean=1 to keep the loss scale roughly comparable.
+    """
+    mode = str(mode).lower().strip()
+    if mode == "none":
+        return np.ones((int(num_classes),), dtype=np.float32)
+
+    counts = np.bincount(y.astype(np.int64, copy=False), minlength=int(num_classes)).astype(np.float64)
+    safe = np.maximum(counts, 1.0)
+
+    if mode == "inv":
+        w = 1.0 / (safe + float(eps))
+    elif mode == "inv_sqrt":
+        w = 1.0 / (np.sqrt(safe) + float(eps))
+    else:
+        raise ValueError(f"Unknown class weight mode: {mode}")
+
+    if rare_class_ids and float(rare_boost) != 1.0:
+        for cid in rare_class_ids:
+            if 0 <= int(cid) < int(num_classes):
+                w[int(cid)] *= float(rare_boost)
+
+    w = w / (np.mean(w) + float(eps))
+    return w.astype(np.float32, copy=False)
+
+
 @torch.no_grad()
 def _update_confusion_matrix(
     cm: torch.Tensor,
@@ -149,14 +191,18 @@ def selection_score_from_confusion(
     """Returns a scalar score where larger is better."""
     # cm: rows = true, cols = pred
     support = cm.sum(dim=1)  # (C,)
+    pred_support = cm.sum(dim=0)  # (C,)
     tp = cm.diag()
     recall = tp.float() / support.clamp(min=1).float()
+    precision = tp.float() / pred_support.clamp(min=1).float()
+    f1 = (2.0 * precision * recall) / (precision + recall).clamp(min=1e-12)
 
     mask = support > 0
     if not bool(mask.any()):
         return 0.0
 
     recall = recall[mask]
+    f1 = f1[mask]
 
     if selection_metric == "macro_recall":
         return float(recall.mean().item())
@@ -169,6 +215,9 @@ def selection_score_from_confusion(
             return float(recall.mean().item())
         w = w / w.sum()
         return float((recall * w).sum().item())
+
+    if selection_metric == "macro_f1":
+        return float(f1.mean().item())
 
     raise ValueError(f"Unknown selection_metric: {selection_metric}")
 
@@ -303,6 +352,7 @@ def train_one_epoch(
     fall_ids_0based: Optional[List[int]] = None,
     lambda_bin: float = 0.5,
     pos_weight: Optional[float] = None,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[float, float]:
     model.train()
     total_loss = 0.0
@@ -327,7 +377,7 @@ def train_one_epoch(
         out = model(X)
         activity_logits, fall_logit = unpack_model_output(out)
 
-        loss = F.cross_entropy(activity_logits, y)
+        loss = F.cross_entropy(activity_logits, y, weight=class_weights)
 
         # If the model supports fall head AND we have fall class ids, train it
         if fall_logit is not None and fall_ids_t is not None:
@@ -354,8 +404,9 @@ def eval_one_epoch(
     fall_ids_0based: Optional[List[int]] = None,
     lambda_bin: float = 0.5,
     pos_weight: Optional[float] = None,
+    class_weights: Optional[torch.Tensor] = None,
     num_classes: Optional[int] = None,
-    selection_metric: str = "inv_freq_recall",
+    selection_metric: str = "macro_f1",
     metric_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[float, float, float]:
     model.eval()
@@ -373,9 +424,9 @@ def eval_one_epoch(
         fall_ids_t = torch.tensor(fall_ids_0based, device=device, dtype=torch.long)
 
     cm = None
-    if selection_metric in {"macro_recall", "inv_freq_recall"}:
+    if selection_metric in {"macro_recall", "inv_freq_recall", "macro_f1"}:
         if num_classes is None:
-            raise ValueError("num_classes must be provided when using recall-based selection metrics.")
+            raise ValueError("num_classes must be provided when using confusion-matrix-based selection metrics.")
         cm = torch.zeros((int(num_classes), int(num_classes)), dtype=torch.long)
 
     for X, y in loader:
@@ -385,7 +436,7 @@ def eval_one_epoch(
         out = model(X)
         activity_logits, fall_logit = unpack_model_output(out)
 
-        loss = F.cross_entropy(activity_logits, y)
+        loss = F.cross_entropy(activity_logits, y, weight=class_weights)
 
         if fall_logit is not None and fall_ids_t is not None:
             fall_logit = fall_logit.view(-1, 1)
@@ -444,8 +495,9 @@ def train_model_once(
     fall_ids_0based: Optional[List[int]] = None,
     pos_weight: Optional[float] = None,
     lambda_bin: float = 0.5,
-    selection_metric: str = "inv_freq_recall",
+    selection_metric: str = "macro_f1",
     metric_weights_np: Optional[np.ndarray] = None,
+    class_weights_np: Optional[np.ndarray] = None,
 ) -> RunResult:
     model_name = model_name.lower().strip()
 
@@ -479,7 +531,11 @@ def train_model_once(
     if metric_weights_np is not None:
         metric_weights_t = torch.tensor(metric_weights_np, device=cfg.device, dtype=torch.float32)
 
-    # Best checkpoint is chosen by selection_metric (default: inv_freq_recall),
+    class_weights_t = None
+    if class_weights_np is not None:
+        class_weights_t = torch.tensor(class_weights_np, device=cfg.device, dtype=torch.float32)
+
+    # Best checkpoint is chosen by selection_metric (default: macro_f1),
     # not by overall accuracy.
     best_vs = -1.0
     best_va = -1.0
@@ -497,12 +553,14 @@ def train_model_once(
             fall_ids_0based=fall_ids_0based,
             lambda_bin=lambda_bin,
             pos_weight=pos_weight,
+            class_weights=class_weights_t,
         )
         va_loss, va_acc, va_score = eval_one_epoch(
             model, val_loader, cfg.device,
             fall_ids_0based=fall_ids_0based,
             lambda_bin=lambda_bin,
             pos_weight=pos_weight,
+            class_weights=class_weights_t,
             num_classes=num_classes,
             selection_metric=selection_metric,
             metric_weights=metric_weights_t,
@@ -542,7 +600,8 @@ def train_model_once(
                 "pos_weight": float(pos_weight) if pos_weight is not None else None,
                 "lambda_bin": float(lambda_bin),
                 "selection_metric": str(selection_metric),
-                "metric_weights": list(metric_weights_np) if metric_weights_np is not None else None,
+                "metric_weights": metric_weights_np.tolist() if metric_weights_np is not None else None,
+                "class_weights": class_weights_np.tolist() if class_weights_np is not None else None,
                 "node_features": int(node_features) if node_features is not None else None,
             }, ckpt_path)
 
@@ -698,9 +757,9 @@ if __name__ == "__main__":
     parser.add_argument("--min-valid-frac", type=float, default=0.3, help="Min fraction of joints above conf_thres for a frame to be valid.")
     parser.add_argument("--add-mask-channel", type=int, default=1, help="Append mask channel (0/1).")
     parser.add_argument("--drop-ambig-share", type=float, default=0.6,
-                        help="Train-only: drop windows where top-label share < this value. 0 disables.")
+                        help="Drop windows where top-label share < this value (measured on valid frames). 0 disables.")
     parser.add_argument("--drop-ambig-nonfall-only", type=int, default=1,
-                        help="Train-only: if 1, only drop ambiguous windows that contain no fall frames (requires --fall-class-ids).")
+                         help="If 1, only drop ambiguous windows that contain no fall frames (helps preserve fall transitions).")
     parser.add_argument(
         "--fall-class-ids",
         nargs="+",
@@ -716,11 +775,30 @@ if __name__ == "__main__":
     )
     parser.add_argument("--lambda-bin", type=float, default=0.5, help="Weight for binary fall head loss (default: 0.5)")
     parser.add_argument(
+        "--class-weight-mode",
+        type=str,
+        default="inv_sqrt",
+        choices=["none", "inv", "inv_sqrt"],
+        help="Cross-entropy class weighting to mitigate imbalance (default: inv_sqrt).",
+    )
+    parser.add_argument(
+        "--rare-class-boost",
+        type=float,
+        default=1.0,
+        help="Optional multiplicative boost applied to rare classes [0,4] in CE weights (default: 1.0).",
+    )
+    parser.add_argument(
+        "--weighted-sampler",
+        type=int,
+        default=0,
+        help="If 1, use WeightedRandomSampler for the training loader (0/1).",
+    )
+    parser.add_argument(
         "--selection-metric",
         type=str,
-        default="inv_freq_recall",
-        choices=["inv_freq_recall", "macro_recall", "acc"],
-        help="Metric used to choose the best checkpoint. inv_freq_recall upweights minority classes using inverse train frequency.",
+        default="macro_f1",
+        choices=["macro_f1", "inv_freq_recall", "macro_recall", "acc"],
+        help="Metric used to choose the best checkpoint (default: macro_f1). inv_freq_recall upweights minority classes using inverse train frequency.",
     )
     args = parser.parse_args()
 
@@ -823,7 +901,7 @@ if __name__ == "__main__":
         add_mask_channel=add_mask_channel,
         fall_ids_0based=fall_ids_0based,
         fall_pct=float(args.fall_pct),
-        drop_ambig_share=0.0,  # do not drop in val
+        drop_ambig_share=float(args.drop_ambig_share),
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
         label_convention=label_convention,
     )
@@ -850,10 +928,29 @@ if __name__ == "__main__":
             w = w / float(w.sum())
             metric_weights_np = w
         print("Selection metric:", args.selection_metric, "(minority-upweighted)")
+    elif args.selection_metric == "macro_f1":
+        print("Selection metric:", args.selection_metric, "(equal weight per class)")
     elif args.selection_metric == "macro_recall":
         print("Selection metric:", args.selection_metric, "(equal weight per class)")
     else:
         print("Selection metric:", args.selection_metric, "(overall accuracy)")
+
+    # Cross-entropy class weights to mitigate multi-class imbalance.
+    class_weights_np = None
+    if str(args.class_weight_mode).lower().strip() != "none":
+        class_weights_np = compute_class_weights(
+            y_train,
+            num_classes=int(num_classes),
+            mode=str(args.class_weight_mode),
+            rare_boost=float(args.rare_class_boost),
+            rare_class_ids=RARE_CLASS_IDS_MERGED,
+        )
+        counts_dbg = np.bincount(y_train, minlength=int(num_classes)).astype(np.int64)
+        counts_dbg_d = {int(i): int(c) for i, c in enumerate(counts_dbg.tolist()) if int(c) > 0}
+        print("Train window counts:", counts_dbg_d)
+        print("CE class weights:", [float(x) for x in class_weights_np.tolist()])
+    else:
+        print("CE class weights: disabled (--class-weight-mode none)")
 
     # pos_weight for BCE (neg/pos) computed from y_train (0-based)
     pos_weight = None
@@ -887,8 +984,25 @@ if __name__ == "__main__":
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,  drop_last=False, num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, drop_last=False, num_workers=0)
+    if bool(args.weighted_sampler):
+        sampler_weights_np = class_weights_np
+        if sampler_weights_np is None:
+            # If CE weights are disabled, still build sampler weights from inverse-sqrt counts.
+            sampler_weights_np = compute_class_weights(
+                y_train,
+                num_classes=int(num_classes),
+                mode="inv_sqrt",
+                rare_boost=float(args.rare_class_boost),
+                rare_class_ids=RARE_CLASS_IDS_MERGED,
+            )
+        sample_w = torch.from_numpy(sampler_weights_np[y_train]).double()
+        sampler = WeightedRandomSampler(weights=sample_w, num_samples=int(len(sample_w)), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=sampler, shuffle=False, drop_last=False, num_workers=0)
+        print("Train loader: WeightedRandomSampler enabled.")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False, num_workers=0)
+
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False, num_workers=0)
 
     results: List[RunResult] = []
     for m in model_list:
@@ -924,6 +1038,7 @@ if __name__ == "__main__":
             lambda_bin=float(args.lambda_bin),
             selection_metric=str(args.selection_metric),
             metric_weights_np=metric_weights_np,
+            class_weights_np=class_weights_np,
         )
         results.append(res)
 

@@ -32,12 +32,28 @@ FALL_MERGE_SET_1_11 = {1, 2, 3, 4, 5}
 FALL_MERGE_SET_0_10 = {0, 1, 2, 3, 4}
 
 # New label names (index = new class id)
-NEW_LABEL_NAMES_1_11 = ["Fall", "Class6", "Class7", "Class8", "Class9", "Class10", "Class11"]
-NEW_LABEL_NAMES_0_10 = ["Fall", "Class5", "Class6", "Class7", "Class8", "Class9", "Class10"]
+# NOTE: These names reflect the UP-Fall merged 7-class mapping used by MotionBERT:
+#   0: Fall
+#   1: Walking
+#   2: Standing
+#   3: Sitting
+#   4: Picking up an object
+#   5: Jumping
+#   6: Laying
+#
+# The raw conventions (1-11 vs 0-10) only affect how frame labels are remapped; the
+# merged 0..6 names are the same for both.
+NEW_LABEL_NAMES_1_11 = ["Fall", "Walking", "Standing", "Sitting", "Picking up an object", "Jumping", "Laying"]
+NEW_LABEL_NAMES_0_10 = ["Fall", "Walking", "Standing", "Sitting", "Picking up an object", "Jumping", "Laying"]
 
 # Filled at runtime after convention detection (for easy introspection/debugging)
 FALL_MERGE_SET: set[int] = set()
 NEW_LABEL_NAMES: list[str] = []
+
+# When dropping ambiguous windows (drop_ambig_share), always keep windows that
+# contain these merged-class IDs. This helps avoid further undersampling for
+# rare/important classes (e.g., Fall=0, Picking up an object=4).
+AMBIG_KEEP_CLASS_IDS_MERGED: set[int] = {0, 4}
 
 
 def detect_label_convention(observed_labels: Iterable[int], hint: Optional[str] = None) -> str:
@@ -546,7 +562,16 @@ def _make_sliding_windows(
         # Build mask: 1 only where frame_valid is True (and non-padded)
         mask_t = valid.astype(np.float32)  # (T,)
 
-        # Optional: drop ambiguous windows (train-time only).
+        # Center label (merged space) is used both for window labeling and for
+        # safeguarding rare classes from ambiguity-based dropping.
+        c = T // 2
+        if valid[c]:
+            center_y = int(labs[c])
+        else:
+            idxs = np.where(valid)[0]
+            center_y = int(labs[idxs[len(idxs)//2]]) if idxs.size > 0 else int(labs[c])
+
+        # Optional: drop ambiguous windows.
         # Ambiguity is measured on *valid* frames, in merged label space.
         if drop_ambig_share and drop_ambig_share > 0.0:
             labs_valid = labs[valid]
@@ -554,7 +579,11 @@ def _make_sliding_windows(
                 _vals, counts_v = np.unique(labs_valid, return_counts=True)
                 top_share = float(counts_v.max()) / float(labs_valid.size)
                 if top_share < float(drop_ambig_share):
-                    if bool(drop_ambig_nonfall_only):
+                    keep_ids = AMBIG_KEEP_CLASS_IDS_MERGED
+                    # Never drop windows that contain (or are centered on) rare classes.
+                    if (int(center_y) in keep_ids) or bool(np.any(np.isin(labs_valid, list(keep_ids)))):
+                        pass
+                    elif bool(drop_ambig_nonfall_only):
                         has_any_fall = bool(np.any(labs_valid == 0))
                         if not has_any_fall:
                             continue
@@ -565,13 +594,6 @@ def _make_sliding_windows(
         seq[~valid] = 0.0
 
         # Label assignment (merged space)
-        c = T // 2
-        if valid[c]:
-            center_y = int(labs[c])
-        else:
-            idxs = np.where(valid)[0]
-            center_y = int(labs[idxs[len(idxs)//2]]) if idxs.size > 0 else int(labs[c])
-
         if binary_any_fall:
             y = 1 if bool(np.any(labs[valid] == 0)) else 0
 

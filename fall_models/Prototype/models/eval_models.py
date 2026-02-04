@@ -427,18 +427,30 @@ def ensure_dir(p: Path):
 
 def make_cm_plot(cm: np.ndarray, class_names: List[str], out_path: Path, title: str):
     import matplotlib.pyplot as plt
-    plt.figure(figsize=(7, 6))
-    plt.imshow(cm, interpolation='nearest')
-    plt.title(title)
-    plt.colorbar()
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax)
+
     tick_marks = np.arange(len(class_names))
-    plt.xticks(tick_marks, class_names, rotation=45, ha='right')
-    plt.yticks(tick_marks, class_names)
-    plt.ylabel('True')
-    plt.xlabel('Predicted')
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
+    ax.set_xticks(tick_marks)
+    ax.set_xticklabels(class_names, rotation=45, ha="right")
+    ax.set_yticks(tick_marks)
+    ax.set_yticklabels(class_names)
+    ax.set_ylabel("True")
+    ax.set_xlabel("Predicted")
+
+    fmt = "d" if np.issubdtype(cm.dtype, np.integer) else ".2f"
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            v = cm[i, j]
+            color = "white" if float(v) == 0.0 else "black"
+            ax.text(j, i, format(v, fmt), ha="center", va="center", color=color)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 
 def make_plots(summary_df: pd.DataFrame, plots_dir: Path):
