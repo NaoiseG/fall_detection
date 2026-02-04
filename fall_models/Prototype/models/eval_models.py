@@ -99,7 +99,7 @@ from .mlp.simple_mlp import MLPBaseline
 from .stgcn.simple_stgcn import STGCNBaseline
 
 # NEW: CNN + LSTM two-head model
-from .cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
+from .cnnlstm.cnn_lstm import CNNLSTMTwoHead
 
 
 import inspect

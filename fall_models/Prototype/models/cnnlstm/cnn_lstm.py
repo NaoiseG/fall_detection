@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional
 
 
@@ -10,8 +9,7 @@ class CNNLSTMTwoHead(nn.Module):
       x: (B, T, F)
 
     Output:
-      activity_logits: (B, num_classes)
-      fall_logit: (B, 1)
+      logits: (B, num_classes)
 
     If (num_keypoints, kp_channels) are provided AND F == K*Ck:
       uses a small Conv1d over joints (K) with channels=Ck per frame.
@@ -99,9 +97,8 @@ class CNNLSTMTwoHead(nn.Module):
         # Optional dropout before heads
         self.window_dropout = nn.Dropout(self.dropout_p)
 
-        # ----- Two heads -----
+        # ----- Classification head -----
         self.activity_head = nn.Linear(self.hidden_size, self.num_classes)
-        self.fall_head = nn.Linear(self.hidden_size, 1)
 
     def _encode_frames_keypoint_cnn(self, x_bt: torch.Tensor, K: int, Ck: int) -> torch.Tensor:
         """
@@ -131,13 +128,12 @@ class CNNLSTMTwoHead(nn.Module):
         frame_emb = self.feat_proj(h)            # (B*T, E)
         return frame_emb
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, T, F)
 
         Returns:
-          activity_logits: (B, num_classes)
-          fall_logit: (B, 1)
+          logits: (B, num_classes)
         """
         # Shape checks
         assert x.dim() == 3, f"Expected (B,T,F), got {tuple(x.shape)}"
@@ -175,8 +171,6 @@ class CNNLSTMTwoHead(nn.Module):
 
         win_emb = self.window_dropout(win_emb)
 
-        # Heads
-        activity_logits = self.activity_head(win_emb)                  # (B, C)
-        fall_logit = self.fall_head(win_emb)                           # (B, 1)
-
-        return activity_logits, fall_logit
+        # Head
+        logits = self.activity_head(win_emb)                           # (B, C)
+        return logits

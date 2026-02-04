@@ -34,7 +34,7 @@ from models.mlp.simple_mlp import MLPBaseline
 from models.stgcn.simple_stgcn import STGCNBaseline
 
 try:
-    from models.cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
+    from models.cnnlstm.cnn_lstm import CNNLSTMTwoHead
 except Exception:
     CNNLSTMTwoHead = None
 

@@ -48,7 +48,7 @@ from .gru.simple_gru import GRUBaseline
 from .gcn.simple_gcn import GCNBaseline
 from .mlp.simple_mlp import MLPBaseline
 from .stgcn.simple_stgcn import STGCNBaseline
-from .cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
+from .cnnlstm.cnn_lstm import CNNLSTMTwoHead
 
 
 # =============================================================================
