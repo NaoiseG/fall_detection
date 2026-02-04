@@ -1,101 +1,155 @@
 #!/usr/bin/env python3
 """
-Offline video -> YOLOv11 pose -> MotionBERT ActionNet (LITE) inference.
+Offline video -> YOLOv11 pose -> MotionBERT ActionNet inference.
 
 This script:
 1) Runs YOLOv11 pose on a video
 2) Builds a MotionBERT action .pkl (same schema as prepare_motionbert_dataset.py)
-3) Loads MotionBERT ActionNet checkpoint (best_epoch.bin)
+3) Loads a MotionBERT ActionNet checkpoint (*.bin)
 4) Runs per-window predictions and saves a CSV
 
-
-Optional flags you’ll probably care about
-
---config (defaults to MB_ft_UPFall_xsub_LITE.yaml)
---yolo-weights (defaults to yolo11l-pose.pt)
---win-len (defaults to config.clip_len)
---win-step (default 16)
---pad-tail (pad short tail windows instead of dropping)
---out-pkl (default motionbert_video.pkl)
---out-csv (default motionbert_video_preds.csv)
---labels-file (override class names)
---keep-empty-windows (if you want to keep empty/degenerate windows)
+Notes
+- Preprocessing mirrors MotionBERT training (models/MotionBERT/lib/data/dataset_action.py):
+  make_cam -> human_tracking -> coco2h36m -> concat conf -> resample -> crop_scale
+- You can pass paths relative to:
+    - your current working directory
+    - this repo root (fall_models/Prototype)
+    - MotionBERT root (fall_models/Prototype/models/MotionBERT)
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import os
-import sys
 import pickle
+import sys
+import threading
+import time
+import queue
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-import cv2
 from ultralytics import YOLO
 
 # -----------------------------------------------------------------------------
-# MotionBERT imports (add repo root for MotionBERT to sys.path)
+# MotionBERT imports: add MotionBERT repo root to sys.path
 # -----------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).resolve().parent
 _MB_ROOT = _REPO_ROOT / "models" / "MotionBERT"
-if str(_MB_ROOT) not in sys.path:
+if _MB_ROOT.exists() and str(_MB_ROOT) not in sys.path:
     sys.path.insert(0, str(_MB_ROOT))
 
-from models.MotionBERT.lib.utils.tools import get_config, read_pkl  # noqa: E402
-from models.MotionBERT.lib.utils.learning import load_backbone  # noqa: E402
-from models.MotionBERT.lib.model.model_action import ActionNet  # noqa: E402
-from models.MotionBERT.lib.data.dataset_action import make_cam, coco2h36m, human_tracking  # noqa: E402
-from models.MotionBERT.lib.utils.utils_data import crop_scale, resample  # noqa: E402
+from lib.utils.tools import get_config  # noqa: E402
+from lib.utils.learning import load_backbone  # noqa: E402
+from lib.model.model_action import ActionNet  # noqa: E402
+from lib.data.dataset_action import make_cam, coco2h36m, human_tracking  # noqa: E402
+from lib.utils.utils_data import crop_scale, resample  # noqa: E402
 
 # -----------------------------------------------------------------------------
 # Labels
 # -----------------------------------------------------------------------------
 CLASS_NAMES_DEFAULT = [
-    "Falling forward using hands",        # 0
-    "Falling forward using knees",        # 1
-    "Falling backwards",                  # 2
-    "Falling sideward",                   # 3
+    "Falling forward using hands",  # 0
+    "Falling forward using knees",  # 1
+    "Falling backwards",  # 2
+    "Falling sideward",  # 3
     "Falling sitting in an empty chair",  # 4
-    "Walking",                            # 5
-    "Standing",                           # 6
-    "Sitting",                            # 7
-    "Picking up an object",               # 8
-    "Jumping",                            # 9
-    "Laying",                             # 10
+    "Walking",  # 5
+    "Standing",  # 6
+    "Sitting",  # 7
+    "Picking up an object",  # 8
+    "Jumping",  # 9
+    "Laying",  # 10
+]
+
+CLASS_NAMES_MERGED_DEFAULT = [
+    "Fall",  # 0 (all fall subclasses merged)
+    "Walking",  # 1
+    "Standing",  # 2
+    "Sitting",  # 3
+    "Picking up an object",  # 4
+    "Jumping",  # 5
+    "Laying",  # 6
 ]
 
 FALL_CLASS_IDS_DEFAULT = [0, 1, 2, 3, 4]
 
-# COCO keypoint order for YOLO pose (17 joints)
+# COCO keypoint order for Ultralytics pose models (17 joints)
 K = 17
 
 SKELETON = [
-    (5, 7), (7, 9),        # left arm
-    (6, 8), (8, 10),       # right arm
-    (11, 13), (13, 15),    # left leg
-    (12, 14), (14, 16),    # right leg
-    (5, 6),                # shoulders
-    (11, 12),              # hips
-    (5, 11), (6, 12),      # torso sides
+    (5, 7),
+    (7, 9),  # left arm
+    (6, 8),
+    (8, 10),  # right arm
+    (11, 13),
+    (13, 15),  # left leg
+    (12, 14),
+    (14, 16),  # right leg
+    (5, 6),  # shoulders
+    (11, 12),  # hips
+    (5, 11),
+    (6, 12),  # torso sides
 ]
 
 
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
-
 def pick_device(device: Optional[str]) -> str:
-    if device is None:
+    if not device:
         return "cuda" if torch.cuda.is_available() else "cpu"
-    d = device.lower()
+    d = device.lower().strip()
     if d.startswith("cuda") and not torch.cuda.is_available():
         return "cpu"
     return device
+
+
+def resolve_path(path: str, *, desc: str) -> Path:
+    """
+    Resolve a user-provided path in a forgiving way:
+      1) as given (relative to CWD)
+      2) relative to this repo root (where this file lives)
+      3) relative to MotionBERT root (repo_root/models/MotionBERT)
+    """
+    p = Path(path).expanduser()
+    if p.exists():
+        return p
+
+    repo_rel = (_REPO_ROOT / path).expanduser()
+    if repo_rel.exists():
+        return repo_rel
+
+    mb_rel = (_MB_ROOT / path).expanduser()
+    if mb_rel.exists():
+        return mb_rel
+
+    raise FileNotFoundError(f"{desc} not found: {path}")
+
+
+def resolve_checkpoint_path(ckpt: str) -> Path:
+    """
+    Accept either:
+      - a checkpoint file (e.g. best_epoch.bin)
+      - a checkpoint directory containing best_epoch.bin
+    """
+    p = resolve_path(ckpt, desc="Checkpoint")
+    if p.is_file():
+        return p
+
+    best = p / "best_epoch.bin"
+    if best.exists():
+        return best
+    latest = p / "latest_epoch.bin"
+    if latest.exists():
+        return latest
+
+    bins = sorted(p.glob("**/*.bin"), key=lambda x: x.stat().st_mtime, reverse=True)
+    if bins:
+        return bins[0]
+
+    raise FileNotFoundError(f"No *.bin checkpoints found under: {p.as_posix()}")
 
 
 def infer_fall_indices(class_names: List[str]) -> List[int]:
@@ -149,14 +203,24 @@ def interpolate_missing_joints_inplace(
                 kxy[:, j, a] = 0.0
 
 
-def draw_hud(frame, lines, org=(10, 10), font=cv2.FONT_HERSHEY_SIMPLEX,
-             font_scale=0.7, thickness=2, pad=8, line_gap=6,
-             bg_color=(0, 0, 0), bg_alpha=0.6, text_color=(255, 255, 255)):
+def draw_hud(
+    frame,
+    lines,
+    org=(10, 10),
+    font=cv2.FONT_HERSHEY_SIMPLEX,
+    font_scale=0.7,
+    thickness=2,
+    pad=8,
+    line_gap=6,
+    bg_color=(0, 0, 0),
+    bg_alpha=0.6,
+    text_color=(255, 255, 255),
+):
     if not lines:
         return frame
 
     x0, y0 = org
-    sizes = [cv2.getTextSize(s, font, font_scale, thickness)[0] for s in lines]
+    sizes = [cv2.getTextSize(str(s), font, font_scale, thickness)[0] for s in lines]
     max_w = max(w for w, h in sizes)
     total_h = sum(h for w, h in sizes) + line_gap * (len(lines) - 1)
 
@@ -174,7 +238,7 @@ def draw_hud(frame, lines, org=(10, 10), font=cv2.FONT_HERSHEY_SIMPLEX,
     y = y0 + pad
     for (w, h), s in zip(sizes, lines):
         y += h
-        cv2.putText(frame, s, (x0 + pad, y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+        cv2.putText(frame, str(s), (x0 + pad, y), font, font_scale, text_color, thickness, cv2.LINE_AA)
         y += line_gap
 
     return frame
@@ -230,19 +294,6 @@ def build_windows(
     if T_total <= 0:
         return split_list, annotations
 
-    def compute_num_windows(T_total: int) -> int:
-        if pad_tail:
-            if T_total <= 0:
-                return 0
-            return int((max(0, T_total - 1)) // win_step + 1)
-        if T_total < win_len:
-            return 0
-        return int((T_total - win_len) // win_step + 1)
-
-    n_wins = compute_num_windows(T_total)
-    if n_wins == 0:
-        return split_list, annotations
-
     for start in range(0, T_total, win_step):
         end = start + win_len
         if end > T_total:
@@ -254,8 +305,8 @@ def build_windows(
 
         frame_dir = f"{video_stem}_s{start}_len{win_len}"
 
-        raw_kxy = kpts_xy[start:min(end, T_total)].astype(np.float32)
-        raw_ksc = kpts_conf[start:min(end, T_total)].astype(np.float32)
+        raw_kxy = kpts_xy[start : min(end, T_total)].astype(np.float32)
+        raw_ksc = kpts_conf[start : min(end, T_total)].astype(np.float32)
 
         if pad_tail and end > T_total:
             last_xy = raw_kxy[-1:, :, :]
@@ -277,7 +328,7 @@ def build_windows(
             nonfinite_joint = nonfinite_xy.any(axis=2) | nonfinite_sc
             ksc[nonfinite_joint] = 0.0
 
-        if ((ksc < 0).any() or (ksc > 1).any()):
+        if (ksc < 0).any() or (ksc > 1).any():
             ksc = np.clip(ksc, 0.0, 1.0)
 
         interpolate_missing_joints_inplace(kxy, ksc, missing_conf_thres=missing_conf_thres)
@@ -291,14 +342,16 @@ def build_windows(
         keypoint = kxy[None, ...].astype(np.float32)
         keypoint_score = ksc[None, ...].astype(np.float32)
 
-        annotations.append({
-            "frame_dir": frame_dir,
-            "total_frames": int(win_len),
-            "img_shape": (int(img_shape[0]), int(img_shape[1])),
-            "keypoint": keypoint,
-            "keypoint_score": keypoint_score,
-            "label": 0,
-        })
+        annotations.append(
+            {
+                "frame_dir": frame_dir,
+                "total_frames": int(win_len),
+                "img_shape": (int(img_shape[0]), int(img_shape[1])),
+                "keypoint": keypoint,
+                "keypoint_score": keypoint_score,
+                "label": 0,
+            }
+        )
         split_list.append(frame_dir)
 
         if (not pad_tail) and end >= T_total:
@@ -312,11 +365,15 @@ def build_motion_from_annotation(
     clip_len: int,
     scale_range: Optional[List[float]],
 ) -> np.ndarray:
+    """
+    Build MotionBERT ActionNet input exactly like MotionBERT's dataset_action.NTURGBD:
+      resample -> make_cam -> human_tracking -> coco2h36m -> concat conf -> crop_scale
+    """
     keypoint = ann["keypoint"]  # (1, T, 17, 2)
     keypoint_score = ann["keypoint_score"]  # (1, T, 17)
     img_shape = ann["img_shape"]
 
-    resample_id = resample(ori_len=ann["total_frames"], target_len=clip_len, randomness=False)
+    resample_id = resample(ori_len=int(ann["total_frames"]), target_len=int(clip_len), randomness=False)
     motion_cam = make_cam(x=keypoint, img_shape=img_shape)
     motion_cam = human_tracking(motion_cam)
     motion_cam = coco2h36m(motion_cam)
@@ -336,9 +393,7 @@ def build_motion_from_annotation(
 def load_labels_file(path: Optional[str]) -> Optional[List[str]]:
     if not path:
         return None
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"--labels-file not found: {p.as_posix()}")
+    p = resolve_path(path, desc="Labels file")
     names = [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
     return names or None
 
@@ -353,10 +408,86 @@ def pad_or_trim(names: List[str], num_classes: int) -> List[str]:
     return names
 
 
+def window_start_end_from_frame_dir(frame_dir: str, total_frames: int) -> Tuple[int, int]:
+    start_frame = 0
+    try:
+        parts = frame_dir.split("_s", 1)
+        if len(parts) > 1:
+            start_frame = int(parts[1].split("_len", 1)[0])
+    except Exception:
+        start_frame = 0
+    end_frame = int(start_frame) + int(total_frames) - 1
+    return int(start_frame), int(end_frame)
+
+
+def predict_one_window(
+    *,
+    model: nn.Module,
+    device: str,
+    ann: dict,
+    frame_dir: str,
+    clip_len: int,
+    scale_range: Optional[List[float]],
+    merge_fall: bool,
+    fall_idx: List[int],
+    class_names_out: List[str],
+    unmerged_len_expected: int,
+    merged_len_expected: int,
+) -> dict:
+    motion = build_motion_from_annotation(ann, clip_len=clip_len, scale_range=scale_range)
+
+    X = torch.from_numpy(motion).unsqueeze(0).to(device)
+    with torch.no_grad():
+        out = model(X)
+        probs_t = torch.softmax(out, dim=1).squeeze(0).detach().cpu().numpy()
+
+    if merge_fall:
+        if probs_t.shape[0] == merged_len_expected:
+            merged_probs = probs_t
+            fall_prob = float(merged_probs[0]) if merged_probs.size else 0.0
+        elif probs_t.shape[0] == unmerged_len_expected:
+            fall_prob = float(np.sum(probs_t[FALL_CLASS_IDS_DEFAULT]))
+            nonfall_probs = [probs_t[i] for i in range(unmerged_len_expected) if i not in FALL_CLASS_IDS_DEFAULT]
+            merged_probs = np.array([fall_prob] + nonfall_probs, dtype=np.float32)
+        else:
+            merged_probs = probs_t
+            fall_prob = float(np.sum(probs_t[fall_idx])) if fall_idx else 0.0
+    else:
+        merged_probs = probs_t
+        fall_prob = float(np.sum(probs_t[fall_idx])) if fall_idx else 0.0
+
+    pred_id = int(np.argmax(merged_probs))
+    pred_conf = float(np.max(merged_probs))
+    p_fall = float(fall_prob)
+
+    start_frame, end_frame = window_start_end_from_frame_dir(frame_dir, int(ann["total_frames"]))
+    pred_name = class_names_out[pred_id] if 0 <= pred_id < len(class_names_out) else str(pred_id)
+
+    return {
+        "frame_dir": str(frame_dir),
+        "start_frame": int(start_frame),
+        "end_frame": int(end_frame),
+        "pred_id": int(pred_id),
+        "pred_name": str(pred_name),
+        "pred_conf": float(pred_conf),
+        "p_fall": float(p_fall),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt-dir", type=str, required=True, help="Directory containing best_epoch.bin")
-    ap.add_argument("--config", type=str, default="models/MotionBERT/configs/action/MB_ft_UPFall_xsub_LITE.yaml")
+    ap.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Path to MotionBERT checkpoint (*.bin) OR checkpoint directory (contains best_epoch.bin)",
+    )
+    ap.add_argument(
+        "--config",
+        type=str,
+        default="configs/action/MB_ft_UPFall_xsub_LITE.yaml",
+        help="MotionBERT config yaml (can be relative to models/MotionBERT/)",
+    )
     ap.add_argument("--video", type=str, required=True, help="Path to input mp4")
     ap.add_argument("--yolo-weights", type=str, default="yolo11l-pose.pt")
     ap.add_argument("--device", type=str, default=None)
@@ -379,22 +510,18 @@ def main() -> int:
 
     device = pick_device(args.device)
 
-    ckpt_dir = Path(args.ckpt_dir)
-    ckpt_path = ckpt_dir / "best_epoch.bin"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path.as_posix()}")
+    ckpt_path = resolve_checkpoint_path(args.model)
+    video_path = resolve_path(args.video, desc="Video")
+    cfg_path = resolve_path(args.config, desc="Config")
+    yolo_path = resolve_path(args.yolo_weights, desc="YOLO weights")
 
-    video_path = Path(args.video)
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video not found: {video_path.as_posix()}")
-
-    cfg = get_config(args.config)
+    cfg = get_config(str(cfg_path))
     clip_len = int(args.win_len) if args.win_len is not None else int(getattr(cfg, "clip_len", 64))
 
     # ------------------------------------------------------------------
     # 1) YOLOv11 pose extraction
     # ------------------------------------------------------------------
-    pose_model = YOLO(args.yolo_weights)
+    pose_model = YOLO(str(yolo_path))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -431,10 +558,13 @@ def main() -> int:
             cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
 
             if xy_all.ndim == 3 and xy_all.shape[0] > 0:
-                scores = cf_all.sum(axis=1)
-                best = int(np.argmax(scores))
+                scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
+                best = int(np.argmax(scores)) if scores is not None else 0
                 kpts_xy = xy_all[best].astype(np.float32)
-                kpts_conf = cf_all[best].astype(np.float32)
+                if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
+                    kpts_conf = cf_all[best].astype(np.float32)
+                else:
+                    kpts_conf = np.ones((17,), dtype=np.float32)
 
         frames_xy.append(kpts_xy)
         frames_cf.append(kpts_conf)
@@ -491,7 +621,7 @@ def main() -> int:
         num_joints=getattr(cfg, "num_joints", 17),
     )
 
-    use_dp = (device.startswith("cuda") and torch.cuda.device_count() > 1)
+    use_dp = device.startswith("cuda") and torch.cuda.device_count() > 1
     if use_dp:
         model = nn.DataParallel(model)
     model = model.to(device)
@@ -502,137 +632,202 @@ def main() -> int:
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    num_classes = int(getattr(cfg, "action_classes", 11))
-    merge_fall = not bool(args.no_merge_fall)
-    labels_file_names = load_labels_file(args.labels_file)
-
-    merged_len_expected = 1 + (len(CLASS_NAMES_DEFAULT) - len(FALL_CLASS_IDS_DEFAULT))
-
-    if merge_fall:
-        # If labels file already looks merged (e.g., 7 classes), use it directly.
-        if labels_file_names is not None and len(labels_file_names) in (merged_len_expected, num_classes):
-            merged_class_names = list(labels_file_names)
-        else:
-            raw_names = list(labels_file_names) if labels_file_names is not None else list(CLASS_NAMES_DEFAULT)
-            merged_class_names = ["Fall"] + [raw_names[i] for i in range(len(raw_names)) if i not in FALL_CLASS_IDS_DEFAULT]
-    else:
-        base = list(labels_file_names) if labels_file_names is not None else list(CLASS_NAMES_DEFAULT)
-        merged_class_names = pad_or_trim(base, num_classes)
-
-    fall_idx = infer_fall_indices(merged_class_names)
-
     # ------------------------------------------------------------------
     # 4) Run per-window inference
     # ------------------------------------------------------------------
-    dataset_loaded = read_pkl(str(out_pkl))
-    split = dataset_loaded["split"]["xsub_val"]
-    ann_map = {ann["frame_dir"]: ann for ann in dataset_loaded["annotations"]}
-
+    num_classes = int(getattr(cfg, "action_classes", 11))
     scale_range = getattr(cfg, "scale_range_test", None)
+
+    labels_file_names = load_labels_file(args.labels_file)
+
+    unmerged_len_expected = len(CLASS_NAMES_DEFAULT)
+    merged_len_expected = len(CLASS_NAMES_MERGED_DEFAULT)
+
+    # Only merge at inference time when the model is trained with separate fall subclasses (11-class).
+    merge_fall = (not bool(args.no_merge_fall)) and (num_classes == unmerged_len_expected)
+
+    if labels_file_names is not None:
+        if merge_fall and len(labels_file_names) == merged_len_expected:
+            # User provided already-merged display names (7).
+            class_names_out = list(labels_file_names)
+        else:
+            # User provided names matching the model output space.
+            base_names = pad_or_trim(list(labels_file_names), num_classes)
+            if merge_fall:
+                class_names_out = ["Fall"] + [base_names[i] for i in range(unmerged_len_expected) if i not in FALL_CLASS_IDS_DEFAULT]
+            else:
+                class_names_out = base_names
+    else:
+        # No labels file: choose a sane default taxonomy for the configured model output space.
+        if num_classes == merged_len_expected:
+            class_names_out = list(CLASS_NAMES_MERGED_DEFAULT)
+        else:
+            base_names = pad_or_trim(list(CLASS_NAMES_DEFAULT), num_classes)
+            if merge_fall:
+                class_names_out = ["Fall"] + [base_names[i] for i in range(unmerged_len_expected) if i not in FALL_CLASS_IDS_DEFAULT]
+            else:
+                class_names_out = base_names
+
+    fall_idx = infer_fall_indices(class_names_out)
 
     out_csv = Path(args.out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    preds_for_display = []
+    ann_map = {ann["frame_dir"]: ann for ann in annotations}
 
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "frame_dir",
-            "start_frame",
-            "end_frame",
-            "pred_id",
-            "pred_name",
-            "pred_conf",
-            "p_fall",
-        ])
+    preds_for_display: List[dict] = []
+    preds_by_start: dict[int, dict] = {}
+    preds_lock = threading.Lock()
 
-        for frame_dir in split:
-            ann = ann_map[frame_dir]
-            motion = build_motion_from_annotation(ann, clip_len=clip_len, scale_range=scale_range)
+    def write_header(writer: csv.writer) -> None:
+        writer.writerow(
+            [
+                "frame_dir",
+                "start_frame",
+                "end_frame",
+                "pred_id",
+                "pred_name",
+                "pred_conf",
+                "p_fall",
+            ]
+        )
 
-            X = torch.from_numpy(motion).unsqueeze(0).to(device)
-            with torch.no_grad():
-                out = model(X)
-                probs_t = torch.softmax(out, dim=1).squeeze(0).detach().cpu().numpy()
-
-            # Merge first five fall classes into a single "Fall" class for display/output.
-            if merge_fall:
-                if probs_t.shape[0] == len(merged_class_names):
-                    merged_probs = probs_t
-                    fall_prob = float(merged_probs[0]) if len(merged_probs) > 0 else 0.0
-                elif probs_t.shape[0] == len(CLASS_NAMES_DEFAULT):
-                    fall_prob = float(np.sum(probs_t[FALL_CLASS_IDS_DEFAULT]))
-                    nonfall_probs = [probs_t[i] for i in range(len(probs_t)) if i not in FALL_CLASS_IDS_DEFAULT]
-                    merged_probs = np.array([fall_prob] + nonfall_probs, dtype=np.float32)
-                else:
-                    merged_probs = probs_t
-                    fall_prob = float(np.sum(probs_t[FALL_CLASS_IDS_DEFAULT])) if probs_t.shape[0] > max(FALL_CLASS_IDS_DEFAULT) else 0.0
-            else:
-                merged_probs = probs_t
-                fall_prob = float(np.sum(probs_t[fall_idx])) if fall_idx else 0.0
-
-            pred_id = int(np.argmax(merged_probs))
-            pred_conf = float(np.max(merged_probs))
-            p_fall = float(fall_prob)
-
-            # parse window start from frame_dir
-            start_frame = 0
-            end_frame = ann["total_frames"] - 1
-            try:
-                parts = frame_dir.split("_s")
-                if len(parts) > 1:
-                    start_frame = int(parts[1].split("_len")[0])
-                    end_frame = start_frame + int(ann["total_frames"]) - 1
-            except Exception:
-                pass
-
-            pred_name = merged_class_names[pred_id] if 0 <= pred_id < len(merged_class_names) else str(pred_id)
-
-            writer.writerow([
-                frame_dir,
-                start_frame,
-                end_frame,
-                pred_id,
-                pred_name,
-                f"{pred_conf:.6f}",
-                f"{p_fall:.6f}",
-            ])
-            preds_for_display.append({
-                "start_frame": int(start_frame),
-                "end_frame": int(end_frame),
-                "pred_id": int(pred_id),
-                "pred_name": str(pred_name),
-                "pred_conf": float(pred_conf),
-                "p_fall": float(p_fall),
-            })
-
-    print(f"Saved pkl: {out_pkl.as_posix()}")
-    print(f"Saved predictions: {out_csv.as_posix()}")
-    print(f"Windows: {len(split)}")
+    def write_pred_row(writer: csv.writer, pred: dict) -> None:
+        writer.writerow(
+            [
+                pred["frame_dir"],
+                pred["start_frame"],
+                pred["end_frame"],
+                pred["pred_id"],
+                pred["pred_name"],
+                f"{float(pred['pred_conf']):.6f}",
+                f"{float(pred['p_fall']):.6f}",
+            ]
+        )
 
     # ------------------------------------------------------------------
-    # 5) Optional display with pose + current window prediction
+    # 4) Predict windows (optionally streaming into display)
     # ------------------------------------------------------------------
-    if args.display:
-        preds_for_display.sort(key=lambda x: x["start_frame"])
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Failed to open video for display: {video_path.as_posix()}")
+    predict_kwargs = dict(
+        model=model,
+        device=device,
+        clip_len=clip_len,
+        scale_range=scale_range,
+        merge_fall=merge_fall,
+        fall_idx=fall_idx,
+        class_names_out=class_names_out,
+        unmerged_len_expected=unmerged_len_expected,
+        merged_len_expected=merged_len_expected,
+    )
 
-        cv2.namedWindow("MotionBERT Inference", cv2.WINDOW_NORMAL)
-        cap_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        display_fps = float(args.display_fps) if args.display_fps is not None else cap_fps
-        if not np.isfinite(display_fps) or display_fps <= 0.0:
-            display_fps = 30.0
-        delay_ms = max(1, int(1000.0 / display_fps))
-        print(f"[Display] Playing at ~{display_fps:.2f} FPS. Press 'q' or Esc to quit.", flush=True)
+    if not args.display:
+        with out_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            write_header(writer)
+            for frame_dir in split_list:
+                ann = ann_map[frame_dir]
+                pred = predict_one_window(ann=ann, frame_dir=frame_dir, **predict_kwargs)
+                write_pred_row(writer, pred)
+        print(f"Saved pkl: {out_pkl.as_posix()}")
+        print(f"Saved predictions: {out_csv.as_posix()}")
+        print(f"Windows: {len(split_list)}")
+        return 0
 
-        pred_idx = 0
-        current_pred = None
+    # Display mode: wait for first window prediction, then stream display while
+    # predicting the next windows in the background.
+    if len(split_list) == 0:
+        print("No windows were generated. Try --pad-tail or smaller --win-len.")
+        return 1
+
+    # Predict first window synchronously (required for 'warmup' + first overlay)
+    t0 = time.perf_counter()
+    first_fd = split_list[0]
+    first_pred = predict_one_window(ann=ann_map[first_fd], frame_dir=first_fd, **predict_kwargs)
+    first_pred_time_s = max(1e-6, float(time.perf_counter() - t0))
+
+    with preds_lock:
+        preds_for_display.append(first_pred)
+        preds_by_start[int(first_pred["start_frame"])] = first_pred
+
+    # Background worker predicts windows 1..N-1 and pushes them to a queue.
+    pred_q: "queue.Queue[Tuple[int, dict]]" = queue.Queue(maxsize=8)
+    stop_event = threading.Event()
+
+    def worker(start_idx: int) -> None:
+        try:
+            for i in range(start_idx, len(split_list)):
+                if stop_event.is_set():
+                    break
+                fd = split_list[i]
+                ann = ann_map[fd]
+                t_pred0 = time.perf_counter()
+                pred = predict_one_window(ann=ann, frame_dir=fd, **predict_kwargs)
+                pred["infer_time_s"] = float(time.perf_counter() - t_pred0)
+                pred_q.put((i, pred))
+        except Exception as e:
+            pred_q.put((-1, {"error": repr(e)}))
+
+    th = threading.Thread(target=worker, args=(1,), daemon=True)
+    th.start()
+
+    # ------------------------------------------------------------------
+    # 5) Display while consuming predictions
+    # ------------------------------------------------------------------
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        stop_event.set()
+        raise RuntimeError(f"Failed to open video for display: {video_path.as_posix()}")
+
+    cv2.namedWindow("MotionBERT Inference", cv2.WINDOW_NORMAL)
+    cap_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    user_fps = float(args.display_fps) if args.display_fps is not None else None
+    base_fps = float(user_fps) if (user_fps is not None and np.isfinite(user_fps) and user_fps > 0.0) else float(cap_fps)
+    if not np.isfinite(base_fps) or base_fps <= 0.0:
+        base_fps = 30.0
+
+    # Heuristic: ensure we have enough wall-clock time to predict the next window.
+    # Need >= first_pred_time_s seconds per win_step frames.
+    try:
+        win_step = int(args.win_step)
+    except Exception:
+        win_step = 16
+    safe_fps = float(win_step) / float(first_pred_time_s)
+    safe_fps = max(1.0, safe_fps * 0.9)  # safety margin
+    display_fps = min(base_fps, safe_fps) if user_fps is None else base_fps
+    delay_ms = max(1, int(1000.0 / float(display_fps)))
+    print(
+        f"[Display] Playing at ~{display_fps:.2f} FPS (base={base_fps:.2f}, safe~{safe_fps:.2f}). Press 'q' or Esc to quit.",
+        flush=True,
+    )
+
+    with out_csv.open("w", newline="", encoding="utf-8") as f_csv:
+        writer = csv.writer(f_csv)
+        write_header(writer)
+        write_pred_row(writer, first_pred)
+
+        # Window scheduling state
+        win_idx_current = 0
+        current_pred = first_pred
+
         frame_idx = 0
+        user_exit = False
 
         while True:
+            # Drain prediction queue without blocking (keeps CSV + display state up to date)
+            try:
+                while True:
+                    idx, pred = pred_q.get_nowait()
+                    if idx == -1 and "error" in pred:
+                        raise RuntimeError(f"Prediction worker failed: {pred['error']}")
+                    with preds_lock:
+                        start_k = int(pred["start_frame"])
+                        if start_k not in preds_by_start:
+                            preds_for_display.append(pred)
+                            preds_by_start[start_k] = pred
+                            write_pred_row(writer, pred)
+            except queue.Empty:
+                pass
+
             ok, frame = cap.read()
             if not ok:
                 break
@@ -646,32 +841,107 @@ def main() -> int:
                     draw_skeleton=True,
                 )
 
-            while pred_idx < len(preds_for_display) and preds_for_display[pred_idx]["start_frame"] <= frame_idx:
-                current_pred = preds_for_display[pred_idx]
-                pred_idx += 1
+            # Update current window prediction when we reach the next window start.
+            if win_idx_current + 1 < len(split_list):
+                next_fd = split_list[win_idx_current + 1]
+                next_start, _ = window_start_end_from_frame_dir(next_fd, clip_len)
 
-            if current_pred is not None and frame_idx > current_pred["end_frame"]:
+                if frame_idx >= next_start:
+                    # Ensure the prediction for this next window exists (block if needed).
+                    while True:
+                        with preds_lock:
+                            next_pred = preds_by_start.get(int(next_start))
+                        if next_pred is not None:
+                            current_pred = next_pred
+                            win_idx_current += 1
+                            break
+
+                        # Not ready yet -> slow down / wait a bit while worker runs.
+                        lines = [
+                            "Pred: (computing next window...)",
+                            f"Frame: {frame_idx}",
+                        ]
+                        frame_wait = draw_hud(frame.copy(), lines)
+                        cv2.imshow("MotionBERT Inference", frame_wait)
+                        key = cv2.waitKey(max(1, delay_ms)) & 0xFF
+                        if key == ord("q") or key == 27:
+                            user_exit = True
+                            stop_event.set()
+                            break
+
+                        # Drain any newly available predictions
+                        try:
+                            while True:
+                                idx, pred = pred_q.get_nowait()
+                                if idx == -1 and "error" in pred:
+                                    raise RuntimeError(f"Prediction worker failed: {pred['error']}")
+                                with preds_lock:
+                                    start_k = int(pred["start_frame"])
+                                    if start_k not in preds_by_start:
+                                        preds_for_display.append(pred)
+                                        preds_by_start[start_k] = pred
+                                        write_pred_row(writer, pred)
+                        except queue.Empty:
+                            pass
+
+                    if user_exit:
+                        break
+
+            # If we ever have a gap with no valid window covering the current frame, clear the overlay.
+            if current_pred is not None and frame_idx > int(current_pred["end_frame"]):
                 current_pred = None
 
-            lines = []
             if current_pred is not None:
-                lines.append(f"Pred: {current_pred['pred_name']} ({current_pred['pred_conf']:.2f})")
-                lines.append(f"p_fall: {current_pred['p_fall']:.2f}")
-                lines.append(f"Window: {current_pred['start_frame']}-{current_pred['end_frame']}")
+                lines = [
+                    f"Pred: {current_pred['pred_name']} ({current_pred['pred_conf']:.2f})",
+                    f"p_fall: {current_pred['p_fall']:.2f}",
+                    f"Window: {current_pred['start_frame']}-{current_pred['end_frame']}",
+                ]
             else:
-                lines.append("Pred: (warming up)")
+                lines = ["Pred: (warming up)"]
 
             frame = draw_hud(frame, lines)
             cv2.imshow("MotionBERT Inference", frame)
 
             key = cv2.waitKey(delay_ms) & 0xFF
             if key == ord("q") or key == 27:
+                user_exit = True
+                stop_event.set()
                 break
 
             frame_idx += 1
 
-        cap.release()
-        cv2.destroyAllWindows()
+        # If the user watched to the end, finish computing and writing the remaining window predictions.
+        if not user_exit:
+            expected = len(split_list)
+            while True:
+                with preds_lock:
+                    done = len(preds_by_start) >= expected
+                if done:
+                    break
+                if not th.is_alive() and pred_q.empty():
+                    break
+                try:
+                    idx, pred = pred_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if idx == -1 and "error" in pred:
+                    raise RuntimeError(f"Prediction worker failed: {pred['error']}")
+                with preds_lock:
+                    start_k = int(pred["start_frame"])
+                    if start_k not in preds_by_start:
+                        preds_for_display.append(pred)
+                        preds_by_start[start_k] = pred
+                        write_pred_row(writer, pred)
+            th.join(timeout=1.0)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    print(f"Saved pkl: {out_pkl.as_posix()}")
+    print(f"Saved predictions: {out_csv.as_posix()}")
+    print(f"Windows: {len(split_list)}")
+
     return 0
 
 
