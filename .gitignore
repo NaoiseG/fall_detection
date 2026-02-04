@@ -10,3 +10,4 @@ copy_zips.py
 audit_upfall.py
 get_one_npz.py
 models/prompts/
+fall_models/Prototype/models/MotionBert/**

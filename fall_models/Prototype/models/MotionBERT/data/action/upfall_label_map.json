@@ -1,0 +1,63 @@
+{
+  "label_mode": "majority",
+  "label_map": {
+    "1": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 1,
+    "7": 2,
+    "8": 3,
+    "9": 4,
+    "10": 5,
+    "11": 6
+  },
+  "meta": {
+    "type": "int",
+    "offset": 1,
+    "mapping": {
+      "1": 0,
+      "2": 0,
+      "3": 0,
+      "4": 0,
+      "5": 0,
+      "6": 1,
+      "7": 2,
+      "8": 3,
+      "9": 4,
+      "10": 5,
+      "11": 6
+    },
+    "num_classes_observed": 7,
+    "min_raw": 1,
+    "max_raw": 11,
+    "merge_fall": {
+      "enabled": true,
+      "raw_fall_labels": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "raw_adl_labels": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "new_class_names": {
+        "0": "Fall",
+        "1": "Walking",
+        "2": "Standing",
+        "3": "Sitting",
+        "4": "Picking up an object",
+        "5": "Jumping",
+        "6": "Laying"
+      }
+    }
+  }
+}

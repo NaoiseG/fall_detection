@@ -8,6 +8,11 @@ This script:
 3) Loads a MotionBERT ActionNet checkpoint (*.bin)
 4) Runs per-window predictions and saves a CSV
 
+Display mode (--display)
+- Runs YOLO pose + MotionBERT inference while the video is being displayed (similar to inference_on_video.py).
+- If processing is slower than the source FPS, playback will automatically slow down (no frame skipping).
+- Shows the effective FPS in an on-screen HUD.
+
 Notes
 - Preprocessing mirrors MotionBERT training (models/MotionBERT/lib/data/dataset_action.py):
   make_cam -> human_tracking -> coco2h36m -> concat conf -> resample -> crop_scale
@@ -23,9 +28,8 @@ import argparse
 import csv
 import pickle
 import sys
-import threading
 import time
-import queue
+from collections import deque
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -474,6 +478,474 @@ def predict_one_window(
     }
 
 
+def stream_infer_and_display(
+    *,
+    ckpt_path: Path,
+    video_path: Path,
+    cfg,
+    yolo_path: Path,
+    device: str,
+    clip_len: int,
+    args: argparse.Namespace,
+) -> int:
+    """
+    One-pass streaming: read frames -> YOLO pose -> window inference -> imshow.
+
+    Playback targets the source FPS (or --display-fps). If processing can't keep up, the display slows down.
+    """
+
+    win_step = max(1, int(args.win_step))
+    missing_conf_thres = float(args.missing_conf_thres)
+    drop_empty_windows = not bool(args.keep_empty_windows)
+    pad_tail = bool(args.pad_tail)
+
+    # Models
+    pose_model = YOLO(str(yolo_path))
+
+    model_backbone = load_backbone(cfg)
+    model = ActionNet(
+        backbone=model_backbone,
+        dim_rep=getattr(cfg, "dim_rep", 512),
+        num_classes=int(getattr(cfg, "action_classes", 11)),
+        dropout_ratio=getattr(cfg, "dropout_ratio", 0.0),
+        version=getattr(cfg, "model_version", "class"),
+        hidden_dim=getattr(cfg, "hidden_dim", 2048),
+        num_joints=getattr(cfg, "num_joints", 17),
+    )
+
+    use_dp = device.startswith("cuda") and torch.cuda.device_count() > 1
+    if use_dp:
+        model = nn.DataParallel(model)
+    model = model.to(device)
+
+    checkpoint = torch.load(str(ckpt_path), map_location="cpu")
+    state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    state = _clean_state_dict_for_model(state, model)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    # Labels / inference config
+    num_classes = int(getattr(cfg, "action_classes", 11))
+    scale_range = getattr(cfg, "scale_range_test", None)
+
+    labels_file_names = load_labels_file(args.labels_file)
+
+    unmerged_len_expected = len(CLASS_NAMES_DEFAULT)
+    merged_len_expected = len(CLASS_NAMES_MERGED_DEFAULT)
+
+    merge_fall = (not bool(args.no_merge_fall)) and (num_classes == unmerged_len_expected)
+
+    if labels_file_names is not None:
+        if merge_fall and len(labels_file_names) == merged_len_expected:
+            class_names_out = list(labels_file_names)
+        else:
+            base_names = pad_or_trim(list(labels_file_names), num_classes)
+            if merge_fall:
+                class_names_out = ["Fall"] + [base_names[i] for i in range(unmerged_len_expected) if i not in FALL_CLASS_IDS_DEFAULT]
+            else:
+                class_names_out = base_names
+    else:
+        if num_classes == merged_len_expected:
+            class_names_out = list(CLASS_NAMES_MERGED_DEFAULT)
+        else:
+            base_names = pad_or_trim(list(CLASS_NAMES_DEFAULT), num_classes)
+            if merge_fall:
+                class_names_out = ["Fall"] + [base_names[i] for i in range(unmerged_len_expected) if i not in FALL_CLASS_IDS_DEFAULT]
+            else:
+                class_names_out = base_names
+
+    fall_idx = infer_fall_indices(class_names_out)
+
+    predict_kwargs = dict(
+        model=model,
+        device=device,
+        clip_len=int(clip_len),
+        scale_range=scale_range,
+        merge_fall=merge_fall,
+        fall_idx=fall_idx,
+        class_names_out=class_names_out,
+        unmerged_len_expected=unmerged_len_expected,
+        merged_len_expected=merged_len_expected,
+    )
+
+    out_csv = Path(args.out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_pkl = Path(args.out_pkl)
+
+    def write_header(writer: csv.writer) -> None:
+        writer.writerow(
+            [
+                "frame_dir",
+                "start_frame",
+                "end_frame",
+                "pred_id",
+                "pred_name",
+                "pred_conf",
+                "p_fall",
+            ]
+        )
+
+    def write_pred_row(writer: csv.writer, pred: dict) -> None:
+        writer.writerow(
+            [
+                pred["frame_dir"],
+                pred["start_frame"],
+                pred["end_frame"],
+                pred["pred_id"],
+                pred["pred_name"],
+                f"{float(pred['pred_conf']):.6f}",
+                f"{float(pred['p_fall']):.6f}",
+            ]
+        )
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path.as_posix()}")
+
+    src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if not np.isfinite(src_fps) or src_fps <= 1e-3:
+        src_fps = 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    user_fps = float(args.display_fps) if args.display_fps is not None else None
+    fps_target = float(user_fps) if (user_fps is not None and np.isfinite(user_fps) and user_fps > 0.0) else float(src_fps)
+    if not np.isfinite(fps_target) or fps_target <= 1e-3:
+        fps_target = 30.0
+    frame_period_s = 1.0 / float(fps_target)
+
+    window_name = "MotionBERT Inference"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    print(f"[Display] Target FPS={fps_target:.2f} (source={src_fps:.2f}). Press 'q' or Esc to quit.", flush=True)
+
+    frames_buf: "deque[np.ndarray]" = deque()
+    xy_buf: "deque[np.ndarray]" = deque()
+    cf_buf: "deque[np.ndarray]" = deque()
+
+    all_xy: List[np.ndarray] = []
+    all_cf: List[np.ndarray] = []
+
+    img_shape: Optional[Tuple[int, int]] = None
+    processed_total = 0
+    display_idx = 0
+    cap_done = False
+
+    window_preds: dict[int, dict] = {}
+    skipped_windows: set[int] = set()
+    next_win_start = 0
+
+    def pose_on_frame(frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        results = pose_model.predict(
+            source=frame_bgr,
+            imgsz=int(args.imgsz),
+            conf=float(args.conf_thres),
+            verbose=False,
+            device=device,
+        )
+
+        kpts_xy = np.zeros((17, 2), dtype=np.float32)
+        kpts_conf = np.zeros((17,), dtype=np.float32)
+
+        if results and len(results) > 0 and results[0].keypoints is not None:
+            kpts = results[0].keypoints
+            xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
+            cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
+
+            if xy_all.ndim == 3 and xy_all.shape[0] > 0:
+                scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
+                best = int(np.argmax(scores)) if scores is not None else 0
+                kpts_xy = xy_all[best].astype(np.float32)
+                if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
+                    kpts_conf = cf_all[best].astype(np.float32)
+                else:
+                    kpts_conf = np.ones((17,), dtype=np.float32)
+
+        return kpts_xy, kpts_conf
+
+    def process_next_frame() -> bool:
+        nonlocal processed_total, cap_done, img_shape
+
+        if cap_done:
+            return False
+
+        ok, frame = cap.read()
+        if not ok:
+            cap_done = True
+            return False
+
+        if img_shape is None:
+            h, w = frame.shape[:2]
+            img_shape = (int(h), int(w))
+
+        xy, cf = pose_on_frame(frame)
+
+        frames_buf.append(frame)
+        xy_buf.append(xy)
+        cf_buf.append(cf)
+        all_xy.append(xy)
+        all_cf.append(cf)
+        processed_total += 1
+
+        if args.limit_frames is not None and processed_total >= int(args.limit_frames):
+            cap_done = True
+
+        return True
+
+    def make_window_annotation(start: int) -> Optional[Tuple[str, dict]]:
+        if img_shape is None:
+            return None
+
+        end = int(start) + int(clip_len)
+        if end <= int(processed_total):
+            raw_kxy = np.stack(all_xy[start:end], axis=0).astype(np.float32)
+            raw_ksc = np.stack(all_cf[start:end], axis=0).astype(np.float32)
+        else:
+            if not cap_done or (not pad_tail):
+                return None
+            if start >= int(processed_total):
+                return None
+            pad_n = int(end - int(processed_total))
+            if pad_n >= int(clip_len):
+                return None
+            raw_kxy = np.stack(all_xy[start:processed_total], axis=0).astype(np.float32)
+            raw_ksc = np.stack(all_cf[start:processed_total], axis=0).astype(np.float32)
+            last_xy = raw_kxy[-1:, :, :]
+            last_sc = raw_ksc[-1:, :]
+            raw_kxy = np.concatenate([raw_kxy, np.repeat(last_xy, pad_n, axis=0)], axis=0)
+            raw_ksc = np.concatenate([raw_ksc, np.repeat(last_sc, pad_n, axis=0)], axis=0)
+
+        if raw_kxy.shape != (int(clip_len), 17, 2) or raw_ksc.shape != (int(clip_len), 17):
+            return None
+
+        kxy = raw_kxy.copy()
+        ksc = raw_ksc.copy()
+
+        nonfinite_xy = ~np.isfinite(kxy)
+        nonfinite_sc = ~np.isfinite(ksc)
+        if nonfinite_xy.any() or nonfinite_sc.any():
+            kxy[nonfinite_xy] = 0.0
+            ksc[nonfinite_sc] = 0.0
+            nonfinite_joint = nonfinite_xy.any(axis=2) | nonfinite_sc
+            ksc[nonfinite_joint] = 0.0
+
+        if (ksc < 0).any() or (ksc > 1).any():
+            ksc = np.clip(ksc, 0.0, 1.0)
+
+        interpolate_missing_joints_inplace(kxy, ksc, missing_conf_thres=missing_conf_thres)
+
+        if drop_empty_windows:
+            if np.all(ksc <= missing_conf_thres):
+                return None
+            if (np.ptp(kxy[..., 0]) < 1e-6) and (np.ptp(kxy[..., 1]) < 1e-6):
+                return None
+
+        frame_dir = f"{video_path.stem}_s{start}_len{clip_len}"
+        ann = {
+            "frame_dir": frame_dir,
+            "total_frames": int(clip_len),
+            "img_shape": (int(img_shape[0]), int(img_shape[1])),
+            "keypoint": kxy[None, ...].astype(np.float32),
+            "keypoint_score": ksc[None, ...].astype(np.float32),
+            "label": 0,
+        }
+        return frame_dir, ann
+
+    def compute_window_pred(start: int, *, writer: csv.writer) -> Optional[dict]:
+        if int(start) in window_preds:
+            return window_preds[int(start)]
+        if int(start) in skipped_windows:
+            return None
+
+        window = make_window_annotation(int(start))
+        if window is None:
+            # Window is either not ready yet, or it was dropped (empty / too short)
+            if cap_done and (not pad_tail) and int(processed_total) < int(start) + int(clip_len):
+                skipped_windows.add(int(start))
+            if drop_empty_windows and int(processed_total) >= int(start) + int(clip_len):
+                skipped_windows.add(int(start))
+            return None
+
+        frame_dir, ann = window
+        pred = predict_one_window(ann=ann, frame_dir=frame_dir, **predict_kwargs)
+        window_preds[int(start)] = pred
+        write_pred_row(writer, pred)
+        return pred
+
+    def compute_ready_windows(*, writer: csv.writer) -> None:
+        nonlocal next_win_start
+
+        while True:
+            if int(next_win_start) in window_preds or int(next_win_start) in skipped_windows:
+                next_win_start = int(next_win_start) + int(win_step)
+                continue
+
+            if not cap_done:
+                if int(processed_total) >= int(next_win_start) + int(clip_len):
+                    compute_window_pred(int(next_win_start), writer=writer)
+                    next_win_start = int(next_win_start) + int(win_step)
+                    continue
+                break
+
+            # cap_done
+            if int(processed_total) >= int(next_win_start) + int(clip_len):
+                compute_window_pred(int(next_win_start), writer=writer)
+                next_win_start = int(next_win_start) + int(win_step)
+                continue
+            if pad_tail and int(next_win_start) < int(processed_total):
+                compute_window_pred(int(next_win_start), writer=writer)
+                next_win_start = int(next_win_start) + int(win_step)
+                continue
+            break
+
+    def get_pred_for_frame(frame_idx: int) -> Optional[dict]:
+        if frame_idx < 0:
+            return None
+        ws = (int(frame_idx) // int(win_step)) * int(win_step)
+        pred = window_preds.get(int(ws))
+        if pred is not None:
+            return pred
+
+        # If the exact window was dropped (empty), fall back to the most recent available window covering frame_idx.
+        s = int(ws) - int(win_step)
+        while s >= 0:
+            p = window_preds.get(int(s))
+            if p is not None and int(frame_idx) <= int(p["end_frame"]):
+                return p
+            s -= int(win_step)
+        return None
+
+    try:
+        with out_csv.open("w", newline="", encoding="utf-8") as f_csv:
+            writer = csv.writer(f_csv)
+            write_header(writer)
+
+            # Warm up: read enough frames to make the FIRST window prediction (if possible), then start display.
+            while int(processed_total) < int(clip_len) and not cap_done:
+                process_next_frame()
+            if int(processed_total) <= 0:
+                raise RuntimeError("Video had 0 frames.")
+
+            compute_window_pred(0, writer=writer)
+            next_win_start = int(win_step)
+
+            fps_ema: Optional[float] = None
+            ema_alpha = 0.1
+            t_prev = time.perf_counter()
+            user_exit = False
+
+            while True:
+                if not frames_buf and cap_done:
+                    break
+
+                t_frame0 = time.perf_counter()
+
+                target_processed = int(display_idx) + int(clip_len) + 1
+                while (not cap_done) and int(processed_total) < int(target_processed):
+                    process_next_frame()
+
+                compute_ready_windows(writer=writer)
+
+                if not frames_buf:
+                    continue
+
+                win_start = (int(display_idx) // int(win_step)) * int(win_step)
+                if win_start not in window_preds and win_start not in skipped_windows:
+                    while (not cap_done) and int(processed_total) < int(win_start) + int(clip_len):
+                        process_next_frame()
+                        compute_ready_windows(writer=writer)
+                    compute_window_pred(int(win_start), writer=writer)
+
+                pred = get_pred_for_frame(int(display_idx))
+
+                frame = frames_buf[0].copy()
+                xy = xy_buf[0]
+                cf = cf_buf[0]
+                frame = draw_pose(
+                    frame,
+                    xy,
+                    cf,
+                    conf_thres=float(args.display_conf_thres),
+                    draw_skeleton=True,
+                )
+
+                t_now = time.perf_counter()
+                dt = max(1e-6, float(t_now - t_prev))
+                inst_fps = 1.0 / dt
+                fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+                t_prev = t_now
+
+                frame_info = f"frame {int(display_idx) + 1}"
+                if int(frame_count) > 0:
+                    frame_info += f"/{int(frame_count)}"
+
+                win_id = int(win_start) // max(1, int(win_step))
+                hud = [
+                    frame_info,
+                    f"fps: {float(fps_ema):.1f} (target {float(fps_target):.1f})",
+                    f"window {win_id} (start={win_start})",
+                ]
+                if pred is not None:
+                    hud.append(f"pred: {pred['pred_name']} ({float(pred['pred_conf']):.2f})")
+                    hud.append(f"fall_prob: {float(pred['p_fall']):.2f}")
+                    hud.append(f"win: {int(pred['start_frame'])}-{int(pred['end_frame'])}")
+                else:
+                    hud.append("pred: ... (warming up)")
+                    hud.append(f"T={int(clip_len)} stride={int(win_step)}")
+
+                frame = draw_hud(frame, hud)
+                cv2.imshow(window_name, frame)
+
+                elapsed = float(time.perf_counter() - t_frame0)
+                wait_s = float(frame_period_s) - elapsed
+                wait_ms = max(1, int(round(1000.0 * wait_s))) if wait_s > 0.0 else 1
+                key = cv2.waitKey(int(wait_ms)) & 0xFF
+                if key in (ord("q"), 27):
+                    user_exit = True
+                    break
+
+                frames_buf.popleft()
+                xy_buf.popleft()
+                cf_buf.popleft()
+                display_idx += 1
+
+            if (not user_exit) and cap_done:
+                while True:
+                    before = int(next_win_start)
+                    compute_ready_windows(writer=writer)
+                    if int(next_win_start) == before:
+                        break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    if img_shape is None:
+        raise RuntimeError("No frames read from video.")
+
+    # Build and save MotionBERT action pkl from the frames we processed.
+    kpts_xy = np.stack(all_xy, axis=0)  # (T,17,2)
+    kpts_conf = np.stack(all_cf, axis=0)  # (T,17)
+    split_list, annotations = build_windows(
+        kpts_xy=kpts_xy,
+        kpts_conf=kpts_conf,
+        img_shape=img_shape,
+        win_len=int(clip_len),
+        win_step=int(win_step),
+        pad_tail=pad_tail,
+        missing_conf_thres=missing_conf_thres,
+        drop_empty_windows=drop_empty_windows,
+        video_stem=video_path.stem,
+    )
+
+    dataset = {"split": {"xsub_train": [], "xsub_val": split_list}, "annotations": annotations}
+    out_pkl.parent.mkdir(parents=True, exist_ok=True)
+    with out_pkl.open("wb") as f:
+        pickle.dump(dataset, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"Saved pkl: {out_pkl.as_posix()}")
+    print(f"Saved predictions: {out_csv.as_posix()}")
+    print(f"Windows: {len(split_list)}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -502,7 +974,7 @@ def main() -> int:
     ap.add_argument("--out-csv", type=str, default="outputs/motionbert_video_preds.csv")
     ap.add_argument("--labels-file", type=str, default=None)
     ap.add_argument("--limit-frames", type=int, default=None)
-    ap.add_argument("--display", action="store_true", help="Display video with pose + current window prediction")
+    ap.add_argument("--display", action="store_true", help="Display video with pose + streaming window prediction (FPS HUD)")
     ap.add_argument("--display-conf-thres", type=float, default=0.2, help="Keypoint conf threshold for drawing")
     ap.add_argument("--display-fps", type=float, default=None, help="Playback FPS for display (default: video FPS)")
     ap.add_argument("--no-merge-fall", action="store_true", help="Disable merging the first five fall labels into one class")
@@ -517,6 +989,17 @@ def main() -> int:
 
     cfg = get_config(str(cfg_path))
     clip_len = int(args.win_len) if args.win_len is not None else int(getattr(cfg, "clip_len", 64))
+
+    if args.display:
+        return stream_infer_and_display(
+            ckpt_path=ckpt_path,
+            video_path=video_path,
+            cfg=cfg,
+            yolo_path=yolo_path,
+            device=device,
+            clip_len=clip_len,
+            args=args,
+        )
 
     # ------------------------------------------------------------------
     # 1) YOLOv11 pose extraction
@@ -675,10 +1158,6 @@ def main() -> int:
 
     ann_map = {ann["frame_dir"]: ann for ann in annotations}
 
-    preds_for_display: List[dict] = []
-    preds_by_start: dict[int, dict] = {}
-    preds_lock = threading.Lock()
-
     def write_header(writer: csv.writer) -> None:
         writer.writerow(
             [
@@ -706,7 +1185,7 @@ def main() -> int:
         )
 
     # ------------------------------------------------------------------
-    # 4) Predict windows (optionally streaming into display)
+    # 4) Predict windows (offline)
     # ------------------------------------------------------------------
     predict_kwargs = dict(
         model=model,
@@ -720,228 +1199,17 @@ def main() -> int:
         merged_len_expected=merged_len_expected,
     )
 
-    if not args.display:
-        with out_csv.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            write_header(writer)
-            for frame_dir in split_list:
-                ann = ann_map[frame_dir]
-                pred = predict_one_window(ann=ann, frame_dir=frame_dir, **predict_kwargs)
-                write_pred_row(writer, pred)
-        print(f"Saved pkl: {out_pkl.as_posix()}")
-        print(f"Saved predictions: {out_csv.as_posix()}")
-        print(f"Windows: {len(split_list)}")
-        return 0
-
-    # Display mode: wait for first window prediction, then stream display while
-    # predicting the next windows in the background.
-    if len(split_list) == 0:
-        print("No windows were generated. Try --pad-tail or smaller --win-len.")
-        return 1
-
-    # Predict first window synchronously (required for 'warmup' + first overlay)
-    t0 = time.perf_counter()
-    first_fd = split_list[0]
-    first_pred = predict_one_window(ann=ann_map[first_fd], frame_dir=first_fd, **predict_kwargs)
-    first_pred_time_s = max(1e-6, float(time.perf_counter() - t0))
-
-    with preds_lock:
-        preds_for_display.append(first_pred)
-        preds_by_start[int(first_pred["start_frame"])] = first_pred
-
-    # Background worker predicts windows 1..N-1 and pushes them to a queue.
-    pred_q: "queue.Queue[Tuple[int, dict]]" = queue.Queue(maxsize=8)
-    stop_event = threading.Event()
-
-    def worker(start_idx: int) -> None:
-        try:
-            for i in range(start_idx, len(split_list)):
-                if stop_event.is_set():
-                    break
-                fd = split_list[i]
-                ann = ann_map[fd]
-                t_pred0 = time.perf_counter()
-                pred = predict_one_window(ann=ann, frame_dir=fd, **predict_kwargs)
-                pred["infer_time_s"] = float(time.perf_counter() - t_pred0)
-                pred_q.put((i, pred))
-        except Exception as e:
-            pred_q.put((-1, {"error": repr(e)}))
-
-    th = threading.Thread(target=worker, args=(1,), daemon=True)
-    th.start()
-
-    # ------------------------------------------------------------------
-    # 5) Display while consuming predictions
-    # ------------------------------------------------------------------
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        stop_event.set()
-        raise RuntimeError(f"Failed to open video for display: {video_path.as_posix()}")
-
-    cv2.namedWindow("MotionBERT Inference", cv2.WINDOW_NORMAL)
-    cap_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    user_fps = float(args.display_fps) if args.display_fps is not None else None
-    base_fps = float(user_fps) if (user_fps is not None and np.isfinite(user_fps) and user_fps > 0.0) else float(cap_fps)
-    if not np.isfinite(base_fps) or base_fps <= 0.0:
-        base_fps = 30.0
-
-    # Heuristic: ensure we have enough wall-clock time to predict the next window.
-    # Need >= first_pred_time_s seconds per win_step frames.
-    try:
-        win_step = int(args.win_step)
-    except Exception:
-        win_step = 16
-    safe_fps = float(win_step) / float(first_pred_time_s)
-    safe_fps = max(1.0, safe_fps * 0.9)  # safety margin
-    display_fps = min(base_fps, safe_fps) if user_fps is None else base_fps
-    delay_ms = max(1, int(1000.0 / float(display_fps)))
-    print(
-        f"[Display] Playing at ~{display_fps:.2f} FPS (base={base_fps:.2f}, safe~{safe_fps:.2f}). Press 'q' or Esc to quit.",
-        flush=True,
-    )
-
-    with out_csv.open("w", newline="", encoding="utf-8") as f_csv:
-        writer = csv.writer(f_csv)
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
         write_header(writer)
-        write_pred_row(writer, first_pred)
-
-        # Window scheduling state
-        win_idx_current = 0
-        current_pred = first_pred
-
-        frame_idx = 0
-        user_exit = False
-
-        while True:
-            # Drain prediction queue without blocking (keeps CSV + display state up to date)
-            try:
-                while True:
-                    idx, pred = pred_q.get_nowait()
-                    if idx == -1 and "error" in pred:
-                        raise RuntimeError(f"Prediction worker failed: {pred['error']}")
-                    with preds_lock:
-                        start_k = int(pred["start_frame"])
-                        if start_k not in preds_by_start:
-                            preds_for_display.append(pred)
-                            preds_by_start[start_k] = pred
-                            write_pred_row(writer, pred)
-            except queue.Empty:
-                pass
-
-            ok, frame = cap.read()
-            if not ok:
-                break
-
-            if frame_idx < len(kpts_xy):
-                frame = draw_pose(
-                    frame,
-                    kpts_xy[frame_idx],
-                    kpts_conf[frame_idx],
-                    conf_thres=float(args.display_conf_thres),
-                    draw_skeleton=True,
-                )
-
-            # Update current window prediction when we reach the next window start.
-            if win_idx_current + 1 < len(split_list):
-                next_fd = split_list[win_idx_current + 1]
-                next_start, _ = window_start_end_from_frame_dir(next_fd, clip_len)
-
-                if frame_idx >= next_start:
-                    # Ensure the prediction for this next window exists (block if needed).
-                    while True:
-                        with preds_lock:
-                            next_pred = preds_by_start.get(int(next_start))
-                        if next_pred is not None:
-                            current_pred = next_pred
-                            win_idx_current += 1
-                            break
-
-                        # Not ready yet -> slow down / wait a bit while worker runs.
-                        lines = [
-                            "Pred: (computing next window...)",
-                            f"Frame: {frame_idx}",
-                        ]
-                        frame_wait = draw_hud(frame.copy(), lines)
-                        cv2.imshow("MotionBERT Inference", frame_wait)
-                        key = cv2.waitKey(max(1, delay_ms)) & 0xFF
-                        if key == ord("q") or key == 27:
-                            user_exit = True
-                            stop_event.set()
-                            break
-
-                        # Drain any newly available predictions
-                        try:
-                            while True:
-                                idx, pred = pred_q.get_nowait()
-                                if idx == -1 and "error" in pred:
-                                    raise RuntimeError(f"Prediction worker failed: {pred['error']}")
-                                with preds_lock:
-                                    start_k = int(pred["start_frame"])
-                                    if start_k not in preds_by_start:
-                                        preds_for_display.append(pred)
-                                        preds_by_start[start_k] = pred
-                                        write_pred_row(writer, pred)
-                        except queue.Empty:
-                            pass
-
-                    if user_exit:
-                        break
-
-            # If we ever have a gap with no valid window covering the current frame, clear the overlay.
-            if current_pred is not None and frame_idx > int(current_pred["end_frame"]):
-                current_pred = None
-
-            if current_pred is not None:
-                lines = [
-                    f"Pred: {current_pred['pred_name']} ({current_pred['pred_conf']:.2f})",
-                    f"p_fall: {current_pred['p_fall']:.2f}",
-                    f"Window: {current_pred['start_frame']}-{current_pred['end_frame']}",
-                ]
-            else:
-                lines = ["Pred: (warming up)"]
-
-            frame = draw_hud(frame, lines)
-            cv2.imshow("MotionBERT Inference", frame)
-
-            key = cv2.waitKey(delay_ms) & 0xFF
-            if key == ord("q") or key == 27:
-                user_exit = True
-                stop_event.set()
-                break
-
-            frame_idx += 1
-
-        # If the user watched to the end, finish computing and writing the remaining window predictions.
-        if not user_exit:
-            expected = len(split_list)
-            while True:
-                with preds_lock:
-                    done = len(preds_by_start) >= expected
-                if done:
-                    break
-                if not th.is_alive() and pred_q.empty():
-                    break
-                try:
-                    idx, pred = pred_q.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if idx == -1 and "error" in pred:
-                    raise RuntimeError(f"Prediction worker failed: {pred['error']}")
-                with preds_lock:
-                    start_k = int(pred["start_frame"])
-                    if start_k not in preds_by_start:
-                        preds_for_display.append(pred)
-                        preds_by_start[start_k] = pred
-                        write_pred_row(writer, pred)
-            th.join(timeout=1.0)
-
-    cap.release()
-    cv2.destroyAllWindows()
+        for frame_dir in split_list:
+            ann = ann_map[frame_dir]
+            pred = predict_one_window(ann=ann, frame_dir=frame_dir, **predict_kwargs)
+            write_pred_row(writer, pred)
 
     print(f"Saved pkl: {out_pkl.as_posix()}")
     print(f"Saved predictions: {out_csv.as_posix()}")
     print(f"Windows: {len(split_list)}")
-
     return 0
 
 
