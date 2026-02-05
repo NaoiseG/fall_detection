@@ -319,6 +319,144 @@ def _fill_and_mask_kpts(kxy: np.ndarray, kconf: np.ndarray, conf_thres: float, m
     return xy, conf
 
 
+def _build_missing_mask(
+    xy: np.ndarray,
+    conf: np.ndarray,
+    conf_thres: float,
+    missing_mode: str,
+) -> np.ndarray:
+    """
+    xy: (N,K,2), conf: (N,K)
+    Returns missing mask (N,K) based on the requested mode.
+
+    Modes:
+      - conf_thres    : missing if conf < conf_thres
+      - zeros_only    : missing if (x==0 and y==0)
+      - conf_or_zeros : missing if (conf < conf_thres) OR (x==0 and y==0)
+    """
+    mode = str(missing_mode).lower().strip()
+    if mode not in {"conf_thres", "zeros_only", "conf_or_zeros"}:
+        raise ValueError(f"Unknown missing_mode: {missing_mode}")
+
+    zeros = (xy[..., 0] == 0.0) & (xy[..., 1] == 0.0)  # (N,K)
+    conf_low = conf < float(conf_thres)
+
+    if mode == "conf_thres":
+        return conf_low
+    if mode == "zeros_only":
+        return zeros
+    return conf_low | zeros
+
+
+def _interp_paper_group_linear_1d(x: np.ndarray, valid: np.ndarray, group: int) -> np.ndarray:
+    """
+    Paper-style interpolation in contiguous groups of `group` frames.
+
+    Rules within each group:
+      - If at least 2 known points exist, linearly interpolate missing points between them.
+      - Leading/trailing missing values are filled with nearest known value (ffill/bfill).
+      - If the entire group is missing, leave it as zero.
+    """
+    N = int(x.shape[0])
+    g = int(group)
+    if g <= 0:
+        raise ValueError(f"interp_group must be > 0, got {group}")
+
+    out = x.astype(np.float32, copy=True)
+
+    for s in range(0, N, g):
+        e = min(N, s + g)
+        vg = valid[s:e]
+        if not bool(np.any(vg)):
+            out[s:e] = 0.0
+            continue
+
+        idx_known = np.where(vg)[0]
+        if idx_known.size == 1:
+            out[s:e] = out[s + int(idx_known[0])]
+            continue
+
+        fp = out[s:e][idx_known].astype(np.float32, copy=False)
+        out[s:e] = np.interp(
+            np.arange(e - s, dtype=np.float32),
+            idx_known.astype(np.float32, copy=False),
+            fp,
+        ).astype(np.float32, copy=False)
+
+    return out
+
+
+def _fill_and_mask_kpts_paper(
+    kxy: np.ndarray,
+    kconf: np.ndarray,
+    *,
+    conf_thres: float,
+    missing_mode: str,
+    interp_mode: str,
+    max_interp_gap: int,
+    interp_group: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extended fill/mask supporting paper-style missingness and interpolation.
+
+    kxy: (N,K,2), kconf: (N,K)
+    Returns:
+      xy_filled: (N,K,2)
+      conf_filled: (N,K)
+    """
+    interp_mode = str(interp_mode).lower().strip()
+    if interp_mode not in {"short_gap_hold", "paper_group_linear"}:
+        raise ValueError(f"Unknown interp_mode: {interp_mode}")
+
+    xy = kxy.astype(np.float32, copy=True)
+    conf = kconf.astype(np.float32, copy=True)
+    xy = np.nan_to_num(xy, nan=0.0, posinf=0.0, neginf=0.0)
+    conf = np.nan_to_num(conf, nan=0.0, posinf=0.0, neginf=0.0)
+
+    missing = _build_missing_mask(xy=xy, conf=conf, conf_thres=float(conf_thres), missing_mode=missing_mode)
+
+    N, K, _ = xy.shape
+    xy_out = xy.copy()
+    conf_out = conf.copy()
+    conf_out[missing] = 0.0
+
+    zeros_based = str(missing_mode).lower().strip() in {"zeros_only", "conf_or_zeros"}
+
+    for j in range(K):
+        valid = ~missing[:, j]
+        xj = xy[:, j, 0]
+        yj = xy[:, j, 1]
+
+        if interp_mode == "short_gap_hold":
+            xj_f = _interp_short_gaps_1d(xj, valid, max_gap=int(max_interp_gap))
+            yj_f = _interp_short_gaps_1d(yj, valid, max_gap=int(max_interp_gap))
+            xy_out[:, j, 0] = xj_f
+            xy_out[:, j, 1] = yj_f
+
+            if zeros_based and bool(np.any(valid)):
+                conf_out[missing[:, j], j] = 1.0
+
+        else:  # paper_group_linear
+            xj_f = _interp_paper_group_linear_1d(xj, valid, group=int(interp_group))
+            yj_f = _interp_paper_group_linear_1d(yj, valid, group=int(interp_group))
+            xy_out[:, j, 0] = xj_f
+            xy_out[:, j, 1] = yj_f
+
+            if zeros_based:
+                g = int(interp_group)
+                if g <= 0:
+                    raise ValueError(f"interp_group must be > 0, got {interp_group}")
+                for s in range(0, N, g):
+                    e = min(N, s + g)
+                    if bool(np.any(valid[s:e])):
+                        m = missing[s:e, j]
+                        if bool(np.any(m)):
+                            idx = np.where(m)[0] + s
+                            conf_out[idx, j] = 1.0
+
+    return xy_out, conf_out
+
+
 def _frame_center_scale(xy_t: np.ndarray, conf_t: np.ndarray) -> Tuple[np.ndarray, float]:
     """
     Computes a robust center and scale for one frame.
@@ -375,6 +513,107 @@ def _normalize_xy(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
     return out
 
 
+def _compute_image_center(
+    xy: np.ndarray,
+    rp_center_mode: str,
+    rp_img_w: Optional[int],
+    rp_img_h: Optional[int],
+) -> np.ndarray:
+    """
+    Determine (cx, cy) for paper-style Relative Position (RP) normalisation.
+
+    rp_center_mode:
+      - normalized_01 : center=(0.5, 0.5)
+      - pixel         : center=(W/2, H/2) (requires rp_img_w, rp_img_h)
+      - auto          : if coords look like [0,1] => normalized_01 else pixel (requires dims)
+    """
+    mode = str(rp_center_mode).lower().strip()
+    if mode not in {"auto", "normalized_01", "pixel"}:
+        raise ValueError(f"Unknown rp_center_mode: {rp_center_mode}")
+
+    if mode == "normalized_01":
+        return np.array([0.5, 0.5], dtype=np.float32)
+
+    if mode == "pixel":
+        if rp_img_w is None or rp_img_h is None:
+            raise ValueError(
+                "paper_rp normalisation with rp_center_mode='pixel' requires rp_img_w and rp_img_h. "
+                "Pass --rp-img-w/--rp-img-h (or regenerate NPZs with stored image dimensions)."
+            )
+        return np.array([float(rp_img_w) / 2.0, float(rp_img_h) / 2.0], dtype=np.float32)
+
+    # auto
+    finite = np.isfinite(xy)
+    non_zero = finite & (xy != 0.0)
+    if bool(np.any(non_zero)):
+        max_val = float(np.max(np.abs(xy[non_zero])))
+    else:
+        max_val = float(np.nanmax(np.abs(xy))) if xy.size else 0.0
+
+    if max_val <= 1.5:
+        return np.array([0.5, 0.5], dtype=np.float32)
+
+    if rp_img_w is None or rp_img_h is None:
+        raise ValueError(
+            "paper_rp normalisation with rp_center_mode='auto' detected pixel-like coordinates "
+            f"(max|xy|={max_val:.3f}). Please pass --rp-img-w/--rp-img-h (or regenerate NPZs with stored image dimensions)."
+        )
+    return np.array([float(rp_img_w) / 2.0, float(rp_img_h) / 2.0], dtype=np.float32)
+
+
+def _reference_hip(xy_t: np.ndarray, conf_t: np.ndarray) -> np.ndarray:
+    """
+    Reference "hip" for RP translation (COCO-17):
+      preferred: mid-hip (L_HIP+R_HIP) when both valid
+      fallback : whichever hip is valid
+      fallback : mid-shoulder (or whichever shoulder is valid)
+      fallback : mean of valid joints
+      fallback : (0,0)
+    """
+    K = int(xy_t.shape[0])
+    valid = conf_t > 0.0
+
+    def is_valid(idx: int) -> bool:
+        return 0 <= int(idx) < K and bool(valid[int(idx)])
+
+    if is_valid(L_HIP) and is_valid(R_HIP):
+        return (0.5 * (xy_t[L_HIP] + xy_t[R_HIP])).astype(np.float32, copy=False)
+    if is_valid(L_HIP):
+        return xy_t[L_HIP].astype(np.float32, copy=False)
+    if is_valid(R_HIP):
+        return xy_t[R_HIP].astype(np.float32, copy=False)
+
+    if is_valid(L_SHOULDER) and is_valid(R_SHOULDER):
+        return (0.5 * (xy_t[L_SHOULDER] + xy_t[R_SHOULDER])).astype(np.float32, copy=False)
+    if is_valid(L_SHOULDER):
+        return xy_t[L_SHOULDER].astype(np.float32, copy=False)
+    if is_valid(R_SHOULDER):
+        return xy_t[R_SHOULDER].astype(np.float32, copy=False)
+
+    if bool(np.any(valid)):
+        return xy_t[valid].mean(axis=0).astype(np.float32, copy=False)
+
+    return np.zeros((2,), dtype=np.float32)
+
+
+def _normalize_xy_paper_rp(xy: np.ndarray, conf: np.ndarray, center: np.ndarray) -> np.ndarray:
+    """
+    Paper-style Relative Position (RP) normalisation:
+      - translation only, no scale normalisation
+      - displacement is (center - reference_hip) per-frame
+    """
+    N, K, _ = xy.shape
+    out = xy.astype(np.float32, copy=True)
+    c = np.asarray(center, dtype=np.float32).reshape(2)
+
+    for t in range(N):
+        hip = _reference_hip(out[t], conf[t])
+        d = c - hip
+        out[t] = out[t] + d[None, :]
+
+    return out
+
+
 def _add_velocity_channels(xy_norm: np.ndarray) -> np.ndarray:
     """
     xy_norm: (N,K,2)
@@ -421,6 +660,15 @@ def load_windows_from_npzs(
     drop_ambig_nonfall_only: bool = True,
     # NEW: label convention control (auto-detect if None)
     label_convention: Optional[str] = None,
+    # NEW: preprocessing mode control (backwards compatible defaults)
+    normalize_mode: str = "center_scale",
+    missing_mode: str = "conf_thres",
+    interp_mode: str = "short_gap_hold",
+    interp_group: int = 100,
+    # NEW: paper-style RP normalisation args (only used when normalize_mode='paper_rp')
+    rp_center_mode: str = "auto",
+    rp_img_w: Optional[int] = None,
+    rp_img_h: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Loads multiple trial NPZs, converts each to (W, T, K, C) windows,
@@ -451,11 +699,15 @@ def load_windows_from_npzs(
                 T=None,
                 use_conf=use_conf,
                 normalize=normalize,
+                normalize_mode=normalize_mode,
                 add_vel=add_vel,
                 add_acc=add_acc,
                 add_global=add_global,
                 conf_thres=conf_thres,
                 max_interp_gap=max_interp_gap,
+                missing_mode=missing_mode,
+                interp_mode=interp_mode,
+                interp_group=interp_group,
                 stride=stride,
                 label_mode=label_mode,
                 binary_any_fall=binary_any_fall,
@@ -466,6 +718,9 @@ def load_windows_from_npzs(
                 drop_ambig_share=drop_ambig_share,
                 drop_ambig_nonfall_only=drop_ambig_nonfall_only,
                 label_convention=conv,
+                rp_center_mode=rp_center_mode,
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
             )
         else:
             X, y, _ = make_window_tensors(
@@ -473,11 +728,15 @@ def load_windows_from_npzs(
                 T=T_used,
                 use_conf=use_conf,
                 normalize=normalize,
+                normalize_mode=normalize_mode,
                 add_vel=add_vel,
                 add_acc=add_acc,
                 add_global=add_global,
                 conf_thres=conf_thres,
                 max_interp_gap=max_interp_gap,
+                missing_mode=missing_mode,
+                interp_mode=interp_mode,
+                interp_group=interp_group,
                 stride=stride,
                 label_mode=label_mode,
                 binary_any_fall=binary_any_fall,
@@ -488,6 +747,9 @@ def load_windows_from_npzs(
                 drop_ambig_share=drop_ambig_share,
                 drop_ambig_nonfall_only=drop_ambig_nonfall_only,
                 label_convention=conv,
+                rp_center_mode=rp_center_mode,
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
             )
 
         X_all.append(X)
@@ -691,6 +953,15 @@ def make_window_tensors(
     drop_ambig_nonfall_only: bool = True,
     # NEW: pass through detected convention so we do not re-detect per file.
     label_convention: Optional[str] = None,
+    # NEW: preprocessing mode control (backwards compatible defaults)
+    normalize_mode: str = "center_scale",
+    missing_mode: str = "conf_thres",
+    interp_mode: str = "short_gap_hold",
+    interp_group: int = 100,
+    # NEW: paper-style RP normalisation args (only used when normalize_mode='paper_rp')
+    rp_center_mode: str = "auto",
+    rp_img_w: Optional[int] = None,
+    rp_img_h: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Converts frame-level pose data into window-level tensors.
@@ -717,9 +988,36 @@ def make_window_tensors(
     FALL_MERGE_SET = get_fall_merge_set(conv)
     NEW_LABEL_NAMES = get_new_label_names(conv)
 
-    xy_filled, conf_filled = _fill_and_mask_kpts(kxy, kconf, conf_thres=conf_thres, max_interp_gap=max_interp_gap)
+    if str(missing_mode).lower().strip() == "conf_thres" and str(interp_mode).lower().strip() == "short_gap_hold":
+        # Preserve exact legacy behaviour for the default code path.
+        xy_filled, conf_filled = _fill_and_mask_kpts(kxy, kconf, conf_thres=conf_thres, max_interp_gap=max_interp_gap)
+    else:
+        xy_filled, conf_filled = _fill_and_mask_kpts_paper(
+            kxy,
+            kconf,
+            conf_thres=float(conf_thres),
+            missing_mode=str(missing_mode),
+            interp_mode=str(interp_mode),
+            max_interp_gap=int(max_interp_gap),
+            interp_group=int(interp_group),
+        )
 
-    xy_used = _normalize_xy(xy_filled, conf_filled) if normalize else xy_filled.astype(np.float32, copy=False)
+    if not bool(normalize):
+        xy_used = xy_filled.astype(np.float32, copy=False)
+    else:
+        nm = str(normalize_mode).lower().strip()
+        if nm == "center_scale":
+            xy_used = _normalize_xy(xy_filled, conf_filled)
+        elif nm == "paper_rp":
+            center = _compute_image_center(
+                xy=xy_filled,
+                rp_center_mode=str(rp_center_mode),
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
+            )
+            xy_used = _normalize_xy_paper_rp(xy_filled, conf_filled, center=center)
+        else:
+            raise ValueError(f"Unknown normalize_mode: {normalize_mode}")
 
     has_vel = bool(add_vel)
     if has_vel:

@@ -15,6 +15,11 @@ All models:
 
 Save results table:
   python -m models.train_models --all --save-results results.csv
+
+  python -m training.train_models --all --train-subjects 1-12 --val-subjects 13-15 --label-mode center \
+    --drop-ambig-share 0 --T 64 --stride 18 --epochs 100 --selection-metric macro_recall \
+    --normalize 1 --normalize-mode paper_rp --rp-center-mode pixel --rp-img-w 640 --rp-img-h 480 \
+    --missing-mode zeros_only --interp-mode paper_group_linear --interp-group 100
 """
 
 from dataclasses import dataclass, asdict
@@ -740,11 +745,42 @@ if __name__ == "__main__":
     # Data preprocessing options
     parser.add_argument("--use-conf", type=int, default=1, help="Include keypoint confidence channel (0/1).")
     parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
+    parser.add_argument(
+        "--normalize-mode",
+        type=str,
+        default="center_scale",
+        choices=["center_scale", "paper_rp"],
+        help="Normalisation mode when --normalize 1. center_scale=legacy translation+scale; paper_rp=paper Relative Position (translation only).",
+    )
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
     parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")
     parser.add_argument("--add-global", type=int, default=1, help="Add global features (0/1).")
     parser.add_argument("--conf-thres", type=float, default=0.2, help="Conf threshold below which joints are treated as missing.")
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for linear interpolation of missing joints.")
+    parser.add_argument(
+        "--missing-mode",
+        type=str,
+        default="conf_thres",
+        choices=["conf_thres", "zeros_only", "conf_or_zeros"],
+        help="Missing-keypoint definition. conf_thres=legacy; zeros_only=paper; conf_or_zeros=union.",
+    )
+    parser.add_argument(
+        "--interp-mode",
+        type=str,
+        default="short_gap_hold",
+        choices=["short_gap_hold", "paper_group_linear"],
+        help="Interpolation/fill mode for missing joints.",
+    )
+    parser.add_argument("--interp-group", type=int, default=100, help="Group size (frames) for paper_group_linear interpolation (default: 100).")
+    parser.add_argument(
+        "--rp-center-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "normalized_01", "pixel"],
+        help="Image center definition for --normalize-mode paper_rp. pixel requires --rp-img-w/--rp-img-h; auto infers [0,1] vs pixel from coords.",
+    )
+    parser.add_argument("--rp-img-w", type=int, default=None, help="Image width W for paper_rp when using pixel coordinates.")
+    parser.add_argument("--rp-img-h", type=int, default=None, help="Image height H for paper_rp when using pixel coordinates.")
     parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
     parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
     parser.add_argument(
@@ -869,11 +905,15 @@ if __name__ == "__main__":
         T=int(args.T),
         use_conf=use_conf,
         normalize=normalize,
+        normalize_mode=str(args.normalize_mode),
         add_vel=add_vel,
         add_acc=add_acc,
         add_global=add_global,
         conf_thres=float(args.conf_thres),
         max_interp_gap=int(args.max_interp_gap),
+        missing_mode=str(args.missing_mode),
+        interp_mode=str(args.interp_mode),
+        interp_group=int(args.interp_group),
         stride=int(args.stride),
         label_mode=str(args.label_mode),
         min_valid_frac=float(args.min_valid_frac),
@@ -883,6 +923,9 @@ if __name__ == "__main__":
         drop_ambig_share=float(args.drop_ambig_share),
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
         label_convention=label_convention,
+        rp_center_mode=str(args.rp_center_mode),
+        rp_img_w=args.rp_img_w,
+        rp_img_h=args.rp_img_h,
     )
 
     X_val, y_val_tags, _ = load_windows_from_npzs(
@@ -890,11 +933,15 @@ if __name__ == "__main__":
         T=int(T_used),
         use_conf=use_conf,
         normalize=normalize,
+        normalize_mode=str(args.normalize_mode),
         add_vel=add_vel,
         add_acc=add_acc,
         add_global=add_global,
         conf_thres=float(args.conf_thres),
         max_interp_gap=int(args.max_interp_gap),
+        missing_mode=str(args.missing_mode),
+        interp_mode=str(args.interp_mode),
+        interp_group=int(args.interp_group),
         stride=int(args.stride),
         label_mode=str(args.label_mode),
         min_valid_frac=float(args.min_valid_frac),
@@ -904,6 +951,9 @@ if __name__ == "__main__":
         drop_ambig_share=float(args.drop_ambig_share),
         drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
         label_convention=label_convention,
+        rp_center_mode=str(args.rp_center_mode),
+        rp_img_w=args.rp_img_w,
+        rp_img_h=args.rp_img_h,
     )
 
     # Labels are already remapped to the merged 7-class space (0..6)
