@@ -15,7 +15,7 @@ import glob
 
 import numpy as np
 
-from dataset import WindowTensorDataset  # not used, but keeps parity with project structure
+from dataset_helpers.dataset import WindowTensorDataset  # not used, but keeps parity with project structure
 from build_windows import make_window_tensors
 
 

@@ -8,6 +8,7 @@ Preprocessing mirrors training:
 
 Usage:
   python inference_on_video.py --video path\\to\\clip.mp4 --model path\\to\\tcn_best.pt
+  python inference_on_video.py --video path\\to\\clip.mp4 --model path\\to\\tcn_best.pt --save out.mp4
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import torch
 import torch.nn as nn
 from ultralytics import YOLO
 
-import dataset as ds
+import dataset_helpers.dataset as ds
 
 from models.tcn.simple_tcn import TCNBaseline
 from models.lstm.simple_lstm import LSTMBaseline
@@ -320,6 +321,29 @@ def draw_pose(frame: np.ndarray, xy: np.ndarray, conf: np.ndarray, conf_thres: f
     return frame
 
 
+def open_video_writer(save_path: Path, fps: float, frame_size: Tuple[int, int]) -> cv2.VideoWriter:
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suffix = save_path.suffix.lower()
+    if suffix in {".avi"}:
+        codecs = ["XVID", "MJPG", "mp4v"]
+    elif suffix in {".mp4", ".m4v", ".mov"}:
+        codecs = ["mp4v", "avc1", "H264", "MJPG"]
+    else:
+        codecs = ["mp4v", "MJPG"]
+
+    w, h = int(frame_size[0]), int(frame_size[1])
+    for codec in codecs:
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(str(save_path), fourcc, float(fps), (w, h))
+        if writer.isOpened():
+            print(f"[save] writing: {save_path.as_posix()} ({w}x{h} @{float(fps):.2f}fps, codec={codec})")
+            return writer
+
+    raise RuntimeError(f"Could not open VideoWriter for: {save_path} (tried codecs={codecs})")
+
+
 def feature_layout(use_conf: bool, add_vel: bool, add_acc: bool) -> Dict[str, Optional[object]]:
     idx = 2  # xy
     conf_idx = None
@@ -536,12 +560,28 @@ def main() -> int:
     ap.add_argument("--T", type=int, default=0, help="0 => use ckpt T_used/T, else override")
     ap.add_argument("--stride", type=int, default=0, help="0 => use ckpt stride, else override")
     ap.add_argument("--labels-file", type=str, default=None)
+    ap.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="Optional path to save annotated output video (e.g. out.mp4). If a directory, writes <video_stem>_annotated.mp4 inside.",
+    )
     ap.add_argument("--display-fps", type=float, default=0.0, help="0 => source fps")
     args = ap.parse_args()
 
     video_path = Path(args.video).expanduser()
     if not video_path.exists():
         raise FileNotFoundError(f"--video not found: {video_path}")
+
+    save_path: Optional[Path] = None
+    if args.save:
+        save_arg = Path(args.save).expanduser()
+        if str(args.save).endswith(("/", "\\")) or (save_arg.exists() and save_arg.is_dir()):
+            save_path = save_arg / f"{video_path.stem}_annotated.mp4"
+        else:
+            save_path = save_arg
+        if save_path.suffix == "":
+            save_path = save_path.with_suffix(".mp4")
 
     device = pick_device(args.device)
     use_half = bool(int(args.half)) and device.startswith("cuda")
@@ -613,207 +653,223 @@ def main() -> int:
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
-    src_fps = float(cap.get(cv2.CAP_PROP_FPS))
-    if not np.isfinite(src_fps) or src_fps <= 1e-3:
-        src_fps = 30.0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    writer: Optional[cv2.VideoWriter] = None
+    try:
+        src_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        if not np.isfinite(src_fps) or src_fps <= 1e-3:
+            src_fps = 30.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    fps_play = float(args.display_fps) if float(args.display_fps) > 1e-3 else float(src_fps)
-    delay_ms = max(1, int(round(1000.0 / max(1e-6, fps_play))))
+        fps_play = float(args.display_fps) if float(args.display_fps) > 1e-3 else float(src_fps)
+        delay_ms = max(1, int(round(1000.0 / max(1e-6, fps_play))))
 
-    frames_buf: deque[np.ndarray] = deque()
-    xy_buf: deque[np.ndarray] = deque()
-    cf_buf: deque[np.ndarray] = deque()
+        frames_buf: deque[np.ndarray] = deque()
+        xy_buf: deque[np.ndarray] = deque()
+        cf_buf: deque[np.ndarray] = deque()
 
-    base_idx = 0        # absolute frame index of frames_buf[0]
-    display_idx = 0     # absolute frame index being displayed
-    processed_total = 0 # absolute count of frames processed by YOLO
-    cap_done = False
+        base_idx = 0        # absolute frame index of frames_buf[0]
+        display_idx = 0     # absolute frame index being displayed
+        processed_total = 0 # absolute count of frames processed by YOLO
+        cap_done = False
 
-    window_preds: Dict[int, Tuple[int, float, Optional[float]]] = {}
-    next_win_start = 0
+        window_preds: Dict[int, Tuple[int, float, Optional[float]]] = {}
+        next_win_start = 0
 
-    t_pose0 = time.time()
+        t_pose0 = time.time()
 
-    def process_next_frame() -> bool:
-        nonlocal processed_total, cap_done
+        def process_next_frame() -> bool:
+            nonlocal processed_total, cap_done
 
-        ok, frame = cap.read()
-        if not ok:
-            cap_done = True
-            return False
+            ok, frame = cap.read()
+            if not ok:
+                cap_done = True
+                return False
 
-        xy, cf = pose_on_frame(
-            pose_model=pose_model,
-            frame_bgr=frame,
-            imgsz=int(args.imgsz),
-            yolo_conf=float(args.yolo_conf),
-            device=device,
-            max_people=int(args.max_people),
-            use_half=use_half,
-        )
+            xy, cf = pose_on_frame(
+                pose_model=pose_model,
+                frame_bgr=frame,
+                imgsz=int(args.imgsz),
+                yolo_conf=float(args.yolo_conf),
+                device=device,
+                max_people=int(args.max_people),
+                use_half=use_half,
+            )
 
-        frames_buf.append(frame)
-        xy_buf.append(xy)
-        cf_buf.append(cf)
-        processed_total += 1
+            frames_buf.append(frame)
+            xy_buf.append(xy)
+            cf_buf.append(cf)
+            processed_total += 1
 
-        if processed_total % 200 == 0:
-            dt = time.time() - t_pose0
-            if frame_count > 0:
-                pct = 100.0 * float(processed_total) / float(frame_count)
-                print(f"[pose] {processed_total}/{frame_count} ({pct:.1f}%) | {dt:.1f}s")
-            else:
-                print(f"[pose] {processed_total} frames | {dt:.1f}s")
+            if processed_total % 200 == 0:
+                dt = time.time() - t_pose0
+                if frame_count > 0:
+                    pct = 100.0 * float(processed_total) / float(frame_count)
+                    print(f"[pose] {processed_total}/{frame_count} ({pct:.1f}%) | {dt:.1f}s")
+                else:
+                    print(f"[pose] {processed_total} frames | {dt:.1f}s")
 
-        return True
+            return True
 
-    def compute_window_pred(start: int) -> Tuple[int, float, Optional[float]]:
-        if start in window_preds:
+        def compute_window_pred(start: int) -> Tuple[int, float, Optional[float]]:
+            if start in window_preds:
+                return window_preds[start]
+            if start < base_idx:
+                raise RuntimeError(f"Cannot compute window {start}: frames already dropped (base_idx={base_idx}).")
+            if start >= processed_total:
+                raise RuntimeError(f"Cannot compute window {start}: frame not processed yet (processed_total={processed_total}).")
+
+            off = int(start - base_idx)
+            avail = int(processed_total - start)
+            L = int(min(int(T_final), max(0, avail)))
+            if L <= 0:
+                raise RuntimeError(f"Window start {start} has no available frames (processed_total={processed_total}).")
+
+            xy_seq = np.stack([xy_buf[off + i] for i in range(L)], axis=0)
+            conf_seq = np.stack([cf_buf[off + i] for i in range(L)], axis=0)
+
+            window_feat = make_window_features(
+                xy_seq=xy_seq,
+                conf_seq=conf_seq,
+                T=int(T_final),
+                use_conf=use_conf,
+                normalize=normalize,
+                add_vel=add_vel,
+                add_acc=add_acc,
+                add_global=add_global,
+                add_mask=add_mask,
+                conf_thres=conf_thres,
+                max_interp_gap=max_interp_gap,
+                min_valid_frac=min_valid_frac,
+            )
+            pred, pconf, p_fall = infer_one_window(
+                model=model,
+                window_feat=window_feat,
+                device=device,
+                use_half=use_half,
+                merge_fall_11_to_7=merge_fall_11_to_7,
+            )
+            window_preds[start] = (pred, pconf, p_fall)
             return window_preds[start]
-        if start < base_idx:
-            raise RuntimeError(f"Cannot compute window {start}: frames already dropped (base_idx={base_idx}).")
-        if start >= processed_total:
-            raise RuntimeError(f"Cannot compute window {start}: frame not processed yet (processed_total={processed_total}).")
 
-        off = int(start - base_idx)
-        avail = int(processed_total - start)
-        L = int(min(int(T_final), max(0, avail)))
-        if L <= 0:
-            raise RuntimeError(f"Window start {start} has no available frames (processed_total={processed_total}).")
+        def compute_ready_windows() -> None:
+            nonlocal next_win_start
 
-        xy_seq = np.stack([xy_buf[off + i] for i in range(L)], axis=0)
-        conf_seq = np.stack([cf_buf[off + i] for i in range(L)], axis=0)
+            while True:
+                if next_win_start in window_preds:
+                    next_win_start += int(stride_final)
+                    continue
 
-        window_feat = make_window_features(
-            xy_seq=xy_seq,
-            conf_seq=conf_seq,
-            T=int(T_final),
-            use_conf=use_conf,
-            normalize=normalize,
-            add_vel=add_vel,
-            add_acc=add_acc,
-            add_global=add_global,
-            add_mask=add_mask,
-            conf_thres=conf_thres,
-            max_interp_gap=max_interp_gap,
-            min_valid_frac=min_valid_frac,
-        )
-        pred, pconf, p_fall = infer_one_window(
-            model=model,
-            window_feat=window_feat,
-            device=device,
-            use_half=use_half,
-            merge_fall_11_to_7=merge_fall_11_to_7,
-        )
-        window_preds[start] = (pred, pconf, p_fall)
-        return window_preds[start]
+                if cap_done:
+                    if next_win_start >= processed_total:
+                        break
+                    compute_window_pred(int(next_win_start))
+                    next_win_start += int(stride_final)
+                    continue
 
-    def compute_ready_windows() -> None:
-        nonlocal next_win_start
+                if processed_total >= int(next_win_start) + int(T_final):
+                    compute_window_pred(int(next_win_start))
+                    next_win_start += int(stride_final)
+                    continue
 
-        while True:
-            if next_win_start in window_preds:
-                next_win_start += int(stride_final)
-                continue
+                break
 
-            if cap_done:
-                if next_win_start >= processed_total:
-                    break
-                compute_window_pred(int(next_win_start))
-                next_win_start += int(stride_final)
-                continue
-
-            if processed_total >= int(next_win_start) + int(T_final):
-                compute_window_pred(int(next_win_start))
-                next_win_start += int(stride_final)
-                continue
-
-            break
-
-    # Warm up: read enough frames to make the FIRST window prediction, then start display.
-    while processed_total < int(T_final) and not cap_done:
-        process_next_frame()
-    if processed_total <= 0:
-        raise RuntimeError("Video had 0 frames.")
-
-    compute_window_pred(0)
-    next_win_start = int(stride_final)
-
-    # Main loop: keep a small lookahead so each next-window prediction is ready in time.
-    window_name = "inference_on_video"
-    fps_ema: Optional[float] = None
-    ema_alpha = 0.1
-    t_prev = time.perf_counter()
-    while True:
-        if not frames_buf and cap_done:
-            break
-
-        # Keep a lead of ~T frames (plus 1) so we can predict the next window before it is displayed.
-        target_processed = int(display_idx) + int(T_final) + 1
-        while not cap_done and processed_total < target_processed:
+        # Warm up: read enough frames to make the FIRST window prediction, then start display.
+        while processed_total < int(T_final) and not cap_done:
             process_next_frame()
+        if processed_total <= 0:
+            raise RuntimeError("Video had 0 frames.")
 
-        compute_ready_windows()
+        compute_window_pred(0)
+        next_win_start = int(stride_final)
 
-        if not frames_buf:
-            continue
+        if save_path is not None:
+            h0, w0 = frames_buf[0].shape[:2]
+            writer = open_video_writer(save_path=save_path, fps=float(src_fps), frame_size=(w0, h0))
 
-        win_start = (int(display_idx) // int(stride_final)) * int(stride_final)
-        if win_start not in window_preds:
-            # If we're behind (slow device), wait until we can compute it, then continue.
-            while not cap_done and processed_total < int(win_start) + int(T_final):
+        # Main loop: keep a small lookahead so each next-window prediction is ready in time.
+        window_name = "inference_on_video"
+        fps_ema: Optional[float] = None
+        ema_alpha = 0.1
+        t_prev = time.perf_counter()
+        while True:
+            if not frames_buf and cap_done:
+                break
+
+            # Keep a lead of ~T frames (plus 1) so we can predict the next window before it is displayed.
+            target_processed = int(display_idx) + int(T_final) + 1
+            while not cap_done and processed_total < target_processed:
                 process_next_frame()
-                compute_ready_windows()
+
+            compute_ready_windows()
+
+            if not frames_buf:
+                continue
+
+            win_start = (int(display_idx) // int(stride_final)) * int(stride_final)
             if win_start not in window_preds:
-                compute_window_pred(int(win_start))
+                # If we're behind (slow device), wait until we can compute it, then continue.
+                while not cap_done and processed_total < int(win_start) + int(T_final):
+                    process_next_frame()
+                    compute_ready_windows()
+                if win_start not in window_preds:
+                    compute_window_pred(int(win_start))
 
-        pred, pconf, p_fall = window_preds.get(int(win_start), (-1, 0.0, None))
-        label = class_names[pred] if 0 <= int(pred) < len(class_names) else "..."
+            pred, pconf, p_fall = window_preds.get(int(win_start), (-1, 0.0, None))
+            label = class_names[pred] if 0 <= int(pred) < len(class_names) else "..."
 
-        frame = frames_buf[0].copy()
-        xy = xy_buf[0]
-        cf = cf_buf[0]
+            frame = frames_buf[0].copy()
+            xy = xy_buf[0]
+            cf = cf_buf[0]
 
-        frame = draw_pose(frame, xy, cf, conf_thres=conf_thres)
+            frame = draw_pose(frame, xy, cf, conf_thres=conf_thres)
 
-        frame_info = f"frame {int(display_idx) + 1}"
-        if frame_count > 0:
-            frame_info += f"/{frame_count}"
+            frame_info = f"frame {int(display_idx) + 1}"
+            if frame_count > 0:
+                frame_info += f"/{frame_count}"
 
-        t_now = time.perf_counter()
-        dt = max(1e-6, float(t_now - t_prev))
-        inst_fps = 1.0 / dt
-        fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
-        t_prev = t_now
+            t_now = time.perf_counter()
+            dt = max(1e-6, float(t_now - t_prev))
+            inst_fps = 1.0 / dt
+            fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+            t_prev = t_now
 
-        win_id = int(win_start) // max(1, int(stride_final))
-        hud = [
-            frame_info,
-            f"fps: {float(fps_ema):.1f} (target {float(fps_play):.1f})",
-            f"window {win_id} (start={win_start})",
-            f"pred: {label} ({float(pconf):.2f})" if int(pred) >= 0 else "pred: ...",
-            f"T={int(T_final)} stride={int(stride_final)}",
-        ]
-        if p_fall is not None:
-            hud.append(f"fall_prob: {float(p_fall):.2f}")
+            win_id = int(win_start) // max(1, int(stride_final))
+            hud = [
+                frame_info,
+                f"fps: {float(fps_ema):.1f} (target {float(fps_play):.1f})",
+                f"window {win_id} (start={win_start})",
+                f"pred: {label} ({float(pconf):.2f})" if int(pred) >= 0 else "pred: ...",
+                f"T={int(T_final)} stride={int(stride_final)}",
+            ]
+            if p_fall is not None:
+                hud.append(f"fall_prob: {float(p_fall):.2f}")
 
-        frame = draw_hud(frame, hud)
+            frame = draw_hud(frame, hud)
 
-        cv2.imshow(window_name, frame)
-        key = cv2.waitKey(delay_ms) & 0xFF
-        if key in (ord("q"), 27):
-            break
+            if writer is not None:
+                frame_h, frame_w = frame.shape[:2]
+                frame_to_write = frame
+                if frame_h != h0 or frame_w != w0:
+                    frame_to_write = cv2.resize(frame, (w0, h0), interpolation=cv2.INTER_LINEAR)
+                writer.write(frame_to_write)
 
-        frames_buf.popleft()
-        xy_buf.popleft()
-        cf_buf.popleft()
-        base_idx += 1
-        display_idx += 1
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(delay_ms) & 0xFF
+            if key in (ord("q"), 27):
+                break
 
-    cap.release()
-    cv2.destroyAllWindows()
-    return 0
+            frames_buf.popleft()
+            xy_buf.popleft()
+            cf_buf.popleft()
+            base_idx += 1
+            display_idx += 1
+
+        return 0
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import precision_recall_fscore_support, f1_score, precision_recall_curve, confusion_matrix
 
 # Same dataset pipeline as training
-from dataset import (
+from dataset_helpers.dataset import (
     find_keypoints_npzs_subjects,
     load_windows_from_npzs,
     WindowTensorDataset,

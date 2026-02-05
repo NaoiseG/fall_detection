@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from dataset import (
+from dataset_helpers.dataset import (
     load_windows_from_npzs,
     find_keypoints_npzs_subjects,
     WindowTensorDataset,
@@ -42,13 +42,13 @@ from dataset import (
     get_fall_merge_set as _get_fall_merge_set,
 )
 
-from .tcn.simple_tcn import TCNBaseline
-from .lstm.simple_lstm import LSTMBaseline
-from .gru.simple_gru import GRUBaseline
-from .gcn.simple_gcn import GCNBaseline
-from .mlp.simple_mlp import MLPBaseline
-from .stgcn.simple_stgcn import STGCNBaseline
-from .cnnlstm.cnn_lstm import CNNLSTMTwoHead
+from models.tcn.simple_tcn import TCNBaseline
+from models.lstm.simple_lstm import LSTMBaseline
+from models.gru.simple_gru import GRUBaseline
+from models.gcn.simple_gcn import GCNBaseline
+from models.mlp.simple_mlp import MLPBaseline
+from models.stgcn.simple_stgcn import STGCNBaseline
+from models.cnnlstm.cnn_lstm import CNNLSTMTwoHead
 
 
 # =============================================================================
