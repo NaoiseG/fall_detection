@@ -25,6 +25,7 @@ Save results table:
 from dataclasses import dataclass, asdict
 from typing import Tuple, List, Optional
 import argparse
+import math
 from pathlib import Path
 import time
 import csv
@@ -188,12 +189,114 @@ def _update_confusion_matrix(
 
 
 @torch.no_grad()
+def fall_fbeta_from_confusion(
+    cm: torch.Tensor,
+    fall_ids_0based: Optional[List[int]],
+    beta: float = 2.0,
+    fall_class_id: int = FALL_CLASS_ID,
+) -> float:
+    """Fβ for fall-vs-nonfall computed from a multi-class confusion matrix."""
+    beta = float(beta)
+    if beta <= 0.0 or not math.isfinite(beta):
+        raise ValueError(f"beta must be finite and > 0, got {beta}")
+
+    if cm.ndim != 2 or cm.shape[0] != cm.shape[1]:
+        raise ValueError(f"cm must be square [C,C], got {tuple(cm.shape)}")
+
+    num_classes = int(cm.shape[0])
+    if num_classes <= 0:
+        return 0.0
+
+    fall_ids = fall_ids_0based if fall_ids_0based else [int(fall_class_id)]
+    fall_ids = sorted({int(i) for i in fall_ids if 0 <= int(i) < num_classes})
+    if not fall_ids and 0 <= int(fall_class_id) < num_classes:
+        fall_ids = [int(fall_class_id)]
+    if not fall_ids:
+        return 0.0
+
+    fall_idx = torch.tensor(fall_ids, dtype=torch.long, device=cm.device)
+    is_fall = torch.zeros((num_classes,), dtype=torch.bool, device=cm.device)
+    is_fall[fall_idx] = True
+
+    # TP = true in fall set AND predicted in fall set
+    cm_fall_rows = cm.index_select(0, fall_idx)
+    tp = cm_fall_rows.index_select(1, fall_idx).sum().float()
+
+    # FN = true in fall set AND predicted not in fall set
+    fn = cm_fall_rows.sum().float() - tp
+
+    # FP = true not in fall set AND predicted in fall set
+    cm_nonfall_rows = cm[~is_fall]
+    fp = cm_nonfall_rows.index_select(1, fall_idx).sum().float()
+
+    denom_p = tp + fp
+    denom_r = tp + fn
+    precision = (tp / denom_p) if float(denom_p.item()) > 0.0 else tp.new_tensor(0.0)
+    recall = (tp / denom_r) if float(denom_r.item()) > 0.0 else tp.new_tensor(0.0)
+
+    beta2 = beta * beta
+    denom = beta2 * precision + recall
+    if float(denom.item()) <= 0.0:
+        return 0.0
+    fbeta = (1.0 + beta2) * precision * recall / denom
+    return float(fbeta.item())
+
+
+@torch.no_grad()
+def macro_f1_from_confusion(cm: torch.Tensor) -> float:
+    """Macro F1 across classes with support>0."""
+    # cm: rows = true, cols = pred
+    support = cm.sum(dim=1)  # (C,)
+    pred_support = cm.sum(dim=0)  # (C,)
+    tp = cm.diag()
+    recall = tp.float() / support.clamp(min=1).float()
+    precision = tp.float() / pred_support.clamp(min=1).float()
+    f1 = (2.0 * precision * recall) / (precision + recall).clamp(min=1e-12)
+
+    mask = support > 0
+    if not bool(mask.any()):
+        return 0.0
+    return float(f1[mask].mean().item())
+
+
+@torch.no_grad()
+def composite_fall_fbeta_macro_f1_from_confusion(
+    cm: torch.Tensor,
+    fall_ids_0based: Optional[List[int]],
+    w: float = 0.7,
+    beta: float = 2.0,
+) -> Tuple[float, float, float]:
+    """Composite = w*Fβ(fall)+(1-w)*MacroF1, and returns (composite, fall_fbeta, macro_f1)."""
+    if not math.isfinite(float(w)):
+        raise ValueError(f"w must be finite, got {w}")
+    w = float(w)
+    w = max(0.0, min(1.0, w))
+
+    macro_f1 = macro_f1_from_confusion(cm)
+    fall_fbeta = fall_fbeta_from_confusion(cm, fall_ids_0based=fall_ids_0based, beta=float(beta))
+    composite = w * fall_fbeta + (1.0 - w) * macro_f1
+    return float(composite), float(fall_fbeta), float(macro_f1)
+
+
+@torch.no_grad()
 def selection_score_from_confusion(
     cm: torch.Tensor,
     selection_metric: str,
     metric_weights: Optional[torch.Tensor] = None,
+    fall_ids_0based: Optional[List[int]] = None,
+    selection_w: float = 0.7,
+    selection_beta: float = 2.0,
 ) -> float:
     """Returns a scalar score where larger is better."""
+    if selection_metric == "composite_fall_fbeta_macro_f1":
+        score, _, _ = composite_fall_fbeta_macro_f1_from_confusion(
+            cm,
+            fall_ids_0based=fall_ids_0based,
+            w=float(selection_w),
+            beta=float(selection_beta),
+        )
+        return float(score)
+
     # cm: rows = true, cols = pred
     support = cm.sum(dim=1)  # (C,)
     pred_support = cm.sum(dim=0)  # (C,)
@@ -411,9 +514,11 @@ def eval_one_epoch(
     pos_weight: Optional[float] = None,
     class_weights: Optional[torch.Tensor] = None,
     num_classes: Optional[int] = None,
-    selection_metric: str = "macro_f1",
+    selection_metric: str = "composite_fall_fbeta_macro_f1",
     metric_weights: Optional[torch.Tensor] = None,
-) -> Tuple[float, float, float]:
+    selection_w: float = 0.7,
+    selection_beta: float = 2.0,
+) -> Tuple[float, float, float, dict]:
     model.eval()
     total_loss = 0.0
     total_acc = 0.0
@@ -429,7 +534,7 @@ def eval_one_epoch(
         fall_ids_t = torch.tensor(fall_ids_0based, device=device, dtype=torch.long)
 
     cm = None
-    if selection_metric in {"macro_recall", "inv_freq_recall", "macro_f1"}:
+    if selection_metric in {"macro_recall", "inv_freq_recall", "macro_f1", "composite_fall_fbeta_macro_f1"}:
         if num_classes is None:
             raise ValueError("num_classes must be provided when using confusion-matrix-based selection metrics.")
         cm = torch.zeros((int(num_classes), int(num_classes)), dtype=torch.long)
@@ -460,13 +565,37 @@ def eval_one_epoch(
     val_loss = total_loss / max(1, n)
     val_acc = total_acc / max(1, n)
 
+    details: dict = {}
     if selection_metric == "acc":
         val_score = float(val_acc)
+    elif selection_metric == "composite_fall_fbeta_macro_f1":
+        assert cm is not None
+        composite, fall_fbeta, macro_f1 = composite_fall_fbeta_macro_f1_from_confusion(
+            cm,
+            fall_ids_0based=fall_ids_0based,
+            w=float(selection_w),
+            beta=float(selection_beta),
+        )
+        val_score = float(composite)
+        details = {
+            "macro_f1": float(macro_f1),
+            "fall_fbeta": float(fall_fbeta),
+            "selection_w": float(max(0.0, min(1.0, float(selection_w)))),
+            "selection_beta": float(selection_beta),
+            "composite": float(composite),
+        }
     else:
         assert cm is not None
-        val_score = selection_score_from_confusion(cm, selection_metric=selection_metric, metric_weights=metric_weights)
+        val_score = selection_score_from_confusion(
+            cm,
+            selection_metric=selection_metric,
+            metric_weights=metric_weights,
+            fall_ids_0based=fall_ids_0based,
+            selection_w=float(selection_w),
+            selection_beta=float(selection_beta),
+        )
 
-    return val_loss, val_acc, val_score
+    return val_loss, val_acc, float(val_score), details
 
 
 
@@ -500,7 +629,9 @@ def train_model_once(
     fall_ids_0based: Optional[List[int]] = None,
     pos_weight: Optional[float] = None,
     lambda_bin: float = 0.5,
-    selection_metric: str = "macro_f1",
+    selection_metric: str = "composite_fall_fbeta_macro_f1",
+    selection_w: float = 0.7,
+    selection_beta: float = 2.0,
     metric_weights_np: Optional[np.ndarray] = None,
     class_weights_np: Optional[np.ndarray] = None,
 ) -> RunResult:
@@ -540,7 +671,7 @@ def train_model_once(
     if class_weights_np is not None:
         class_weights_t = torch.tensor(class_weights_np, device=cfg.device, dtype=torch.float32)
 
-    # Best checkpoint is chosen by selection_metric (default: macro_f1),
+    # Best checkpoint is chosen by selection_metric (default: composite_fall_fbeta_macro_f1),
     # not by overall accuracy.
     best_vs = -1.0
     best_va = -1.0
@@ -560,7 +691,7 @@ def train_model_once(
             pos_weight=pos_weight,
             class_weights=class_weights_t,
         )
-        va_loss, va_acc, va_score = eval_one_epoch(
+        va_loss, va_acc, va_score, va_details = eval_one_epoch(
             model, val_loader, cfg.device,
             fall_ids_0based=fall_ids_0based,
             lambda_bin=lambda_bin,
@@ -569,6 +700,8 @@ def train_model_once(
             num_classes=num_classes,
             selection_metric=selection_metric,
             metric_weights=metric_weights_t,
+            selection_w=float(selection_w),
+            selection_beta=float(selection_beta),
         )
 
         final_vs, final_va, final_vl = va_score, va_acc, va_loss
@@ -605,16 +738,31 @@ def train_model_once(
                 "pos_weight": float(pos_weight) if pos_weight is not None else None,
                 "lambda_bin": float(lambda_bin),
                 "selection_metric": str(selection_metric),
+                "selection_w": float(max(0.0, min(1.0, float(selection_w)))),
+                "selection_beta": float(selection_beta),
                 "metric_weights": metric_weights_np.tolist() if metric_weights_np is not None else None,
                 "class_weights": class_weights_np.tolist() if class_weights_np is not None else None,
                 "node_features": int(node_features) if node_features is not None else None,
             }, ckpt_path)
 
-        print(
-            f"{model_name.upper()} | Epoch {epoch:02d} | "
-            f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
-            f"val loss {va_loss:.4f} acc {va_acc:.3f} score {va_score:.3f} ({selection_metric})"
-        )
+        if selection_metric == "composite_fall_fbeta_macro_f1":
+            mf1 = float(va_details.get("macro_f1", 0.0))
+            fbeta = float(va_details.get("fall_fbeta", 0.0))
+            w_used = float(va_details.get("selection_w", max(0.0, min(1.0, float(selection_w)))))
+            beta_used = float(va_details.get("selection_beta", float(selection_beta)))
+            print(
+                f"{model_name.upper()} | Epoch {epoch:02d} | "
+                f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
+                f"val loss {va_loss:.4f} acc {va_acc:.3f} | "
+                f"macro_f1 {mf1:.3f} fall_fbeta(β={beta_used:.2f}) {fbeta:.3f} | "
+                f"composite(w={w_used:.2f}) {va_score:.3f}"
+            )
+        else:
+            print(
+                f"{model_name.upper()} | Epoch {epoch:02d} | "
+                f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
+                f"val loss {va_loss:.4f} acc {va_acc:.3f} score {va_score:.3f} ({selection_metric})"
+            )
 
     dt = time.time() - t0
     res = RunResult(
@@ -832,11 +980,45 @@ if __name__ == "__main__":
     parser.add_argument(
         "--selection-metric",
         type=str,
-        default="macro_f1",
-        choices=["macro_f1", "inv_freq_recall", "macro_recall", "acc"],
-        help="Metric used to choose the best checkpoint (default: macro_f1). inv_freq_recall upweights minority classes using inverse train frequency.",
+        default="composite_fall_fbeta_macro_f1",
+        choices=[
+            "composite_fall_fbeta_macro_f1",
+            "macro_f1",
+            "inv_freq_recall",
+            "macro_recall",
+            "acc",
+        ],
+        help=(
+            "Metric used to choose the best checkpoint (default: composite_fall_fbeta_macro_f1). "
+            "composite_fall_fbeta_macro_f1 = w*Fβ(fall)+(1-w)*MacroF1 (best practical choice). "
+            "inv_freq_recall upweights minority classes using inverse train frequency."
+        ),
+    )
+    parser.add_argument(
+        "--selection-w",
+        type=float,
+        default=0.7,
+        help="Weight w in the composite selection metric w*Fβ(fall)+(1-w)*MacroF1. Clamped to [0,1] (default: 0.7).",
+    )
+    parser.add_argument(
+        "--selection-beta",
+        type=float,
+        default=2.0,
+        help="β for Fβ(fall) in the composite selection metric (β>1 emphasizes recall). Must be >0 (default: 2.0).",
     )
     args = parser.parse_args()
+
+    if not math.isfinite(float(args.selection_w)):
+        raise SystemExit("--selection-w must be a finite float.")
+    selection_w = float(args.selection_w)
+    selection_w_clamped = max(0.0, min(1.0, selection_w))
+    if selection_w != selection_w_clamped:
+        print(f"[selection] Clamped --selection-w from {selection_w} to {selection_w_clamped}")
+    args.selection_w = selection_w_clamped
+
+    if not math.isfinite(float(args.selection_beta)) or float(args.selection_beta) <= 0.0:
+        raise SystemExit("--selection-beta must be a finite float > 0.")
+    args.selection_beta = float(args.selection_beta)
 
     use_conf = bool(args.use_conf)
     normalize = bool(args.normalize)
@@ -1087,6 +1269,8 @@ if __name__ == "__main__":
             pos_weight=pos_weight,
             lambda_bin=float(args.lambda_bin),
             selection_metric=str(args.selection_metric),
+            selection_w=float(args.selection_w),
+            selection_beta=float(args.selection_beta),
             metric_weights_np=metric_weights_np,
             class_weights_np=class_weights_np,
         )
