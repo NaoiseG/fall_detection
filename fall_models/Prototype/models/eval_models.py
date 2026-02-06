@@ -623,11 +623,42 @@ def main():
 
     # Preprocessing options
     parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
+    parser.add_argument(
+        "--normalize-mode",
+        type=str,
+        default="center_scale",
+        choices=["center_scale", "paper_rp"],
+        help="Normalisation mode when --normalize 1. center_scale=legacy translation+scale; paper_rp=paper Relative Position (translation only).",
+    )
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
     parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")
     parser.add_argument("--add-global", type=int, default=1, help="Add global features (0/1).")
     parser.add_argument("--conf-thres", type=float, default=0.2, help="Conf threshold for missing joints.")
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for interpolation.")
+    parser.add_argument(
+        "--missing-mode",
+        type=str,
+        default="conf_thres",
+        choices=["conf_thres", "zeros_only", "conf_or_zeros"],
+        help="Missing-keypoint definition. conf_thres=legacy; zeros_only=paper; conf_or_zeros=union.",
+    )
+    parser.add_argument(
+        "--interp-mode",
+        type=str,
+        default="short_gap_hold",
+        choices=["short_gap_hold", "paper_group_linear"],
+        help="Interpolation strategy for missing keypoints. short_gap_hold=legacy; paper_group_linear=paper (requires --interp-group).",
+    )
+    parser.add_argument("--interp-group", type=int, default=100, help="Group size (frames) for paper_group_linear interpolation (default: 100).")
+    parser.add_argument(
+        "--rp-center-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "normalized_01", "pixel"],
+        help="Image center definition for --normalize-mode paper_rp. pixel requires --rp-img-w/--rp-img-h; auto infers [0,1] vs pixel from coords.",
+    )
+    parser.add_argument("--rp-img-w", type=int, default=None, help="Image width W for paper_rp when using pixel coordinates.")
+    parser.add_argument("--rp-img-h", type=int, default=None, help="Image height H for paper_rp when using pixel coordinates.")
     parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
     parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
     parser.add_argument(
@@ -638,6 +669,18 @@ def main():
     )
     parser.add_argument("--min-valid-frac", type=float, default=0.3)
     parser.add_argument("--add-mask-channel", type=int, default=1)
+    parser.add_argument(
+        "--drop-ambig-share",
+        type=float,
+        default=0.0,
+        help="Drop windows where top-label share < this value (measured on valid frames). 0 disables.",
+    )
+    parser.add_argument(
+        "--drop-ambig-nonfall-only",
+        type=int,
+        default=1,
+        help="If 1, only drop ambiguous windows that contain no fall frames (helps preserve fall transitions).",
+    )
     args = parser.parse_args()
 
     normalize_cli = bool(args.normalize)
@@ -721,11 +764,18 @@ def main():
             use_conf_ckpt = bool(ckpt.get("use_conf", True))
 
             normalize_ckpt = bool(ckpt.get("normalize", normalize_cli))
+            normalize_mode_ckpt = str(ckpt.get("normalize_mode", args.normalize_mode))
             add_vel_ckpt = bool(ckpt.get("add_vel", add_vel_cli))
             add_acc_ckpt = bool(ckpt.get("add_acc", add_acc_cli))
             add_global_ckpt = bool(ckpt.get("add_global", add_global_cli))
             conf_thres_ckpt = float(ckpt.get("conf_thres", args.conf_thres))
             max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
+            missing_mode_ckpt = str(ckpt.get("missing_mode", args.missing_mode))
+            interp_mode_ckpt = str(ckpt.get("interp_mode", args.interp_mode))
+            interp_group_ckpt = int(ckpt.get("interp_group", args.interp_group))
+            rp_center_mode_ckpt = str(ckpt.get("rp_center_mode", args.rp_center_mode))
+            rp_img_w_ckpt = ckpt.get("rp_img_w", args.rp_img_w)
+            rp_img_h_ckpt = ckpt.get("rp_img_h", args.rp_img_h)
             T_ckpt = int(ckpt.get("T", ckpt.get("T_used", args.T)))  # support both keys
             stride_ckpt = int(ckpt.get("stride", args.stride))
 
@@ -733,6 +783,8 @@ def main():
             label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
             min_valid_frac_ckpt = float(ckpt.get("min_valid_frac", args.min_valid_frac))
             add_mask_channel_ckpt = bool(ckpt.get("add_mask_channel", add_mask_channel_cli))
+            drop_ambig_share_ckpt = float(ckpt.get("drop_ambig_share", args.drop_ambig_share))
+            drop_ambig_nonfall_only_ckpt = bool(ckpt.get("drop_ambig_nonfall_only", bool(args.drop_ambig_nonfall_only)))
             node_features_ckpt = ckpt.get("node_features", None)
             if node_features_ckpt is None and (in_features % 17 == 0):
                 node_features_ckpt = in_features // 17
@@ -743,11 +795,18 @@ def main():
             T_used = None
             use_conf_ckpt = use_conf
             normalize_ckpt = normalize_cli
+            normalize_mode_ckpt = str(args.normalize_mode)
             add_vel_ckpt = add_vel_cli
             add_acc_ckpt = add_acc_cli
             add_global_ckpt = add_global_cli
             conf_thres_ckpt = float(args.conf_thres)
             max_interp_gap_ckpt = int(args.max_interp_gap)
+            missing_mode_ckpt = str(args.missing_mode)
+            interp_mode_ckpt = str(args.interp_mode)
+            interp_group_ckpt = int(args.interp_group)
+            rp_center_mode_ckpt = str(args.rp_center_mode)
+            rp_img_w_ckpt = args.rp_img_w
+            rp_img_h_ckpt = args.rp_img_h
             T_ckpt = int(args.T)
             stride_ckpt = int(args.stride)
 
@@ -755,6 +814,8 @@ def main():
             label_mode_ckpt = str(args.label_mode)
             min_valid_frac_ckpt = float(args.min_valid_frac)
             add_mask_channel_ckpt = add_mask_channel_cli
+            drop_ambig_share_ckpt = float(args.drop_ambig_share)
+            drop_ambig_nonfall_only_ckpt = bool(args.drop_ambig_nonfall_only)
             node_features_ckpt = None
 
         # For hybrid window labelling
@@ -770,15 +831,24 @@ def main():
                 T=T_ckpt,
                 use_conf=use_conf_ckpt,
                 normalize=normalize_ckpt,
+                normalize_mode=normalize_mode_ckpt,
                 add_vel=add_vel_ckpt,
                 add_acc=add_acc_ckpt,
                 add_global=add_global_ckpt,
                 conf_thres=conf_thres_ckpt,
                 max_interp_gap=max_interp_gap_ckpt,
+                missing_mode=missing_mode_ckpt,
+                interp_mode=interp_mode_ckpt,
+                interp_group=interp_group_ckpt,
                 stride=stride_ckpt,
                 label_mode=label_mode_ckpt,
                 min_valid_frac=min_valid_frac_ckpt,
                 add_mask_channel=add_mask_channel_ckpt,
+                drop_ambig_share=drop_ambig_share_ckpt,
+                drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+                rp_center_mode=rp_center_mode_ckpt,
+                rp_img_w=rp_img_w_ckpt,
+                rp_img_h=rp_img_h_ckpt,
                 **extra,
                 label_convention=label_convention,
             )
@@ -789,15 +859,24 @@ def main():
                 T=T_ckpt,
                 use_conf=use_conf_ckpt,
                 normalize=normalize_ckpt,
+                normalize_mode=normalize_mode_ckpt,
                 add_vel=add_vel_ckpt,
                 add_acc=add_acc_ckpt,
                 add_global=add_global_ckpt,
                 conf_thres=conf_thres_ckpt,
                 max_interp_gap=max_interp_gap_ckpt,
+                missing_mode=missing_mode_ckpt,
+                interp_mode=interp_mode_ckpt,
+                interp_group=interp_group_ckpt,
                 stride=stride_ckpt,
                 label_mode=label_mode_ckpt,
                 min_valid_frac=min_valid_frac_ckpt,
                 add_mask_channel=add_mask_channel_ckpt,
+                drop_ambig_share=drop_ambig_share_ckpt,
+                drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+                rp_center_mode=rp_center_mode_ckpt,
+                rp_img_w=rp_img_w_ckpt,
+                rp_img_h=rp_img_h_ckpt,
                 **extra,
                 label_convention=label_convention,
             )
@@ -895,15 +974,24 @@ def main():
                     T=T_ckpt,
                     use_conf=use_conf_ckpt,
                     normalize=normalize_ckpt,
+                    normalize_mode=normalize_mode_ckpt,
                     add_vel=add_vel_ckpt,
                     add_acc=add_acc_ckpt,
                     add_global=add_global_ckpt,
                     conf_thres=conf_thres_ckpt,
                     max_interp_gap=max_interp_gap_ckpt,
+                    missing_mode=missing_mode_ckpt,
+                    interp_mode=interp_mode_ckpt,
+                    interp_group=interp_group_ckpt,
                     stride=stride_ckpt,
                     label_mode=label_mode_ckpt,
                     min_valid_frac=min_valid_frac_ckpt,
                     add_mask_channel=add_mask_channel_ckpt,
+                    drop_ambig_share=drop_ambig_share_ckpt,
+                    drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+                    rp_center_mode=rp_center_mode_ckpt,
+                    rp_img_w=rp_img_w_ckpt,
+                    rp_img_h=rp_img_h_ckpt,
                     **extra,
                     label_convention=label_convention,
                 )
