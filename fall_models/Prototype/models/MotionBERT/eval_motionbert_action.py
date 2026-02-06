@@ -36,7 +36,7 @@ python eval_motionbert_action.py \
 
 How to confirm success:
 - report.html exists in the created output folder
-- metrics_summary.csv exists and has top1/top5/loss
+- metrics_summary.csv exists and has loss/top1/top5/balanced_acc/macro_f1/fall_fbeta/ckpt_score
 - plots/confusion_matrix.png exists
 - stdout prints a final summary line including Loss, Acc@1, Acc@5
 
@@ -71,8 +71,6 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import (
     confusion_matrix,
     precision_recall_fscore_support,
-    f1_score,
-    accuracy_score,
 )
 
 import matplotlib.pyplot as plt
@@ -353,8 +351,17 @@ class EvalMetrics:
     loss: float
     top1: float
     top5: float
+    balanced_acc: float
     macro_f1: float
     weighted_f1: float
+    fall_fbeta: float
+    fall_precision: float
+    fall_recall: float
+    ckpt_metric: str
+    ckpt_w: float
+    ckpt_beta: float
+    fall_class_idx: int
+    ckpt_score: float
 
 
 def _topk_accuracy(logits: torch.Tensor, target: torch.Tensor, topk: Tuple[int, ...] = (1, 5)) -> List[float]:
@@ -375,18 +382,108 @@ def _topk_accuracy(logits: torch.Tensor, target: torch.Tensor, topk: Tuple[int, 
         return res
 
 
+def _confusion_metrics_from_cm(cm: np.ndarray, eps: float = 1e-12):
+    """
+    Match train_action_weighted_balanced.py: balanced accuracy (mean recall over classes present)
+    and macro-F1 computed over classes present in this split (support > 0).
+
+    cm shape: (C, C) with rows=true labels, cols=predicted labels.
+    """
+    cm = cm.astype(np.float64)
+    support = cm.sum(axis=1)  # gt count per class
+    valid = support > 0
+
+    tp = np.diag(cm)
+    recall = tp / (support + eps)
+
+    pred_support = cm.sum(axis=0)
+    precision = tp / (pred_support + eps)
+
+    f1 = 2 * precision * recall / (precision + recall + eps)
+
+    balanced_acc = float(np.mean(recall[valid])) if np.any(valid) else 0.0
+    macro_f1 = float(np.mean(f1[valid])) if np.any(valid) else 0.0
+    return balanced_acc, macro_f1, recall, precision, f1
+
+
+def _one_vs_rest_fbeta_from_cm(cm: np.ndarray, class_idx: int, beta: float = 2.0, eps: float = 1e-12):
+    """
+    Match train_action_weighted_balanced.py: one-vs-rest precision/recall/F_beta
+    for a target class from a multiclass confusion matrix.
+    """
+    cm = cm.astype(np.float64)
+    if class_idx < 0 or class_idx >= cm.shape[0]:
+        raise ValueError(f"class_idx={class_idx} out of range for confusion matrix with shape {cm.shape}")
+
+    tp = cm[class_idx, class_idx]
+    fn = cm[class_idx, :].sum() - tp
+    fp = cm[:, class_idx].sum() - tp
+
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+
+    beta2 = beta * beta
+    fbeta = (1.0 + beta2) * precision * recall / (beta2 * precision + recall + eps)
+    return float(fbeta), float(precision), float(recall)
+
+
+def _compute_class_weights_from_pkl(
+    pkl_path: Path,
+    train_split: str,
+    num_classes: int,
+    mode: str = "inv_sqrt",
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Match train_action_weighted_balanced.py: compute per-class weights from the training split of
+    a MotionBERT action .pkl, normalized to mean=1.
+    """
+    ds = _load_action_pkl(pkl_path)
+    split_dict = ds.get("split", {})
+    if train_split not in split_dict:
+        raise KeyError(f"Split '{train_split}' not found in {pkl_path.as_posix()}. Available: {list(split_dict.keys())}")
+
+    train_dirs = set(split_dict[train_split])
+    counts = np.zeros((int(num_classes),), dtype=np.int64)
+
+    for ann in ds.get("annotations", []):
+        fd = ann.get("frame_dir", None)
+        if fd in train_dirs:
+            lab = int(ann.get("label"))
+            if 0 <= lab < int(num_classes):
+                counts[lab] += 1
+
+    safe = np.maximum(counts, 1)
+
+    if mode == "inv":
+        w = 1.0 / (safe.astype(np.float64) + eps)
+    elif mode == "inv_sqrt":
+        w = 1.0 / (np.sqrt(safe.astype(np.float64)) + eps)
+    else:
+        raise ValueError(f"Unknown class-weight mode: {mode!r}. Expected 'inv' or 'inv_sqrt'.")
+
+    w = w / (np.mean(w) + eps)
+
+    print("\n[Class weighting] Train label counts:", {i: int(c) for i, c in enumerate(counts) if c > 0}, flush=True)
+    print("[Class weighting] Example weights (first 11):", [float(x) for x in w[: min(11, len(w))]], flush=True)
+    return torch.tensor(w, dtype=torch.float32)
+
+
 def _evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    criterion: nn.Module,
+    num_classes: int,
     print_freq: int = 100,
-) -> Tuple[EvalMetrics, np.ndarray, np.ndarray]:
+) -> Tuple[float, float, float, np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
-    criterion = nn.CrossEntropyLoss()
 
-    losses: List[float] = []
-    top1_list: List[float] = []
-    top5_list: List[float] = []
+    n_total = 0
+    loss_sum = 0.0
+    top1_correct = 0
+    top5_correct = 0
+    cm = np.zeros((int(num_classes), int(num_classes)), dtype=np.int64)
 
     y_true_all: List[int] = []
     y_pred_all: List[int] = []
@@ -400,42 +497,48 @@ def _evaluate(
             logits = model(batch_input)  # (N, C)
             loss = criterion(logits, batch_gt)
 
-            acc1, acc5 = _topk_accuracy(logits, batch_gt, topk=(1, 5))
-            losses.append(float(loss.item()))
-            top1_list.append(acc1)
-            top5_list.append(acc5)
+            batch_size = int(batch_gt.shape[0])
+            n_total += batch_size
+            loss_sum += float(loss.item()) * batch_size
 
             preds = logits.argmax(dim=1)
+            top1_correct += int((preds == batch_gt).sum().item())
+            maxk = min(5, int(logits.shape[1]))
+            if maxk <= 1:
+                top5_correct += batch_size
+            else:
+                _, pred_topk = logits.topk(maxk, dim=1, largest=True, sorted=True)  # (N, maxk)
+                top5_correct += int(pred_topk.eq(batch_gt.view(-1, 1)).any(dim=1).sum().item())
+
+            # confusion matrix (rows=gt, cols=pred), like train_action_weighted_balanced.py
+            gt_cpu = batch_gt.detach().cpu().numpy().astype(np.int64, copy=False)
+            pr_cpu = preds.detach().cpu().numpy().astype(np.int64, copy=False)
+            np.add.at(cm, (gt_cpu, pr_cpu), 1)
+
             y_true_all.extend(batch_gt.detach().cpu().numpy().astype(int).tolist())
             y_pred_all.extend(preds.detach().cpu().numpy().astype(int).tolist())
 
             if (idx + 1) % print_freq == 0 or (idx + 1) == len(loader):
                 elapsed = time.time() - end
                 end = time.time()
+                avg_loss = (loss_sum / max(1, n_total)) if n_total > 0 else 0.0
+                avg_top1 = (100.0 * top1_correct / max(1, n_total)) if n_total > 0 else 0.0
+                avg_top5 = (100.0 * top5_correct / max(1, n_total)) if n_total > 0 else 0.0
                 print(
                     f"[eval] batch {idx+1:05d}/{len(loader)} | "
-                    f"loss {np.mean(losses):.4f} | "
-                    f"acc@1 {np.mean(top1_list):.2f} | "
-                    f"acc@5 {np.mean(top5_list):.2f} | "
+                    f"loss {avg_loss:.4f} | "
+                    f"acc@1 {avg_top1:.2f} | "
+                    f"acc@5 {avg_top5:.2f} | "
                     f"{elapsed:.2f}s",
                     flush=True,
                 )
 
     y_true_np = np.asarray(y_true_all, dtype=int)
     y_pred_np = np.asarray(y_pred_all, dtype=int)
-
-    macro_f1 = float(f1_score(y_true_np, y_pred_np, average="macro", zero_division=0))
-    weighted_f1 = float(f1_score(y_true_np, y_pred_np, average="weighted", zero_division=0))
-
-    metrics = EvalMetrics(
-        n_samples=int(len(y_true_np)),
-        loss=float(np.mean(losses) if losses else 0.0),
-        top1=float(np.mean(top1_list) if top1_list else 0.0),
-        top5=float(np.mean(top5_list) if top5_list else 0.0),
-        macro_f1=macro_f1,
-        weighted_f1=weighted_f1,
-    )
-    return metrics, y_true_np, y_pred_np
+    avg_loss = (loss_sum / max(1, n_total)) if n_total > 0 else 0.0
+    avg_top1 = (100.0 * top1_correct / max(1, n_total)) if n_total > 0 else 0.0
+    avg_top5 = (100.0 * top5_correct / max(1, n_total)) if n_total > 0 else 0.0
+    return float(avg_loss), float(avg_top1), float(avg_top5), cm, y_true_np, y_pred_np
 
 
 def _plot_confusion_matrix(cm: np.ndarray, class_names: List[str], out_path: Path, normalize: bool = False) -> None:
@@ -602,6 +705,48 @@ def main() -> None:
         help="Optional list of class ids to treat as 'fall' for binary metrics (IDs must match the pkl label space).",
     )
 
+    # ------------------------------------------------------------------
+    # train_action_weighted_balanced.py compatibility flags
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--ckpt-metric",
+        type=str,
+        default=None,
+        choices=("top1", "balanced_acc", "composite"),
+        help="Metric used to compute ckpt_score (default: read from checkpoint if present, else 'composite').",
+    )
+    parser.add_argument(
+        "--ckpt-w",
+        type=float,
+        default=None,
+        help="Composite score weight: ckpt_score = w*F_beta(fall) + (1-w)*MacroF1 (default: read from checkpoint if present, else 0.7).",
+    )
+    parser.add_argument(
+        "--ckpt-beta",
+        type=float,
+        default=None,
+        help="Beta value for fall F_beta (one-vs-rest) (default: read from checkpoint if present, else 2.0).",
+    )
+    parser.add_argument(
+        "--fall-class-idx",
+        type=int,
+        default=0,
+        help="Class index for the priority 'fall' class used in one-vs-rest F_beta (default: 0).",
+    )
+    parser.add_argument(
+        "--use-class-weights",
+        dest="use_class_weights",
+        action="store_true",
+        help="Use class-weighted CrossEntropyLoss (matches train_action_weighted_balanced.py).",
+    )
+    parser.add_argument(
+        "--no-class-weights",
+        dest="use_class_weights",
+        action="store_false",
+        help="Disable class-weighted CrossEntropyLoss.",
+    )
+    parser.set_defaults(use_class_weights=True)
+
     # Optional overrides
     parser.add_argument("--data-pkl", type=str, default=None, help="Override dataset pkl path (default: data/action/<dataset>.pkl).")
     parser.add_argument("--split-base", type=str, default=None, help="Override base split name (default: config data_split, e.g. xsub).")
@@ -732,6 +877,43 @@ def main() -> None:
     state = _clean_state_dict_for_model(state, model)
     model.load_state_dict(state, strict=True)
 
+    # Pick checkpoint-selection settings (prefer checkpoint metadata, allow CLI override)
+    ckpt_metric_raw = args_cli.ckpt_metric
+    if ckpt_metric_raw is None and isinstance(checkpoint, dict):
+        ckpt_metric_raw = checkpoint.get("ckpt_metric", None)
+    ckpt_metric = str(ckpt_metric_raw) if ckpt_metric_raw is not None else "composite"
+    if ckpt_metric not in ("top1", "balanced_acc", "composite"):
+        print(f"WARNING: unknown ckpt_metric={ckpt_metric!r}. Falling back to 'composite'.", flush=True)
+        ckpt_metric = "composite"
+
+    ckpt_w = args_cli.ckpt_w
+    if ckpt_w is None and isinstance(checkpoint, dict):
+        ckpt_w = checkpoint.get("ckpt_w", None)
+    ckpt_w_f = float(ckpt_w) if ckpt_w is not None else 0.7
+
+    ckpt_beta = args_cli.ckpt_beta
+    if ckpt_beta is None and isinstance(checkpoint, dict):
+        ckpt_beta = checkpoint.get("ckpt_beta", None)
+    ckpt_beta_f = float(ckpt_beta) if ckpt_beta is not None else 2.0
+
+    fall_class_idx = int(args_cli.fall_class_idx)
+
+    # Loss weighting (same default as train_action_weighted_balanced.py)
+    class_weights: Optional[torch.Tensor] = None
+    if bool(args_cli.use_class_weights):
+        try:
+            train_split_key = f"{base_split}_train"
+            class_weights = _compute_class_weights_from_pkl(src_pkl, train_split_key, action_classes, mode="inv_sqrt")
+        except Exception as e:
+            print(f"WARNING: could not compute class weights; using unweighted CE loss. Reason: {e}", flush=True)
+            class_weights = None
+
+    if class_weights is not None:
+        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    else:
+        criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+
     # Log shape
     try:
         sample_x, sample_y = next(iter(loader))
@@ -740,19 +922,61 @@ def main() -> None:
         print(f"WARNING: could not read first batch for shape logging: {e}", flush=True)
 
     # Evaluate
-    metrics, y_true, y_pred = _evaluate(model, loader, device=device, print_freq=int(args_cli.print_freq))
-
-    # Compute per-class stats
-    labels = list(range(action_classes))
-    pr, rc, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, average=None, zero_division=0
+    loss_avg, top1, top5, cm, y_true, y_pred = _evaluate(
+        model,
+        loader,
+        device=device,
+        criterion=criterion,
+        num_classes=action_classes,
+        print_freq=int(args_cli.print_freq),
     )
 
+    balanced_acc, macro_f1, recall, precision, f1 = _confusion_metrics_from_cm(cm)
+    support = cm.sum(axis=1).astype(np.int64, copy=False)
+    support_sum = float(np.sum(support))
+    weighted_f1 = float(np.sum(f1 * support) / support_sum) if support_sum > 0 else 0.0
+
+    fall_fbeta, fall_prec, fall_rec = _one_vs_rest_fbeta_from_cm(cm, fall_class_idx, beta=ckpt_beta_f)
+
+    if ckpt_metric == "top1":
+        ckpt_score = float(top1)
+    elif ckpt_metric == "balanced_acc":
+        ckpt_score = float(balanced_acc)
+    else:
+        ckpt_score = float(ckpt_w_f) * float(fall_fbeta) + (1.0 - float(ckpt_w_f)) * float(macro_f1)
+
+    metrics = EvalMetrics(
+        n_samples=int(len(y_true)),
+        loss=float(loss_avg),
+        top1=float(top1),
+        top5=float(top5),
+        balanced_acc=float(balanced_acc),
+        macro_f1=float(macro_f1),
+        weighted_f1=float(weighted_f1),
+        fall_fbeta=float(fall_fbeta),
+        fall_precision=float(fall_prec),
+        fall_recall=float(fall_rec),
+        ckpt_metric=str(ckpt_metric),
+        ckpt_w=float(ckpt_w_f),
+        ckpt_beta=float(ckpt_beta_f),
+        fall_class_idx=int(fall_class_idx),
+        ckpt_score=float(ckpt_score),
+    )
+
+    # Print training-style metrics summary (matches train_action_weighted_balanced.py)
+    print(
+        f"Val: top1={metrics.top1:.3f}, balAcc={metrics.balanced_acc:.3f}, "
+        f"macroF1={metrics.macro_f1:.3f}, fallF{metrics.ckpt_beta:g}={metrics.fall_fbeta:.3f}, "
+        f"ckptScore={metrics.ckpt_score:.3f}",
+        flush=True,
+    )
+
+    labels = list(range(action_classes))
     per_class_df = pd.DataFrame({
         "class_id": labels,
         "class_name": [class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels],
-        "precision": pr,
-        "recall": rc,
+        "precision": precision,
+        "recall": recall,
         "f1": f1,
         "support": support,
     })
@@ -766,8 +990,17 @@ def main() -> None:
         "loss": metrics.loss,
         "acc_top1": metrics.top1,
         "acc_top5": metrics.top5,
+        "balanced_acc": metrics.balanced_acc,
         "macro_f1": metrics.macro_f1,
         "weighted_f1": metrics.weighted_f1,
+        "fall_class_idx": metrics.fall_class_idx,
+        "fall_fbeta": metrics.fall_fbeta,
+        "fall_precision": metrics.fall_precision,
+        "fall_recall": metrics.fall_recall,
+        "ckpt_metric": metrics.ckpt_metric,
+        "ckpt_w": metrics.ckpt_w,
+        "ckpt_beta": metrics.ckpt_beta,
+        "ckpt_score": metrics.ckpt_score,
         "checkpoint": ckpt_path.as_posix(),
         "config": Path(args_cli.config).expanduser().resolve().as_posix(),
         "device": str(device),
@@ -793,7 +1026,6 @@ def main() -> None:
     per_class_df.to_csv(per_class_csv, index=False)
 
     # Plots
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
     _plot_confusion_matrix(cm, class_names=[class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels], out_path=plots_dir / "confusion_matrix.png", normalize=False)
     _plot_f1_bar(per_class_df, out_path=plots_dir / "f1_per_class.png")
 

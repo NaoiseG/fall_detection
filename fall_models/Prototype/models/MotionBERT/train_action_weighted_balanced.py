@@ -36,6 +36,30 @@ def parse_args():
     parser.add_argument('-e', '--evaluate', default='', type=str, metavar='FILENAME', help='checkpoint to evaluate (file name)')
     parser.add_argument('-freq', '--print_freq', default=100)
     parser.add_argument('-ms', '--selection', default='latest_epoch.bin', type=str, metavar='FILENAME', help='checkpoint to finetune (file name)')
+    parser.add_argument(
+        '--ckpt-metric',
+        default=CKPT_METRIC,
+        choices=("top1", "balanced_acc", "composite"),
+        help='Metric for selecting best_epoch.bin: "top1", "balanced_acc", or "composite".',
+    )
+    parser.add_argument(
+        '--ckpt-w',
+        type=float,
+        default=CKPT_W,
+        help="Composite score weight for fall F_beta: score = w*F_beta(fall) + (1-w)*MacroF1.",
+    )
+    parser.add_argument(
+        '--ckpt-beta',
+        type=float,
+        default=CKPT_BETA,
+        help="Beta value for fall F_beta (one-vs-rest). Default emphasizes recall (beta=2).",
+    )
+    parser.add_argument(
+        '--fall-class-idx',
+        type=int,
+        default=FALL_CLASS_IDX,
+        help="Class index for the priority 'fall' class used in one-vs-rest F_beta.",
+    )
     opts = parser.parse_args()
     return opts
 
@@ -45,7 +69,19 @@ def parse_args():
 # -------------------------------------------------------------------------
 # Minimal toggles: flip these two constants if you want to revert behaviour.
 USE_CLASS_WEIGHTS = True          # If True, use weighted CrossEntropyLoss
+# Legacy checkpoint selection toggle (kept for backwards compatibility).
+# Prefer using CKPT_METRIC below (set to "balanced_acc" to match this behaviour).
 BEST_ON_BALANCED_ACC = True       # If True, save best checkpoint by balanced accuracy (mean recall)
+
+# -------------------------------------------------------------------------
+# Best checkpoint selection (best_epoch.bin)
+# -------------------------------------------------------------------------
+# Default uses a composite validation score that prioritizes the "fall" class (label 0):
+#   score = w * F_beta(fall, one-vs-rest) + (1 - w) * MacroF1
+CKPT_METRIC = "composite"         # options: "top1", "balanced_acc", "composite"
+CKPT_W = 0.7
+CKPT_BETA = 2.0
+FALL_CLASS_IDX = 0
 
 def compute_class_weights_from_pkl(data_path: str, train_split: str, num_classes: int,
                                    mode: str = "inv_sqrt", eps: float = 1e-6) -> torch.Tensor:
@@ -117,7 +153,29 @@ def confusion_metrics_from_cm(cm: np.ndarray, eps: float = 1e-12):
     macro_f1 = float(np.mean(f1[valid])) if np.any(valid) else 0.0
     return balanced_acc, macro_f1, recall, precision, f1
 
-def validate(test_loader, model, criterion, num_classes: int):
+
+def one_vs_rest_fbeta_from_cm(cm: np.ndarray, class_idx: int, beta: float = 2.0, eps: float = 1e-12):
+    """
+    Compute one-vs-rest precision/recall/F_beta for a target class from a multiclass confusion matrix.
+    cm shape: (C,C) with rows=gt, cols=pred.
+    """
+    cm = cm.astype(np.float64)
+    if class_idx < 0 or class_idx >= cm.shape[0]:
+        raise ValueError(f"class_idx={class_idx} out of range for confusion matrix with shape {cm.shape}")
+
+    tp = cm[class_idx, class_idx]
+    fn = cm[class_idx, :].sum() - tp
+    fp = cm[:, class_idx].sum() - tp
+
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+
+    beta2 = beta * beta
+    fbeta = (1.0 + beta2) * precision * recall / (beta2 * precision + recall + eps)
+    return float(fbeta), float(precision), float(recall)
+
+
+def validate(test_loader, model, criterion, num_classes: int, fall_class_idx: int = FALL_CLASS_IDX, beta: float = CKPT_BETA):
     model.eval()
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -159,6 +217,7 @@ def validate(test_loader, model, criterion, num_classes: int):
                        loss=losses, top1=top1, top5=top5))
         # balanced metrics (more informative than total accuracy under class imbalance)
     balanced_acc, macro_f1, recall, precision, f1 = confusion_metrics_from_cm(cm)
+    fall_fbeta, fall_prec, fall_rec = one_vs_rest_fbeta_from_cm(cm, fall_class_idx, beta=beta)
     # Print a quick per-class recall summary (helps diagnose minority/fall classes)
     support = cm.sum(axis=1)
     valid = support > 0
@@ -169,8 +228,7 @@ def validate(test_loader, model, criterion, num_classes: int):
         worst = np.argsort(rec_valid)[:min(5, num_classes)]
         worst_str = ', '.join([f"{int(i)}:{float(recall[i]):.2f}({int(support[i])})" for i in worst])
         print(f"Worst recall (class:recall(support)): {worst_str}")
-    print(f"Test summary: Acc@1 {float(top1.avg):.3f} | BalancedAcc {balanced_acc:.3f} | MacroF1 {macro_f1:.3f}")
-    return losses.avg, top1.avg, top5.avg, balanced_acc, macro_f1, recall
+    return losses.avg, top1.avg, top5.avg, balanced_acc, macro_f1, recall, fall_fbeta, fall_prec, fall_rec
 
 
 
@@ -201,7 +259,7 @@ def train_with_config(args, opts):
         model = model.cuda()
         # criterion is moved to CUDA after it is created
 
-    best_acc = 0
+    best_score = float("-inf")
     model_params = 0
     for parameter in model.parameters():
         model_params = model_params + parameter.numel()
@@ -310,8 +368,25 @@ def train_with_config(args, opts):
             else:
                 print('WARNING: this checkpoint does not contain an optimizer state. The optimizer will be reinitialized.')
             lr = checkpoint['lr']
-            if 'best_acc' in checkpoint and checkpoint['best_acc'] is not None:
-                best_acc = checkpoint['best_acc']
+            if checkpoint.get('best_score', None) is not None:
+                best_score = float(checkpoint['best_score'])
+            elif checkpoint.get('best_acc', None) is not None:
+                best_score = float(checkpoint['best_acc'])
+
+            resume_metric = checkpoint.get('ckpt_metric', None)
+            if resume_metric is not None and str(resume_metric) != str(opts.ckpt_metric):
+                print(
+                    f"WARNING: Resuming from checkpoint selected with ckpt_metric='{resume_metric}', "
+                    f"but current run uses ckpt_metric='{opts.ckpt_metric}'. Resetting best_score tracking."
+                )
+                best_score = float("-inf")
+            elif opts.ckpt_metric in ("balanced_acc", "composite") and best_score > 1.0:
+                # Likely resuming from a run where best_acc tracked top1 (%). Prevent scale mismatch.
+                print(
+                    "WARNING: Loaded best_score > 1.0 while ckpt_metric is scaled to [0,1]. "
+                    "Resetting best_score tracking."
+                )
+                best_score = float("-inf")
         # Training
         for epoch in range(st, args.epochs):
             print('Training epoch %d.' % epoch)
@@ -350,7 +425,37 @@ def train_with_config(args, opts):
                        data_time=data_time, loss=losses_train, top1=top1))
                 sys.stdout.flush()
                 
-            test_loss, test_top1, test_top5, test_bal_acc, test_macro_f1, test_recall = validate(test_loader, model, criterion, args.action_classes)
+            (
+                test_loss,
+                test_top1,
+                test_top5,
+                test_bal_acc,
+                test_macro_f1,
+                test_recall,
+                test_fall_fbeta,
+                test_fall_prec,
+                test_fall_rec,
+            ) = validate(
+                test_loader,
+                model,
+                criterion,
+                args.action_classes,
+                fall_class_idx=opts.fall_class_idx,
+                beta=opts.ckpt_beta,
+            )
+
+            if opts.ckpt_metric == "top1":
+                ckpt_score = float(test_top1)
+            elif opts.ckpt_metric == "balanced_acc":
+                ckpt_score = float(test_bal_acc)
+            else:
+                ckpt_score = float(opts.ckpt_w) * float(test_fall_fbeta) + (1.0 - float(opts.ckpt_w)) * float(test_macro_f1)
+
+            print(
+                f"Val: top1={float(test_top1):.3f}, balAcc={float(test_bal_acc):.3f}, "
+                f"macroF1={float(test_macro_f1):.3f}, fallF{float(opts.ckpt_beta):g}={float(test_fall_fbeta):.3f}, "
+                f"ckptScore={float(ckpt_score):.3f}"
+            )
                 
             train_writer.add_scalar('train_loss', losses_train.avg, epoch + 1)
             train_writer.add_scalar('train_top1', top1.avg, epoch + 1)
@@ -360,8 +465,16 @@ def train_with_config(args, opts):
             train_writer.add_scalar('test_top5', test_top5, epoch + 1)
             train_writer.add_scalar('test_balanced_acc', test_bal_acc, epoch + 1)
             train_writer.add_scalar('test_macro_f1', test_macro_f1, epoch + 1)
+            train_writer.add_scalar('test_fall_fbeta', test_fall_fbeta, epoch + 1)
+            train_writer.add_scalar('test_fall_precision', test_fall_prec, epoch + 1)
+            train_writer.add_scalar('test_fall_recall', test_fall_rec, epoch + 1)
+            train_writer.add_scalar('test_ckpt_score', ckpt_score, epoch + 1)
             
             scheduler.step()
+
+            is_new_best = ckpt_score > best_score
+            if is_new_best:
+                best_score = ckpt_score
 
             # Save latest checkpoint.
             chk_path = os.path.join(opts.checkpoint, 'latest_epoch.bin')
@@ -371,26 +484,63 @@ def train_with_config(args, opts):
                 'lr': scheduler.get_last_lr(),
                 'optimizer': optimizer.state_dict(),
                 'model': model.state_dict(),
-                'best_acc' : best_acc
+                'best_score': best_score,
+                'ckpt_metric': opts.ckpt_metric,
+                'ckpt_w': float(opts.ckpt_w),
+                'ckpt_beta': float(opts.ckpt_beta),
+                # legacy key (kept so older resume code doesn't break)
+                'best_acc': best_score,
             }, chk_path)
 
             # Save best checkpoint.
             best_chk_path = os.path.join(opts.checkpoint, 'best_epoch.bin'.format(epoch))
-            # Save best checkpoint based on balanced accuracy (mean recall) if enabled.
-            score = test_bal_acc if BEST_ON_BALANCED_ACC else float(test_top1)
-            if score > best_acc:
-                best_acc = score
+            if is_new_best:
                 print("save best checkpoint")
                 torch.save({
                 'epoch': epoch+1,
                 'lr': scheduler.get_last_lr(),
                 'optimizer': optimizer.state_dict(),
                 'model': model.state_dict(),
-                'best_acc' : best_acc
+                'best_score': best_score,
+                'ckpt_metric': opts.ckpt_metric,
+                'ckpt_w': float(opts.ckpt_w),
+                'ckpt_beta': float(opts.ckpt_beta),
+                # legacy key (kept so older code doesn't break)
+                'best_acc': best_score,
                 }, best_chk_path)
 
     if opts.evaluate:
-        test_loss, test_top1, test_top5, test_bal_acc, test_macro_f1, test_recall = validate(test_loader, model, criterion, args.action_classes)
+        (
+            test_loss,
+            test_top1,
+            test_top5,
+            test_bal_acc,
+            test_macro_f1,
+            test_recall,
+            test_fall_fbeta,
+            test_fall_prec,
+            test_fall_rec,
+        ) = validate(
+            test_loader,
+            model,
+            criterion,
+            args.action_classes,
+            fall_class_idx=opts.fall_class_idx,
+            beta=opts.ckpt_beta,
+        )
+
+        if opts.ckpt_metric == "top1":
+            ckpt_score = float(test_top1)
+        elif opts.ckpt_metric == "balanced_acc":
+            ckpt_score = float(test_bal_acc)
+        else:
+            ckpt_score = float(opts.ckpt_w) * float(test_fall_fbeta) + (1.0 - float(opts.ckpt_w)) * float(test_macro_f1)
+
+        print(
+            f"Val: top1={float(test_top1):.3f}, balAcc={float(test_bal_acc):.3f}, "
+            f"macroF1={float(test_macro_f1):.3f}, fallF{float(opts.ckpt_beta):g}={float(test_fall_fbeta):.3f}, "
+            f"ckptScore={float(ckpt_score):.3f}"
+        )
         print('Loss {loss:.4f} \t'
               'Acc@1 {top1:.3f} \t'
               'Acc@5 {top5:.3f} \t'.format(loss=test_loss, top1=test_top1, top5=test_top5))
