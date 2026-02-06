@@ -40,13 +40,29 @@ import torch.nn as nn
 from ultralytics import YOLO
 
 # -----------------------------------------------------------------------------
-# MotionBERT imports: add MotionBERT repo root to sys.path
+# MotionBERT imports: add MotionBERT root (contains `lib/`) to sys.path
 # -----------------------------------------------------------------------------
-_REPO_ROOT = Path(__file__).resolve().parent
-_MB_ROOT = _REPO_ROOT / "models" / "MotionBERT"
-if _MB_ROOT.exists() and str(_MB_ROOT) not in sys.path:
-    sys.path.insert(0, str(_MB_ROOT))
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parents[1]  # fall_models/Prototype
 
+_MB_ROOT = _REPO_ROOT / "models" / "MotionBERT"
+if not _MB_ROOT.exists():
+    # Fallback: walk upwards until we find models/MotionBERT (helps if this file is moved).
+    for parent in _THIS_FILE.parents:
+        cand = parent / "models" / "MotionBERT"
+        if cand.exists():
+            _REPO_ROOT = parent
+            _MB_ROOT = cand
+            break
+
+if not _MB_ROOT.exists():
+    raise FileNotFoundError(f"MotionBERT root not found at: {_MB_ROOT.as_posix()}")
+
+mb_root_str = str(_MB_ROOT)
+if mb_root_str not in sys.path:
+    sys.path.insert(0, mb_root_str)
+
+# Match MotionBERT training/eval scripts (train_action_weighted_balanced.py) which import via top-level `lib.*`.
 from lib.utils.tools import get_config  # noqa: E402
 from lib.utils.learning import load_backbone  # noqa: E402
 from lib.model.model_action import ActionNet  # noqa: E402

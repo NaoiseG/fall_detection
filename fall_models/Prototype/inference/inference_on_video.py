@@ -3,17 +3,18 @@
 MP4 -> YOLOv11 pose (yolo11l-pose.pt) -> temporal model inference -> popup display.
 
 Preprocessing mirrors training:
-  - dataset.py: fill/interp missing joints, optional normalize/vel/acc/global + mask channel
-  - models/train_models.py: temporal model architectures + checkpoint metadata
+  - dataset_helpers/dataset.py: fill/interp missing joints, optional normalize/vel/acc/global + mask channel
+  - training/train_models.py: temporal model architectures + checkpoint metadata
 
 Usage:
-  python inference_on_video.py --video path\\to\\clip.mp4 --model path\\to\\tcn_best.pt
-  python inference_on_video.py --video path\\to\\clip.mp4 --model path\\to\\tcn_best.pt --save out.mp4
+  python -m inference.inference_on_video --video path\\to\\clip.mp4 --model models\\tcn\\<run>\\tcn_best.pt
+  python -m inference.inference_on_video --video path\\to\\clip.mp4 --model models\\tcn --save out.mp4
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -24,6 +25,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from ultralytics import YOLO
+
+# Allow running as a script from any working directory (mirrors `python -m ...`).
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parents[1]
+_repo_root_str = str(_REPO_ROOT)
+if _repo_root_str not in sys.path:
+    sys.path.insert(0, _repo_root_str)
 
 import dataset_helpers.dataset as ds
 
@@ -437,16 +445,23 @@ def make_window_features(
     T: int,
     use_conf: bool,
     normalize: bool,
+    normalize_mode: str,
     add_vel: bool,
     add_acc: bool,
     add_global: bool,
     add_mask: bool,
     conf_thres: float,
     max_interp_gap: int,
+    missing_mode: str,
+    interp_mode: str,
+    interp_group: int,
+    rp_center_mode: str,
+    rp_img_w: Optional[int],
+    rp_img_h: Optional[int],
     min_valid_frac: float,
 ) -> np.ndarray:
     """
-    Build a single window feature tensor (T,F) matching dataset.py + train_models.py.
+    Build a single window feature tensor (T,F) matching dataset_helpers/dataset.py + training/train_models.py.
     """
     T = int(T)
     L = int(xy_seq.shape[0])
@@ -454,13 +469,42 @@ def make_window_features(
         feat_dim = expected_in_features(use_conf, add_vel, add_acc, add_global, add_mask)
         return np.zeros((T, feat_dim), dtype=np.float32)
 
-    xy_filled, conf_filled = ds._fill_and_mask_kpts(
-        xy_seq.astype(np.float32, copy=False),
-        conf_seq.astype(np.float32, copy=False),
-        conf_thres=float(conf_thres),
-        max_interp_gap=int(max_interp_gap),
-    )
-    xy_used = ds._normalize_xy(xy_filled, conf_filled) if normalize else xy_filled.astype(np.float32, copy=False)
+    missing_mode = str(missing_mode).lower().strip()
+    interp_mode = str(interp_mode).lower().strip()
+    if missing_mode == "conf_thres" and interp_mode == "short_gap_hold":
+        xy_filled, conf_filled = ds._fill_and_mask_kpts(
+            xy_seq.astype(np.float32, copy=False),
+            conf_seq.astype(np.float32, copy=False),
+            conf_thres=float(conf_thres),
+            max_interp_gap=int(max_interp_gap),
+        )
+    else:
+        xy_filled, conf_filled = ds._fill_and_mask_kpts_paper(
+            xy_seq.astype(np.float32, copy=False),
+            conf_seq.astype(np.float32, copy=False),
+            conf_thres=float(conf_thres),
+            missing_mode=str(missing_mode),
+            interp_mode=str(interp_mode),
+            max_interp_gap=int(max_interp_gap),
+            interp_group=int(interp_group),
+        )
+
+    if not bool(normalize):
+        xy_used = xy_filled.astype(np.float32, copy=False)
+    else:
+        nm = str(normalize_mode).lower().strip()
+        if nm == "center_scale":
+            xy_used = ds._normalize_xy(xy_filled, conf_filled)
+        elif nm == "paper_rp":
+            center = ds._compute_image_center(
+                xy=xy_filled,
+                rp_center_mode=str(rp_center_mode),
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
+            )
+            xy_used = ds._normalize_xy_paper_rp(xy_filled, conf_filled, center=center)
+        else:
+            raise ValueError(f"Unknown normalize_mode: {normalize_mode}")
 
     parts = [xy_used]
     if use_conf:
@@ -559,6 +603,42 @@ def main() -> int:
     ap.add_argument("--half", type=int, default=0, help="Use FP16 on CUDA for YOLO+temporal model (0/1)")
     ap.add_argument("--T", type=int, default=0, help="0 => use ckpt T_used/T, else override")
     ap.add_argument("--stride", type=int, default=0, help="0 => use ckpt stride, else override")
+    ap.add_argument(
+        "--normalize-mode",
+        type=str,
+        default=None,
+        choices=["center_scale", "paper_rp"],
+        help="Override checkpoint normalize_mode when --normalize 1 (center_scale or paper_rp).",
+    )
+    ap.add_argument(
+        "--missing-mode",
+        type=str,
+        default=None,
+        choices=["conf_thres", "zeros_only", "conf_or_zeros"],
+        help="Override checkpoint missing_mode (conf_thres, zeros_only, conf_or_zeros).",
+    )
+    ap.add_argument(
+        "--interp-mode",
+        type=str,
+        default=None,
+        choices=["short_gap_hold", "paper_group_linear"],
+        help="Override checkpoint interp_mode (short_gap_hold or paper_group_linear).",
+    )
+    ap.add_argument(
+        "--interp-group",
+        type=int,
+        default=0,
+        help="Override checkpoint interp_group (>0). Only used for --interp-mode paper_group_linear.",
+    )
+    ap.add_argument(
+        "--rp-center-mode",
+        type=str,
+        default=None,
+        choices=["auto", "normalized_01", "pixel"],
+        help="Override checkpoint rp_center_mode for --normalize-mode paper_rp.",
+    )
+    ap.add_argument("--rp-img-w", type=int, default=0, help="Image width W for paper_rp when using pixel coordinates (0 => auto from video).")
+    ap.add_argument("--rp-img-h", type=int, default=0, help="Image height H for paper_rp when using pixel coordinates (0 => auto from video).")
     ap.add_argument("--labels-file", type=str, default=None)
     ap.add_argument(
         "--save",
@@ -594,24 +674,39 @@ def main() -> int:
 
     # Preproc config (prefer checkpoint meta)
     T_final = int(args.T) if int(args.T) > 0 else int(meta.get("T", meta.get("T_used", 64)) or 64)
-    stride_final = int(args.stride) if int(args.stride) > 0 else int(meta.get("stride", 18) or 18)
+    stride_final = int(args.stride) if int(args.stride) > 0 else int(meta.get("stride", 16) or 16)
     T_final = max(1, int(T_final))
     stride_final = max(1, int(stride_final))
 
     use_conf = bool(meta.get("use_conf", True))
     normalize = bool(meta.get("normalize", True))
+    normalize_mode = str(args.normalize_mode) if args.normalize_mode else str(meta.get("normalize_mode") or "center_scale")
     add_vel = bool(meta.get("add_vel", True))
     add_acc = bool(meta.get("add_acc", True))
     add_global = bool(meta.get("add_global", True))
     add_mask = bool(meta.get("add_mask_channel", True))
     conf_thres = float(meta.get("conf_thres", 0.2))
     max_interp_gap = int(meta.get("max_interp_gap", 5))
+    missing_mode = str(args.missing_mode) if args.missing_mode else str(meta.get("missing_mode") or "conf_thres")
+    interp_mode = str(args.interp_mode) if args.interp_mode else str(meta.get("interp_mode") or "short_gap_hold")
+    interp_group = int(args.interp_group) if int(args.interp_group) > 0 else int(meta.get("interp_group", 100) or 100)
+    rp_center_mode = str(args.rp_center_mode) if args.rp_center_mode else str(meta.get("rp_center_mode") or "auto")
+    rp_img_w: Optional[int] = None
+    rp_img_h: Optional[int] = None
+    if int(args.rp_img_w) > 0:
+        rp_img_w = int(args.rp_img_w)
+    elif meta.get("rp_img_w", None) is not None:
+        rp_img_w = int(meta.get("rp_img_w"))  # type: ignore[arg-type]
+    if int(args.rp_img_h) > 0:
+        rp_img_h = int(args.rp_img_h)
+    elif meta.get("rp_img_h", None) is not None:
+        rp_img_h = int(meta.get("rp_img_h"))  # type: ignore[arg-type]
     min_valid_frac = float(meta.get("min_valid_frac", 0.3))
 
     num_classes = int(meta.get("num_classes", 0) or 0)
     in_features_meta = int(meta.get("in_features", 0) or 0)
     if num_classes <= 0:
-        raise ValueError("Checkpoint missing num_classes. Use a checkpoint from models/train_models.py.")
+        raise ValueError("Checkpoint missing num_classes. Use a checkpoint from training/train_models.py.")
 
     merge_fall_11_to_7 = int(num_classes) == 11
     display_num_classes = 7 if merge_fall_11_to_7 else int(num_classes)
@@ -733,12 +828,19 @@ def main() -> int:
                 T=int(T_final),
                 use_conf=use_conf,
                 normalize=normalize,
+                normalize_mode=normalize_mode,
                 add_vel=add_vel,
                 add_acc=add_acc,
                 add_global=add_global,
                 add_mask=add_mask,
                 conf_thres=conf_thres,
                 max_interp_gap=max_interp_gap,
+                missing_mode=missing_mode,
+                interp_mode=interp_mode,
+                interp_group=int(interp_group),
+                rp_center_mode=rp_center_mode,
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
                 min_valid_frac=min_valid_frac,
             )
             pred, pconf, p_fall = infer_one_window(
@@ -778,6 +880,14 @@ def main() -> int:
             process_next_frame()
         if processed_total <= 0:
             raise RuntimeError("Video had 0 frames.")
+
+        # For paper_rp normalisation, default image dims to the video frame size.
+        if str(normalize_mode).lower().strip() == "paper_rp" and frames_buf:
+            h_img, w_img = frames_buf[0].shape[:2]
+            if rp_img_w is None:
+                rp_img_w = int(w_img)
+            if rp_img_h is None:
+                rp_img_h = int(h_img)
 
         compute_window_pred(0)
         next_win_start = int(stride_final)
