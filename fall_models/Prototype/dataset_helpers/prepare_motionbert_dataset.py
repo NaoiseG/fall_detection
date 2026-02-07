@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Prepare a MotionBERT-compatible action-recognition .pkl from UP-Fall keypoints .npz files.
 
 Changes vs. previous version:
@@ -26,6 +26,11 @@ Notes:
 - M is always 1 (single-person).
 - T is always exactly win_len for every sample.
 - label_mode ("majority" or "center") is applied on the frame_labels inside each window slice.
+
+python .\dataset_helpers\prepare_motionbert_dataset.py --label-mode center --win-step 32 --train-subjects 1-12 \
+    --val-subjects 13-15 --data-root ..\..\Datasets\UPFall_keypoints\outputs_npz\ --camera 1 \
+    --out-pkl .\models\MotionBERT\data\action\upfall.pkl \
+    --out-label-map .\models\MotionBERT\data\action\upfall_label_map.json
 """
 
 from __future__ import annotations
