@@ -76,7 +76,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from sklearn.metrics import precision_recall_fscore_support, f1_score, precision_recall_curve, confusion_matrix
+from sklearn.metrics import precision_recall_fscore_support, precision_recall_curve, confusion_matrix
 
 # Same dataset pipeline as training
 from dataset_helpers.dataset import (
@@ -421,6 +421,23 @@ def pick_threshold_fbeta(y_true_bin: np.ndarray, p_fall: np.ndarray, beta: float
     return float(th[best_i]), float(prec[best_i]), float(rec[best_i]), float(fbeta[best_i])
 
 
+def specificity_from_cm(cm: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    One-vs-rest specificity (true negative rate) per class from a multi-class confusion matrix.
+
+    cm shape: (C, C) with rows=true labels, cols=predicted labels.
+    """
+    cm = cm.astype(np.float64)
+
+    total = float(np.sum(cm))
+    tp = np.diag(cm)
+    fp = cm.sum(axis=0) - tp
+    fn = cm.sum(axis=1) - tp
+    tn = total - tp - fp - fn
+
+    return tn / (tn + fp + eps)
+
+
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -480,7 +497,14 @@ def make_plots(summary_df: pd.DataFrame, plots_dir: Path):
     plt.close()
 
 
-def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir: Path, out_path: Path, model_list: List[str]):
+def make_html_report(
+    summary_df: pd.DataFrame,
+    overall_df: pd.DataFrame,
+    f1_long: pd.DataFrame,
+    plots_dir: Path,
+    out_path: Path,
+    model_list: List[str],
+):
     def df_to_html(df: pd.DataFrame) -> str:
         return df.to_html(index=False, escape=False, classes="tbl")
 
@@ -518,6 +542,12 @@ def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir:
 
   <h2>Summary</h2>
   {df_to_html(summary_df)}
+
+  <h2>Overall metrics</h2>
+  <p style="margin:0 0 6px 0;color:#444;font-size:13px;">
+    Values are percentages. Precision/recall/specificity/F1 are macro-averaged over classes present in this split.
+  </p>
+  {df_to_html(overall_df)}
 
   <div class="grid">
     <div>
@@ -738,6 +768,7 @@ def main():
     print("Eval output dir:", out_dir.as_posix())
 
     summary_rows: List[Dict[str, object]] = []
+    overall_rows: List[Dict[str, object]] = []
     f1_rows: List[Dict[str, object]] = []
 
     ckpt_root = Path(args.ckpt_root)
@@ -926,20 +957,55 @@ def main():
         y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
         y_pred = probs_test.argmax(axis=1).astype(int)
 
-        # Confusion matrix (merged 7-class scheme expects 7x7)
-        cm = confusion_matrix(y_true, y_pred, labels=labels_all)
-        cm_csv = out_dir / f"confusion_matrix_{m}.csv"
-        pd.DataFrame(cm, index=NEW_LABEL_NAMES, columns=NEW_LABEL_NAMES).to_csv(cm_csv)
-        make_cm_plot(cm, NEW_LABEL_NAMES, plots_dir / f"confusion_matrix_{m}.png", title=f"Confusion Matrix: {m}")
-
+        # Confusion matrix
         num_classes_eval = int(num_classes if "state_dict" in ckpt else NUM_CLASSES_MERGED)
         labels_all = list(range(num_classes_eval))
-        per_class_f1 = f1_score(y_true, y_pred, labels=labels_all, average=None, zero_division=0)
-        macro_f1 = f1_score(y_true, y_pred, labels=labels_all, average="macro", zero_division=0)
+        cm_counts = confusion_matrix(y_true, y_pred, labels=labels_all).astype(np.float64)
 
-        for lab, f1v in zip(labels_all, per_class_f1):
-            name = NEW_LABEL_NAMES[lab] if ("NEW_LABEL_NAMES" in locals() and 0 <= lab < len(NEW_LABEL_NAMES)) else str(lab)
+        # Normalized confusion matrix for CSV/plot
+        row_sums = cm_counts.sum(axis=1, keepdims=True) + 1e-9
+        cm = cm_counts / row_sums
+
+        if len(NEW_LABEL_NAMES) >= num_classes_eval:
+            cm_names = NEW_LABEL_NAMES[:num_classes_eval]
+        else:
+            cm_names = [str(i) for i in labels_all]
+
+        cm_csv = out_dir / f"confusion_matrix_{m}.csv"
+        pd.DataFrame(cm, index=cm_names, columns=cm_names).to_csv(cm_csv)
+        make_cm_plot(cm, cm_names, plots_dir / f"confusion_matrix_{m}.png", title=f"Confusion Matrix: {m}")
+
+        # Overall multi-class metrics (macro over classes present in this split)
+        eps = 1e-12
+        support = cm_counts.sum(axis=1)
+        valid = support > 0
+
+        tp = np.diag(cm_counts)
+        pred_support = cm_counts.sum(axis=0)
+        recall = tp / (support + eps)
+        precision = tp / (pred_support + eps)
+        f1 = 2.0 * precision * recall / (precision + recall + eps)
+        specificity = specificity_from_cm(cm_counts, eps=eps)
+
+        total = float(np.sum(cm_counts))
+        acc = float(np.sum(tp) / total) if total > 0 else 0.0
+        macro_recall = float(np.mean(recall[valid])) if np.any(valid) else 0.0
+        macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
+        macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
+        macro_f1 = float(np.mean(f1[valid])) if np.any(valid) else 0.0
+
+        for lab, f1v in zip(labels_all, f1):
+            name = cm_names[lab] if 0 <= lab < len(cm_names) else str(lab)
             f1_rows.append({"model": m, "class_id": int(lab), "class_name": name, "f1": float(f1v)})
+
+        overall_rows.append({
+            "model": m,
+            "accuracy": float(acc) * 100.0,
+            "recall": float(macro_recall) * 100.0,
+            "specificity": float(macro_specificity) * 100.0,
+            "precision": float(macro_precision) * 100.0,
+            "f1_score": float(macro_f1) * 100.0,
+        })
 
         y_true_bin = collapse_to_binary(y_true, fall_class_ids_0based)
 
@@ -1062,6 +1128,8 @@ def main():
     summary_df = pd.DataFrame(summary_rows).sort_values("macro_f1", ascending=False).reset_index(drop=True)
     f1_long = pd.DataFrame(f1_rows).sort_values(["model", "class_id"]).reset_index(drop=True)
 
+    overall_df = summary_df[["model"]].merge(pd.DataFrame(overall_rows), on="model", how="left").round(3)
+
     summary_csv = out_dir / "metrics_summary.csv"
     f1_csv = out_dir / "f1_per_class.csv"
     summary_df.to_csv(summary_csv, index=False)
@@ -1069,7 +1137,10 @@ def main():
 
     make_plots(summary_df, plots_dir)
     report_path = out_dir / "report.html"
-    make_html_report(summary_df, f1_long, plots_dir, report_path, model_list)
+    make_html_report(summary_df, overall_df, f1_long, plots_dir, report_path, model_list)
+
+    print("\nOverall metrics (%):")
+    print(overall_df.to_string(index=False))
 
     print(f"Saved: {summary_csv}")
     print(f"Saved: {f1_csv}")

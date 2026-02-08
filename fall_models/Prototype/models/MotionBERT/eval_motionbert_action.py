@@ -406,6 +406,24 @@ def _confusion_metrics_from_cm(cm: np.ndarray, eps: float = 1e-12):
     return balanced_acc, macro_f1, recall, precision, f1
 
 
+def _specificity_from_cm(cm: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    One-vs-rest specificity (true negative rate) per class from a multi-class confusion matrix.
+
+    cm shape: (C, C) with rows=true labels, cols=predicted labels.
+    """
+    cm = cm.astype(np.float64)
+
+    total = float(np.sum(cm))
+    tp = np.diag(cm)
+    fp = cm.sum(axis=0) - tp
+    fn = cm.sum(axis=1) - tp
+    tn = total - tp - fp - fn
+
+    specificity = tn / (tn + fp + eps)
+    return specificity
+
+
 def _one_vs_rest_fbeta_from_cm(cm: np.ndarray, class_idx: int, beta: float = 2.0, eps: float = 1e-12):
     """
     Match train_action_weighted_balanced.py: one-vs-rest precision/recall/F_beta
@@ -549,7 +567,13 @@ def _plot_confusion_matrix(cm: np.ndarray, class_names: List[str], out_path: Pat
 
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111)
-    im = ax.imshow(cm, interpolation="nearest")
+    im = ax.imshow(
+        cm,
+        interpolation="nearest",
+        cmap=plt.cm.Blues,
+        vmin=0.0 if normalize else None,
+        vmax=1.0 if normalize else None,
+    )
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_title("Confusion Matrix" + (" (normalized)" if normalize else ""))
     ax.set_xlabel("Predicted")
@@ -598,6 +622,7 @@ def _df_to_html(df: pd.DataFrame) -> str:
 
 def _make_html_report(
     summary_df: pd.DataFrame,
+    overall_df: pd.DataFrame,
     per_class_df: pd.DataFrame,
     out_dir: Path,
     plots_dir: Path,
@@ -628,6 +653,12 @@ def _make_html_report(
 
   <h2>Summary</h2>
   {_df_to_html(summary_df)}
+
+  <h2>Overall metrics</h2>
+  <p style="margin:0 0 6px 0;color:#444;font-size:13px;">
+    Values are percentages. Precision/recall/specificity/F1 are macro-averaged over classes present in this split.
+  </p>
+  {_df_to_html(overall_df)}
 
   <div class="grid">
     <div>
@@ -933,8 +964,24 @@ def main() -> None:
 
     balanced_acc, macro_f1, recall, precision, f1 = _confusion_metrics_from_cm(cm)
     support = cm.sum(axis=1).astype(np.int64, copy=False)
+    valid = support > 0
     support_sum = float(np.sum(support))
     weighted_f1 = float(np.sum(f1 * support) / support_sum) if support_sum > 0 else 0.0
+
+    macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
+    specificity = _specificity_from_cm(cm)
+    macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
+
+    overall_df = (
+        pd.DataFrame([{
+            "accuracy": float(top1),
+            "recall": float(balanced_acc) * 100.0,
+            "specificity": float(macro_specificity) * 100.0,
+            "precision": float(macro_precision) * 100.0,
+            "f1_score": float(macro_f1) * 100.0,
+        }])
+        .round(3)
+    )
 
     fall_fbeta, fall_prec, fall_rec = _one_vs_rest_fbeta_from_cm(cm, fall_class_idx, beta=ckpt_beta_f)
 
@@ -970,6 +1017,8 @@ def main() -> None:
         f"ckptScore={metrics.ckpt_score:.3f}",
         flush=True,
     )
+    print("\nOverall metrics (%):", flush=True)
+    print(overall_df.to_string(index=False), flush=True)
 
     labels = list(range(action_classes))
     per_class_df = pd.DataFrame({
@@ -1026,12 +1075,25 @@ def main() -> None:
     per_class_df.to_csv(per_class_csv, index=False)
 
     # Plots
-    _plot_confusion_matrix(cm, class_names=[class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels], out_path=plots_dir / "confusion_matrix.png", normalize=False)
+    _plot_confusion_matrix(
+        cm,
+        class_names=[class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels],
+        out_path=plots_dir / "confusion_matrix.png",
+        normalize=True,
+    )
     _plot_f1_bar(per_class_df, out_path=plots_dir / "f1_per_class.png")
 
     # Report
     report_path = out_dir / "report.html"
-    _make_html_report(summary_df, per_class_df, out_dir=out_dir, plots_dir=plots_dir, out_path=report_path, extra_html=extra_html)
+    _make_html_report(
+        summary_df,
+        overall_df,
+        per_class_df,
+        out_dir=out_dir,
+        plots_dir=plots_dir,
+        out_path=report_path,
+        extra_html=extra_html,
+    )
 
     # Print final summary line (matches MotionBERT validate output style)
     print(
