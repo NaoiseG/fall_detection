@@ -100,6 +100,7 @@ from .stgcn.simple_stgcn import STGCNBaseline
 
 # NEW: CNN + LSTM two-head model
 from .cnnlstm.cnn_lstm import CNNLSTMTwoHead
+from .rf.train_rf import windows_to_sklearn_features
 
 
 import inspect
@@ -394,6 +395,61 @@ def predict_probs(model: torch.nn.Module, loader: DataLoader, device: str) -> Tu
     return y_true_np, probs_np, None
 
 
+def pickle_load_safe(path: Path):
+    try:
+        with path.open("rb") as f:
+            return pickle.load(f)
+    except ModuleNotFoundError as e:
+        raise SystemExit(
+            "Failed to load pickle checkpoint. If this is an RF model, you likely need scikit-learn installed.\n"
+            "Install it with: pip install scikit-learn\n"
+            f"Import error: {e}"
+        )
+
+
+def rf_predict_probs(
+    clf,
+    X_windows: np.ndarray,
+    feature_mode: str,
+    num_classes: int,
+    expected_feature_dim: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Returns:
+      probs: (N,C) aligned to class ids 0..C-1
+    """
+    X_feat = windows_to_sklearn_features(X_windows, mode=str(feature_mode))
+    if expected_feature_dim is not None and int(expected_feature_dim) > 0 and int(X_feat.shape[1]) != int(expected_feature_dim):
+        raise ValueError(
+            f"RF feature_dim mismatch: extracted={int(X_feat.shape[1])}, ckpt feature_dim={int(expected_feature_dim)} "
+            f"(mode={str(feature_mode)})"
+        )
+
+    if not hasattr(clf, "predict_proba"):
+        raise TypeError("RF checkpoint model does not implement predict_proba().")
+
+    raw = clf.predict_proba(X_feat)
+    raw = np.asarray(raw)
+    if raw.ndim != 2:
+        raise ValueError(f"Expected predict_proba output (N,C). Got shape {getattr(raw, 'shape', None)}")
+
+    num_classes = int(num_classes)
+    out = np.zeros((int(raw.shape[0]), int(num_classes)), dtype=np.float32)
+
+    classes = getattr(clf, "classes_", None)
+    if classes is None:
+        if int(raw.shape[1]) != int(num_classes):
+            raise ValueError(f"RF predict_proba returned C={int(raw.shape[1])}, expected num_classes={int(num_classes)}")
+        return raw.astype(np.float32, copy=False)
+
+    classes_np = np.asarray(classes).astype(np.int64, copy=False).reshape(-1)
+    for j, cls_id in enumerate(classes_np.tolist()):
+        if 0 <= int(cls_id) < int(num_classes) and j < int(raw.shape[1]):
+            out[:, int(cls_id)] = raw[:, int(j)]
+
+    return out
+
+
 def collapse_to_binary(y: np.ndarray, fall_class_ids_0based: List[int]) -> np.ndarray:
     fall = set(int(x) for x in fall_class_ids_0based)
     return np.array([1 if int(v) in fall else 0 for v in y], dtype=int)
@@ -580,7 +636,7 @@ def make_html_report(
 
 def main():
     # NEW: added "cnnlstm"
-    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm"]
+    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm", "rf"]
 
     parser = argparse.ArgumentParser(description="Evaluate trained models on UP-Fall windowed pose tensors.")
     parser.add_argument("--models", nargs="+", default=None, help="Models to evaluate, e.g. --models tcn lstm")
@@ -602,7 +658,7 @@ def main():
         "--weights-name",
         type=str,
         default=None,
-        help="Override weights filename. If omitted uses '<model>_best.pt'.",
+        help="Override weights filename. If omitted uses '<model>_best.pt' (or '<model>_best.pkl' for rf).",
     )
     parser.add_argument("--out-dir", type=str, default="eval_outputs", help="Output directory")
     parser.add_argument("--use-conf", action="store_true", help="Use confidence channel (x,y,conf).")
@@ -775,7 +831,11 @@ def main():
     ckpt_overrides = parse_ckpt_overrides(args.ckpt)
 
     for m in model_list:
-        weights_name = args.weights_name or f"{m}_best.pt"
+        is_rf = str(m).lower().strip() == "rf"
+        if args.weights_name:
+            weights_name = str(args.weights_name)
+        else:
+            weights_name = f"{m}_best.pkl" if is_rf else f"{m}_best.pt"
 
         model_dir = ckpt_root / m
         run_dir = resolve_run_dir(model_dir, ckpt_overrides.get(m))
@@ -785,9 +845,55 @@ def main():
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Weights not found for {m}: {ckpt_path.as_posix()}")
 
-        ckpt = torch_load_safe(ckpt_path, map_location="cpu")
+        rf_model = None
+        rf_feature_mode = "flatten"
+        rf_feature_dim = None
+        model_params_m = float("nan")
 
-        if "state_dict" in ckpt:
+        if is_rf:
+            ckpt = pickle_load_safe(ckpt_path)
+        else:
+            ckpt = torch_load_safe(ckpt_path, map_location="cpu")
+
+        if is_rf:
+            if not isinstance(ckpt, dict) or "model" not in ckpt:
+                raise TypeError(f"[rf] Unsupported checkpoint format: expected dict with key 'model' at {ckpt_path.as_posix()}")
+
+            rf_model = ckpt.get("model", None)
+            rf_feature_mode = str(ckpt.get("feature_mode", "flatten"))
+            rf_feature_dim = ckpt.get("feature_dim", None)
+
+            state = None
+            T_used = None
+            in_features = None
+            num_classes = int(ckpt.get("num_classes", NUM_CLASSES_MERGED))
+            use_conf_ckpt = bool(ckpt.get("use_conf", True))
+
+            normalize_ckpt = bool(ckpt.get("normalize", normalize_cli))
+            normalize_mode_ckpt = str(ckpt.get("normalize_mode", args.normalize_mode))
+            add_vel_ckpt = bool(ckpt.get("add_vel", add_vel_cli))
+            add_acc_ckpt = bool(ckpt.get("add_acc", add_acc_cli))
+            add_global_ckpt = bool(ckpt.get("add_global", add_global_cli))
+            conf_thres_ckpt = float(ckpt.get("conf_thres", args.conf_thres))
+            max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
+            missing_mode_ckpt = str(ckpt.get("missing_mode", args.missing_mode))
+            interp_mode_ckpt = str(ckpt.get("interp_mode", args.interp_mode))
+            interp_group_ckpt = int(ckpt.get("interp_group", args.interp_group))
+            rp_center_mode_ckpt = str(ckpt.get("rp_center_mode", args.rp_center_mode))
+            rp_img_w_ckpt = ckpt.get("rp_img_w", args.rp_img_w)
+            rp_img_h_ckpt = ckpt.get("rp_img_h", args.rp_img_h)
+            T_ckpt = int(ckpt.get("T", ckpt.get("T_used", args.T)))
+            stride_ckpt = int(ckpt.get("stride", args.stride))
+
+            fall_pct_ckpt = float(ckpt.get("fall_pct", args.fall_pct))
+            label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
+            min_valid_frac_ckpt = float(ckpt.get("min_valid_frac", args.min_valid_frac))
+            add_mask_channel_ckpt = bool(ckpt.get("add_mask_channel", add_mask_channel_cli))
+            drop_ambig_share_ckpt = float(ckpt.get("drop_ambig_share", args.drop_ambig_share))
+            drop_ambig_nonfall_only_ckpt = bool(ckpt.get("drop_ambig_nonfall_only", bool(args.drop_ambig_nonfall_only)))
+            node_features_ckpt = None
+
+        elif "state_dict" in ckpt:
             state = ckpt["state_dict"]
             T_used = int(ckpt["T_used"])
             in_features = int(ckpt["in_features"])
@@ -856,109 +962,95 @@ def main():
             extra["fall_pct"] = fall_pct_ckpt
 
         # Load windows using ckpt settings
-        if T_used is None:
-            X_test, y_test_tags, _T_used = load_windows_from_npzs(
-                test_npzs,
-                T=T_ckpt,
-                use_conf=use_conf_ckpt,
-                normalize=normalize_ckpt,
-                normalize_mode=normalize_mode_ckpt,
-                add_vel=add_vel_ckpt,
-                add_acc=add_acc_ckpt,
-                add_global=add_global_ckpt,
-                conf_thres=conf_thres_ckpt,
-                max_interp_gap=max_interp_gap_ckpt,
-                missing_mode=missing_mode_ckpt,
-                interp_mode=interp_mode_ckpt,
-                interp_group=interp_group_ckpt,
-                stride=stride_ckpt,
-                label_mode=label_mode_ckpt,
-                min_valid_frac=min_valid_frac_ckpt,
-                add_mask_channel=add_mask_channel_ckpt,
-                drop_ambig_share=drop_ambig_share_ckpt,
-                drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
-                rp_center_mode=rp_center_mode_ckpt,
-                rp_img_w=rp_img_w_ckpt,
-                rp_img_h=rp_img_h_ckpt,
-                **extra,
-                label_convention=label_convention,
-            )
-            T_used = int(_T_used)
-        else:
-            X_test, y_test_tags, _T_used = load_windows_from_npzs(
-                test_npzs,
-                T=T_ckpt,
-                use_conf=use_conf_ckpt,
-                normalize=normalize_ckpt,
-                normalize_mode=normalize_mode_ckpt,
-                add_vel=add_vel_ckpt,
-                add_acc=add_acc_ckpt,
-                add_global=add_global_ckpt,
-                conf_thres=conf_thres_ckpt,
-                max_interp_gap=max_interp_gap_ckpt,
-                missing_mode=missing_mode_ckpt,
-                interp_mode=interp_mode_ckpt,
-                interp_group=interp_group_ckpt,
-                stride=stride_ckpt,
-                label_mode=label_mode_ckpt,
-                min_valid_frac=min_valid_frac_ckpt,
-                add_mask_channel=add_mask_channel_ckpt,
-                drop_ambig_share=drop_ambig_share_ckpt,
-                drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
-                rp_center_mode=rp_center_mode_ckpt,
-                rp_img_w=rp_img_w_ckpt,
-                rp_img_h=rp_img_h_ckpt,
-                **extra,
-                label_convention=label_convention,
-            )
-            T_used = int(_T_used)
+        X_test, y_test_tags, _T_used = load_windows_from_npzs(
+            test_npzs,
+            T=T_ckpt,
+            use_conf=use_conf_ckpt,
+            normalize=normalize_ckpt,
+            normalize_mode=normalize_mode_ckpt,
+            add_vel=add_vel_ckpt,
+            add_acc=add_acc_ckpt,
+            add_global=add_global_ckpt,
+            conf_thres=conf_thres_ckpt,
+            max_interp_gap=max_interp_gap_ckpt,
+            missing_mode=missing_mode_ckpt,
+            interp_mode=interp_mode_ckpt,
+            interp_group=interp_group_ckpt,
+            stride=stride_ckpt,
+            label_mode=label_mode_ckpt,
+            min_valid_frac=min_valid_frac_ckpt,
+            add_mask_channel=add_mask_channel_ckpt,
+            drop_ambig_share=drop_ambig_share_ckpt,
+            drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+            rp_center_mode=rp_center_mode_ckpt,
+            rp_img_w=rp_img_w_ckpt,
+            rp_img_h=rp_img_h_ckpt,
+            **extra,
+            label_convention=label_convention,
+        )
+        T_used = int(_T_used)
 
         print("Window length (T):", T_used)
 
         y_test = y_test_tags.astype(np.int64, copy=False)
 
-        # Finalise dims for no-metadata checkpoints
-        if "state_dict" not in ckpt:
-            num_classes = int(y_test.max() + 1)
+        if is_rf:
+            num_classes_eval = int(NUM_CLASSES_MERGED)
+            probs_test = rf_predict_probs(
+                rf_model,
+                X_windows=X_test,
+                feature_mode=rf_feature_mode,
+                num_classes=num_classes_eval,
+                expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
+            )
+            y_true = y_test
+            fall_prob_test = None
+            y_pred = probs_test.argmax(axis=1).astype(int)
+        else:
+            # Finalise dims for no-metadata checkpoints
+            if "state_dict" not in ckpt:
+                num_classes = int(y_test.max() + 1)
 
-        test_ds = WindowTensorDataset(X_test, y_test)
+            test_ds = WindowTensorDataset(X_test, y_test)
 
-        sample_X0, _ = test_ds[0]
-        in_features_now = int(sample_X0.shape[-1])
-        if node_features_ckpt is None and (in_features_now % 17 == 0):
-            node_features_ckpt = in_features_now // 17
+            sample_X0, _ = test_ds[0]
+            in_features_now = int(sample_X0.shape[-1])
+            if node_features_ckpt is None and (in_features_now % 17 == 0):
+                node_features_ckpt = in_features_now // 17
 
-        if "state_dict" in ckpt and in_features_now != in_features:
-            raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
+            if "state_dict" in ckpt and in_features_now != in_features:
+                raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
 
-        in_features_final = in_features if "state_dict" in ckpt else in_features_now
+            in_features_final = in_features if "state_dict" in ckpt else in_features_now
 
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
+            test_loader = DataLoader(
+                test_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                drop_last=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+            )
 
-        model = get_model(
-            m,
-            in_features=in_features_final,
-            num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
-            device=args.device,
-            T_used=T_used,
-            node_features=node_features_ckpt,
-        )
+            model = get_model(
+                m,
+                in_features=in_features_final,
+                num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
+                device=args.device,
+                T_used=T_used,
+                node_features=node_features_ckpt,
+            )
 
-        model.load_state_dict(state, strict=False)
+            model.load_state_dict(state, strict=False)
+            model_params_m = float(count_params_m(model))
 
-        # Multi-class predictions + optional fall head probability
-        y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
-        y_pred = probs_test.argmax(axis=1).astype(int)
+            # Multi-class predictions + optional fall head probability
+            y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
+            y_pred = probs_test.argmax(axis=1).astype(int)
 
         # Confusion matrix
-        num_classes_eval = int(num_classes if "state_dict" in ckpt else NUM_CLASSES_MERGED)
+        if not is_rf:
+            num_classes_eval = int(num_classes if "state_dict" in ckpt else NUM_CLASSES_MERGED)
         labels_all = list(range(num_classes_eval))
         cm_counts = confusion_matrix(y_true, y_pred, labels=labels_all).astype(np.float64)
 
@@ -1015,7 +1107,7 @@ def main():
             p_fall_source = "fall_head"
         else:
             p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based).astype(np.float32)
-            p_fall_source = "activity_softmax"
+            p_fall_source = "rf_predict_proba" if is_rf else "activity_softmax"
 
         tuned_thr = None
         tuned_prec = None
@@ -1063,17 +1155,28 @@ def main():
                 )
 
                 y_tune = y_tune_tags.astype(np.int64, copy=False)
-                tune_ds = WindowTensorDataset(X_tune, y_tune)
-                tune_loader = DataLoader(
-                    tune_ds,
-                    batch_size=args.batch_size,
-                    shuffle=False,
-                    drop_last=False,
-                    num_workers=args.num_workers,
-                    pin_memory=True,
-                )
+                if is_rf:
+                    y_tune_true = y_tune
+                    probs_tune = rf_predict_probs(
+                        rf_model,
+                        X_windows=X_tune,
+                        feature_mode=rf_feature_mode,
+                        num_classes=num_classes_eval,
+                        expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
+                    )
+                    fall_prob_tune = None
+                else:
+                    tune_ds = WindowTensorDataset(X_tune, y_tune)
+                    tune_loader = DataLoader(
+                        tune_ds,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        drop_last=False,
+                        num_workers=args.num_workers,
+                        pin_memory=True,
+                    )
 
-                y_tune_true, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
+                    y_tune_true, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
                 y_tune_bin = collapse_to_binary(y_tune_true, fall_class_ids_0based)
 
                 if fall_prob_tune is not None:
@@ -1100,7 +1203,7 @@ def main():
         summary_rows.append({
             "model": m,
             "n_samples": int(len(y_true)),
-            "params_m": float(count_params_m(model)),
+            "params_m": float(model_params_m),
             "macro_f1": float(macro_f1),
             "binary_mode": str(args.binary_mode).lower(),
             "p_fall_source": p_fall_source,  # NEW: records which score was used

@@ -19,6 +19,7 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import pickle
 
 import cv2
 import numpy as np
@@ -47,6 +48,8 @@ try:
 except Exception:
     CNNLSTMTwoHead = None
 
+from models.rf.train_rf import windows_to_sklearn_features
+
 
 K = 17  # COCO-17 joints for Ultralytics pose models
 
@@ -60,7 +63,7 @@ SKELETON = [
     (5, 11), (6, 12),
 ]
 
-KNOWN_ARCHES = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm"]
+KNOWN_ARCHES = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm", "rf"]
 
 # Updated fall-merged label names (7 classes)
 # 0: Fall (all fall subclasses merged)
@@ -92,6 +95,11 @@ def infer_arch_from_path(p: Path) -> Optional[str]:
             return arch
         if any(tok.startswith(arch + "_") for tok in tokens):
             return arch
+        if arch == "rf":
+            # Avoid substring matches like "pe[r f]ormance" -> "rf".
+            if any(tok.startswith("rf") for tok in tokens):
+                return arch
+            continue
         if any(arch in tok for tok in tokens):
             return arch
     return None
@@ -100,9 +108,9 @@ def infer_arch_from_path(p: Path) -> Optional[str]:
 def resolve_ckpt_and_arch(model_arg: str, arch_arg: Optional[str]) -> Tuple[Path, str]:
     """
     --model can be:
-      - a checkpoint file (*.pt)
-      - a model folder containing checkpoints (picks newest *best*.pt)
-      - a model python file under models/<arch>/...py (picks newest *best*.pt under that folder)
+      - a checkpoint file (*.pt or *.pkl)
+      - a model folder containing checkpoints (picks newest *best*.pt / *best*.pkl)
+      - a model python file under models/<arch>/...py (picks newest *best*.pt / *best*.pkl under that folder)
     """
     p = Path(model_arg).expanduser()
     if not p.exists():
@@ -111,37 +119,66 @@ def resolve_ckpt_and_arch(model_arg: str, arch_arg: Optional[str]) -> Tuple[Path
     arch = (arch_arg or "").lower().strip() or infer_arch_from_path(p)
 
     if p.is_file():
-        if p.suffix.lower() in {".pt", ".pth", ".bin"}:
+        suf = p.suffix.lower()
+        if suf in {".pt", ".pth", ".bin"}:
             if not arch:
                 arch = infer_arch_from_path(p)
             if not arch:
                 raise ValueError("Could not infer --arch from checkpoint path. Pass --arch explicitly.")
+            if arch == "rf":
+                raise ValueError(
+                    "Inferred/selected --arch rf for a .pt checkpoint. RF checkpoints are expected to be .pkl/.pickle.\n"
+                    "Pass the correct --arch (tcn/lstm/...) or provide an RF .pkl checkpoint."
+                )
             return p, arch
 
-        if p.suffix.lower() == ".py":
+        if suf in {".pkl", ".pickle"}:
+            if not arch:
+                arch = infer_arch_from_path(p) or "rf"
+            return p, arch
+
+        if suf == ".py":
             if not arch:
                 raise ValueError("Could not infer --arch from model .py path. Pass --arch explicitly.")
             model_dir = p.parent
-            ckpts = sorted(model_dir.glob("**/*best*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
-            if not ckpts:
-                ckpts = sorted(model_dir.glob("**/*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
+            if arch == "rf":
+                ckpts = sorted(model_dir.glob("**/*best*.pkl"), key=lambda x: x.stat().st_mtime, reverse=True)
+                if not ckpts:
+                    ckpts = sorted(model_dir.glob("**/*.pkl"), key=lambda x: x.stat().st_mtime, reverse=True)
+            else:
+                ckpts = sorted(model_dir.glob("**/*best*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
+                if not ckpts:
+                    ckpts = sorted(model_dir.glob("**/*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
             if not ckpts:
                 raise FileNotFoundError(f"No checkpoints found under: {model_dir}")
             return ckpts[0], arch
 
         raise ValueError(f"Unsupported --model file type: {p.suffix}")
 
-    ckpts = sorted(p.glob("**/*best*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
+    if arch == "rf":
+        ckpts = sorted(p.glob("**/*best*.pkl"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if not ckpts:
+            ckpts = sorted(p.glob("**/*.pkl"), key=lambda x: x.stat().st_mtime, reverse=True)
+    else:
+        ckpts = sorted(p.glob("**/*best*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if not ckpts:
+            # Allow pointing to a folder containing an RF run folder without passing --arch rf.
+            ckpts = sorted(p.glob("**/*best*.pkl"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if not ckpts:
+            ckpts = sorted(p.glob("**/*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if not ckpts:
+            ckpts = sorted(p.glob("**/*.pkl"), key=lambda x: x.stat().st_mtime, reverse=True)
     if not ckpts:
-        ckpts = sorted(p.glob("**/*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoint *.pt files found under: {p}")
+        raise FileNotFoundError(f"No checkpoint *.pt/*.pkl files found under: {p}")
 
     ckpt = ckpts[0]
     if not arch:
         arch = infer_arch_from_path(ckpt)
     if not arch:
-        raise ValueError("Could not infer --arch from checkpoint path. Pass --arch explicitly.")
+        if ckpt.suffix.lower() in {".pkl", ".pickle"}:
+            arch = "rf"
+        else:
+            raise ValueError("Could not infer --arch from checkpoint path. Pass --arch explicitly.")
     return ckpt, arch
 
 
@@ -165,6 +202,25 @@ def clean_state_dict(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     if any(k.startswith("module.") for k in keys):
         return {k.replace("module.", "", 1): v for k, v in state.items()}
     return state
+
+
+def load_rf_checkpoint(ckpt_path: Path) -> Dict[str, object]:
+    """
+    Loads a Random Forest checkpoint saved by `models/rf/train_rf.py`.
+    """
+    try:
+        with Path(ckpt_path).open("rb") as f:
+            obj = pickle.load(f)
+    except ModuleNotFoundError as e:
+        raise SystemExit(
+            "Failed to load RF checkpoint. You likely need scikit-learn installed.\n"
+            "Install it with: pip install scikit-learn\n"
+            f"Import error: {e}"
+        )
+
+    if not isinstance(obj, dict) or "model" not in obj:
+        raise TypeError(f"Unsupported RF checkpoint format: expected a dict with key 'model'. Got: {type(obj)}")
+    return obj
 
 
 def load_class_names(num_classes: int, meta: Dict[str, object], labels_file: Optional[str]) -> List[str]:
@@ -590,10 +646,56 @@ def infer_one_window(
     return int(pred.item()), float(pconf.item()), p_fall
 
 
+def _rf_predict_proba_aligned(clf, X_feat: np.ndarray, num_classes: int) -> np.ndarray:
+    if not hasattr(clf, "predict_proba"):
+        raise TypeError("RF checkpoint model does not implement predict_proba().")
+    raw = clf.predict_proba(X_feat)
+    raw = np.asarray(raw)
+    if raw.ndim != 2:
+        raise ValueError(f"Expected RF predict_proba output (N,C). Got shape {getattr(raw, 'shape', None)}")
+
+    num_classes = int(num_classes)
+    out = np.zeros((int(raw.shape[0]), int(num_classes)), dtype=np.float32)
+
+    classes = getattr(clf, "classes_", None)
+    if classes is None:
+        if int(raw.shape[1]) != int(num_classes):
+            raise ValueError(f"RF predict_proba returned C={int(raw.shape[1])}, expected num_classes={int(num_classes)}")
+        return raw.astype(np.float32, copy=False)
+
+    classes_np = np.asarray(classes).astype(np.int64, copy=False).reshape(-1)
+    for j, cls_id in enumerate(classes_np.tolist()):
+        if 0 <= int(cls_id) < int(num_classes) and j < int(raw.shape[1]):
+            out[:, int(cls_id)] = raw[:, int(j)]
+
+    return out
+
+
+def infer_one_window_rf(
+    clf,
+    window_feat: np.ndarray,  # (T,F)
+    feature_mode: str,
+    num_classes: int,
+    expected_feature_dim: Optional[int] = None,
+) -> Tuple[int, float, Optional[float]]:
+    X_feat = windows_to_sklearn_features(window_feat[None, ...], mode=str(feature_mode))
+    if expected_feature_dim is not None and int(expected_feature_dim) > 0 and int(X_feat.shape[1]) != int(expected_feature_dim):
+        raise ValueError(
+            f"RF feature_dim mismatch: extracted={int(X_feat.shape[1])}, ckpt feature_dim={int(expected_feature_dim)} "
+            f"(mode={str(feature_mode)})"
+        )
+
+    probs = _rf_predict_proba_aligned(clf, X_feat, num_classes=int(num_classes))[0]
+    pred = int(np.argmax(probs))
+    pconf = float(probs[pred]) if probs.size > 0 else 0.0
+    p_fall = float(probs[0]) if probs.size > 0 else None
+    return pred, pconf, p_fall
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Stream windowed pose inference on an MP4 with YOLO pose overlay.")
     ap.add_argument("--video", type=str, required=True, help="Path to input .mp4")
-    ap.add_argument("--model", type=str, required=True, help="Checkpoint *.pt OR model folder OR model .py")
+    ap.add_argument("--model", type=str, required=True, help="Checkpoint *.pt/*.pkl OR model folder OR model .py")
     ap.add_argument("--arch", type=str, default=None, choices=KNOWN_ARCHES, help="Override model architecture if needed")
     ap.add_argument("--yolo-weights", type=str, default="yolo11l-pose.pt")
     ap.add_argument("--imgsz", type=int, default=640)
@@ -669,8 +771,20 @@ def main() -> int:
     ckpt_path, arch = resolve_ckpt_and_arch(args.model, args.arch)
     print(f"[model] arch={arch} ckpt={ckpt_path.as_posix()}")
 
-    state, meta = load_checkpoint(ckpt_path)
-    state = clean_state_dict(state)
+    is_rf = str(arch).lower().strip() == "rf" or ckpt_path.suffix.lower() in {".pkl", ".pickle"}
+    rf_model = None
+    rf_feature_mode = "flatten"
+    rf_feature_dim = None
+
+    if is_rf:
+        meta = load_rf_checkpoint(ckpt_path)
+        rf_model = meta.get("model", None)
+        rf_feature_mode = str(meta.get("feature_mode", "flatten"))
+        rf_feature_dim = meta.get("feature_dim", None)
+        state = None
+    else:
+        state, meta = load_checkpoint(ckpt_path)
+        state = clean_state_dict(state)
 
     # Preproc config (prefer checkpoint meta)
     T_final = int(args.T) if int(args.T) > 0 else int(meta.get("T", meta.get("T_used", 64)) or 64)
@@ -706,7 +820,14 @@ def main() -> int:
     num_classes = int(meta.get("num_classes", 0) or 0)
     in_features_meta = int(meta.get("in_features", 0) or 0)
     if num_classes <= 0:
-        raise ValueError("Checkpoint missing num_classes. Use a checkpoint from training/train_models.py.")
+        if is_rf:
+            nln = meta.get("new_label_names", None)
+            if isinstance(nln, (list, tuple)):
+                num_classes = int(len(nln))
+            if int(num_classes) <= 0:
+                num_classes = 7
+        else:
+            raise ValueError("Checkpoint missing num_classes. Use a checkpoint from training/train_models.py.")
 
     merge_fall_11_to_7 = int(num_classes) == 11
     display_num_classes = 7 if merge_fall_11_to_7 else int(num_classes)
@@ -722,25 +843,29 @@ def main() -> int:
     if in_features_meta > 0 and int(in_features) != int(in_features_meta):
         raise ValueError(f"Feature mismatch: expected in_features={in_features}, ckpt expects {in_features_meta}")
 
-    node_features_meta = meta.get("node_features", None)
-    if node_features_meta is None:
-        nf = int(in_features // K)
-        node_features_meta = nf if nf * K == int(in_features) else None
+    if is_rf:
+        if rf_model is None:
+            raise ValueError("RF checkpoint missing 'model'.")
+    else:
+        node_features_meta = meta.get("node_features", None)
+        if node_features_meta is None:
+            nf = int(in_features // K)
+            node_features_meta = nf if nf * K == int(in_features) else None
 
-    model = build_temporal_model(
-        arch=arch,
-        in_features=int(in_features),
-        num_classes=int(num_classes),
-        device=device,
-        T_used=int(T_final),
-        node_features=int(node_features_meta) if node_features_meta is not None else None,
-    )
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print("[WARN] missing keys:", missing[:8], "..." if len(missing) > 8 else "")
-    if unexpected:
-        print("[WARN] unexpected keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
-    model.eval()
+        model = build_temporal_model(
+            arch=arch,
+            in_features=int(in_features),
+            num_classes=int(num_classes),
+            device=device,
+            T_used=int(T_final),
+            node_features=int(node_features_meta) if node_features_meta is not None else None,
+        )
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print("[WARN] missing keys:", missing[:8], "..." if len(missing) > 8 else "")
+        if unexpected:
+            print("[WARN] unexpected keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
+        model.eval()
 
     pose_model = YOLO(str(Path(args.yolo_weights).expanduser()))
 
@@ -843,13 +968,22 @@ def main() -> int:
                 rp_img_h=rp_img_h,
                 min_valid_frac=min_valid_frac,
             )
-            pred, pconf, p_fall = infer_one_window(
-                model=model,
-                window_feat=window_feat,
-                device=device,
-                use_half=use_half,
-                merge_fall_11_to_7=merge_fall_11_to_7,
-            )
+            if is_rf:
+                pred, pconf, p_fall = infer_one_window_rf(
+                    clf=rf_model,
+                    window_feat=window_feat,
+                    feature_mode=rf_feature_mode,
+                    num_classes=display_num_classes,
+                    expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
+                )
+            else:
+                pred, pconf, p_fall = infer_one_window(
+                    model=model,
+                    window_feat=window_feat,
+                    device=device,
+                    use_half=use_half,
+                    merge_fall_11_to_7=merge_fall_11_to_7,
+                )
             window_preds[start] = (pred, pconf, p_fall)
             return window_preds[start]
 

@@ -55,6 +55,7 @@ from models.gcn.simple_gcn import GCNBaseline
 from models.mlp.simple_mlp import MLPBaseline
 from models.stgcn.simple_stgcn import STGCNBaseline
 from models.cnnlstm.cnn_lstm import CNNLSTMTwoHead
+from models.rf.train_rf import train_random_forest_once
 
 
 # =============================================================================
@@ -862,7 +863,7 @@ if __name__ == "__main__":
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")  # e.g. 2026-01-19_14-03-22_123456
     print("Run ID:", run_id)
 
-    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm"]
+    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm", "rf"]
 
     parser = argparse.ArgumentParser(description="Train one or more models on UP-Fall windowed pose tensors.")
     parser.add_argument(
@@ -1006,7 +1007,91 @@ if __name__ == "__main__":
         default=2.0,
         help="β for Fβ(fall) in the composite selection metric (β>1 emphasizes recall). Must be >0 (default: 2.0).",
     )
+    # Random Forest baseline (sklearn)
+        # Random Forest baseline (sklearn)
+    parser.add_argument(
+        "--rf-feature-mode",
+        type=str,
+        default="flatten",
+        choices=["flatten", "center", "stats", "paper_windowing"],
+        help=(
+            "Feature extraction for RF: "
+            "flatten (T*F), center (F), stats (mean/std/min/max over time), "
+            "paper_windowing (sample S evenly spaced skeletons, keep 51 pose feats each => S*51)."
+        ),
+    )
+    parser.add_argument(
+        "--rf-paper-num-skeletons",
+        type=int,
+        default=3,
+        help="Only for --rf-feature-mode paper_windowing: number of skeletons (frames) sampled evenly per window (default: 3 => first/middle/last).",
+    )
+    parser.add_argument(
+        "--rf-paper-num-features",
+        type=int,
+        default=51,
+        help="Only for --rf-feature-mode paper_windowing: number of pose features per skeleton (default: 51 = 17*(x,y,conf)).",
+    )
+    parser.add_argument(
+        "--rf-paper-defaults",
+        type=int,
+        default=0,
+        help=(
+            "If 1, apply the Sensors 2022 UP-Fall windowed-RF best-candidate defaults: "
+            "T=36, stride=1, label-mode=majority, use-conf=1, normalize=0, add-vel/acc/global/mask=0, "
+            "drop-ambig-share=0, rf-feature-mode=paper_windowing, rf-paper-num-skeletons=3, rf-paper-num-features=51."
+        ),
+    )
+    parser.add_argument("--rf-n-estimators", type=int, default=300, help="Number of trees for RandomForestClassifier.")
+    parser.add_argument("--rf-max-depth", type=int, default=0, help="Max tree depth (0 = unlimited).")
+    parser.add_argument(
+        "--rf-max-features",
+        type=str,
+        default="sqrt",
+        choices=["sqrt", "log2"],
+        help="max_features for RandomForestClassifier (default: sqrt).",
+    )
+    parser.add_argument("--rf-min-samples-split", type=int, default=2, help="min_samples_split for RandomForestClassifier.")
+    parser.add_argument("--rf-min-samples-leaf", type=int, default=1, help="min_samples_leaf for RandomForestClassifier.")
+    parser.add_argument("--rf-bootstrap", type=int, default=1, help="Use bootstrap samples for each tree (0/1).")
+    parser.add_argument(
+        "--rf-criterion",
+        type=str,
+        default="gini",
+        choices=["gini", "entropy", "log_loss"],
+        help="Split criterion for RandomForestClassifier.",
+    )
+    parser.add_argument(
+        "--rf-class-weight",
+        type=str,
+        default="balanced_subsample",
+        choices=["none", "balanced", "balanced_subsample"],
+        help="Class weighting for RandomForestClassifier (default: balanced_subsample).",
+    )
+    parser.add_argument("--rf-n-jobs", type=int, default=-1, help="Number of parallel jobs for RF (-1 = all cores).")
+    parser.add_argument("--rf-random-state", type=int, default=42, help="Random seed for RF.")
+    parser.add_argument(
+        "--rf-use-sample-weights",
+        type=int,
+        default=0,
+        help="If 1, pass the same per-class weights used for CE as sample_weight to RF fit() (0/1).",
+    )
     args = parser.parse_args()
+
+    if int(getattr(args, "rf_paper_defaults", 0)) == 1:
+        args.T = 36
+        args.stride = 1
+        args.label_mode = "majority"
+        args.use_conf = 1
+        args.normalize = 0
+        args.add_vel = 0
+        args.add_acc = 0
+        args.add_global = 0
+        args.add_mask_channel = 0
+        args.drop_ambig_share = 0.0
+        args.rf_feature_mode = "paper_windowing"
+        args.rf_paper_num_skeletons = 3
+        args.rf_paper_num_features = 51
 
     if not math.isfinite(float(args.selection_w)):
         raise SystemExit("--selection-w must be a finite float.")
@@ -1238,42 +1323,94 @@ if __name__ == "__main__":
 
     results: List[RunResult] = []
     for m in model_list:
-        res = train_model_once(
-            model_name=m,
-            cfg=cfg,
-            in_features=in_features,
-            num_classes=num_classes,
-            label_convention=label_convention,
-            new_label_names=NEW_LABEL_NAMES,
-            T_used=T_used,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            ckpt_root=ckpt_root,
-            run_id=run_id,
-            node_features=node_features,
-            use_conf=use_conf,
-            normalize=normalize,
-            add_vel=add_vel,
-            add_acc=add_acc,
-            add_global=add_global,
-            conf_thres=float(args.conf_thres),
-            max_interp_gap=int(args.max_interp_gap),
-            stride=int(args.stride),
-            label_mode=str(args.label_mode),
-            min_valid_frac=float(args.min_valid_frac),
-            add_mask_channel=add_mask_channel,
-            drop_ambig_share=float(args.drop_ambig_share),
-            drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
-            fall_class_ids_raw=fall_class_ids_raw,
-            fall_ids_0based=fall_ids_0based,
-            pos_weight=pos_weight,
-            lambda_bin=float(args.lambda_bin),
-            selection_metric=str(args.selection_metric),
-            selection_w=float(args.selection_w),
-            selection_beta=float(args.selection_beta),
-            metric_weights_np=metric_weights_np,
-            class_weights_np=class_weights_np,
-        )
+        if m == "rf":
+            rf_max_depth = None if int(args.rf_max_depth) <= 0 else int(args.rf_max_depth)
+            rf_class_weight = str(args.rf_class_weight).strip()
+            if rf_class_weight.lower() == "none":
+                rf_class_weight = None
+            res = train_random_forest_once(
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                num_classes=num_classes,
+                ckpt_root=ckpt_root,
+                run_id=run_id,
+                label_convention=label_convention,
+                new_label_names=NEW_LABEL_NAMES,
+                use_conf=use_conf,
+                normalize=normalize,
+                add_vel=add_vel,
+                add_acc=add_acc,
+                add_global=add_global,
+                T_used=T_used,
+                conf_thres=float(args.conf_thres),
+                max_interp_gap=int(args.max_interp_gap),
+                stride=int(args.stride),
+                label_mode=str(args.label_mode),
+                min_valid_frac=float(args.min_valid_frac),
+                add_mask_channel=add_mask_channel,
+                drop_ambig_share=float(args.drop_ambig_share),
+                drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
+                fall_class_ids_raw=fall_class_ids_raw,
+                fall_ids_0based=fall_ids_0based,
+                selection_metric=str(args.selection_metric),
+                selection_w=float(args.selection_w),
+                selection_beta=float(args.selection_beta),
+                metric_weights_np=metric_weights_np,
+                rf_feature_mode=str(args.rf_feature_mode),
+                rf_paper_num_skeletons=int(args.rf_paper_num_skeletons),
+                rf_paper_num_features=int(args.rf_paper_num_features),
+                rf_n_estimators=int(args.rf_n_estimators),
+                rf_max_depth=rf_max_depth,
+                rf_max_features=str(args.rf_max_features),
+                rf_min_samples_split=int(args.rf_min_samples_split),
+                rf_min_samples_leaf=int(args.rf_min_samples_leaf),
+                rf_bootstrap=bool(args.rf_bootstrap),
+                rf_criterion=str(args.rf_criterion),
+                rf_class_weight=rf_class_weight,
+                rf_n_jobs=int(args.rf_n_jobs),
+                rf_random_state=int(args.rf_random_state),
+                rf_use_sample_weights=bool(args.rf_use_sample_weights),
+                class_weights_np=class_weights_np,
+            )
+        else:
+            res = train_model_once(
+                model_name=m,
+                cfg=cfg,
+                in_features=in_features,
+                num_classes=num_classes,
+                label_convention=label_convention,
+                new_label_names=NEW_LABEL_NAMES,
+                T_used=T_used,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                ckpt_root=ckpt_root,
+                run_id=run_id,
+                node_features=node_features,
+                use_conf=use_conf,
+                normalize=normalize,
+                add_vel=add_vel,
+                add_acc=add_acc,
+                add_global=add_global,
+                conf_thres=float(args.conf_thres),
+                max_interp_gap=int(args.max_interp_gap),
+                stride=int(args.stride),
+                label_mode=str(args.label_mode),
+                min_valid_frac=float(args.min_valid_frac),
+                add_mask_channel=add_mask_channel,
+                drop_ambig_share=float(args.drop_ambig_share),
+                drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
+                fall_class_ids_raw=fall_class_ids_raw,
+                fall_ids_0based=fall_ids_0based,
+                pos_weight=pos_weight,
+                lambda_bin=float(args.lambda_bin),
+                selection_metric=str(args.selection_metric),
+                selection_w=float(args.selection_w),
+                selection_beta=float(args.selection_beta),
+                metric_weights_np=metric_weights_np,
+                class_weights_np=class_weights_np,
+            )
         results.append(res)
 
     print_results_table(results)
