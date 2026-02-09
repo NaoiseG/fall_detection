@@ -278,6 +278,29 @@ def draw_pose(frame, xy: np.ndarray, conf: np.ndarray, conf_thres: float = 0.2, 
     return frame
 
 
+def open_video_writer(save_path: Path, fps: float, frame_size: Tuple[int, int]) -> cv2.VideoWriter:
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suffix = save_path.suffix.lower()
+    if suffix in {".avi"}:
+        codecs = ["XVID", "MJPG", "mp4v"]
+    elif suffix in {".mp4", ".m4v", ".mov"}:
+        codecs = ["mp4v", "avc1", "H264", "MJPG"]
+    else:
+        codecs = ["mp4v", "MJPG"]
+
+    w, h = int(frame_size[0]), int(frame_size[1])
+    for codec in codecs:
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(str(save_path), fourcc, float(fps), (w, h))
+        if writer.isOpened():
+            print(f"[save] writing: {save_path.as_posix()} ({w}x{h} @{float(fps):.2f}fps, codec={codec})")
+            return writer
+
+    raise RuntimeError(f"Could not open VideoWriter for: {save_path} (tried codecs={codecs})")
+
+
 def _clean_state_dict_for_model(state: dict, model: nn.Module) -> dict:
     """
     Flexibly handle DataParallel 'module.' prefixes.
@@ -502,6 +525,7 @@ def stream_infer_and_display(
     yolo_path: Path,
     device: str,
     clip_len: int,
+    save_path: Optional[Path],
     args: argparse.Namespace,
 ) -> int:
     """
@@ -633,6 +657,10 @@ def stream_infer_and_display(
     window_name = "MotionBERT Inference"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     print(f"[Display] Target FPS={fps_target:.2f} (source={src_fps:.2f}). Press 'q' or Esc to quit.", flush=True)
+
+    video_writer: Optional[cv2.VideoWriter] = None
+    out_w: Optional[int] = None
+    out_h: Optional[int] = None
 
     frames_buf: "deque[np.ndarray]" = deque()
     xy_buf: "deque[np.ndarray]" = deque()
@@ -844,6 +872,14 @@ def stream_infer_and_display(
             compute_window_pred(0, writer=writer)
             next_win_start = int(win_step)
 
+            if save_path is not None and frames_buf:
+                out_h, out_w = frames_buf[0].shape[:2]
+                video_writer = open_video_writer(
+                    save_path=save_path,
+                    fps=float(src_fps),
+                    frame_size=(int(out_w), int(out_h)),
+                )
+
             fps_ema: Optional[float] = None
             ema_alpha = 0.1
             t_prev = time.perf_counter()
@@ -909,6 +945,14 @@ def stream_infer_and_display(
                     hud.append(f"T={int(clip_len)} stride={int(win_step)}")
 
                 frame = draw_hud(frame, hud)
+
+                if video_writer is not None and out_w is not None and out_h is not None:
+                    frame_h, frame_w = frame.shape[:2]
+                    frame_to_write = frame
+                    if frame_h != int(out_h) or frame_w != int(out_w):
+                        frame_to_write = cv2.resize(frame, (int(out_w), int(out_h)), interpolation=cv2.INTER_LINEAR)
+                    video_writer.write(frame_to_write)
+
                 cv2.imshow(window_name, frame)
 
                 elapsed = float(time.perf_counter() - t_frame0)
@@ -932,6 +976,8 @@ def stream_infer_and_display(
                         break
     finally:
         cap.release()
+        if video_writer is not None:
+            video_writer.release()
         cv2.destroyAllWindows()
 
     if img_shape is None:
@@ -994,6 +1040,12 @@ def main() -> int:
     ap.add_argument("--display", action="store_true", help="Display video with pose + streaming window prediction (FPS HUD)")
     ap.add_argument("--display-conf-thres", type=float, default=0.2, help="Keypoint conf threshold for drawing")
     ap.add_argument("--display-fps", type=float, default=None, help="Playback FPS for display (default: video FPS)")
+    ap.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="Optional path to save annotated output video (e.g. out.mp4). If a directory, writes <video_stem>_annotated.mp4 inside.",
+    )
     ap.add_argument("--no-merge-fall", action="store_true", help="Disable merging the first five fall labels into one class")
     args = ap.parse_args()
 
@@ -1007,6 +1059,19 @@ def main() -> int:
     cfg = get_config(str(cfg_path))
     clip_len = int(args.win_len) if args.win_len is not None else int(getattr(cfg, "clip_len", 64))
 
+    save_path: Optional[Path] = None
+    if args.save:
+        save_arg = Path(args.save).expanduser()
+        if str(args.save).endswith(("/", "\\")) or (save_arg.exists() and save_arg.is_dir()):
+            save_path = save_arg / f"{video_path.stem}_annotated.mp4"
+        else:
+            save_path = save_arg
+        if save_path.suffix == "":
+            save_path = save_path.with_suffix(".mp4")
+        if not args.display:
+            print("[WARN] --save provided; enabling --display for annotated video output.")
+            args.display = True
+
     if args.display:
         return stream_infer_and_display(
             ckpt_path=ckpt_path,
@@ -1015,6 +1080,7 @@ def main() -> int:
             yolo_path=yolo_path,
             device=device,
             clip_len=clip_len,
+            save_path=save_path,
             args=args,
         )
 
