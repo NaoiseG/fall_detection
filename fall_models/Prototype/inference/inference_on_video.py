@@ -881,7 +881,7 @@ def main() -> int:
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
         fps_play = float(args.display_fps) if float(args.display_fps) > 1e-3 else float(src_fps)
-        delay_ms = max(1, int(round(1000.0 / max(1e-6, fps_play))))
+        frame_period_s = 1.0 / max(1e-6, float(fps_play))
 
         frames_buf: deque[np.ndarray] = deque()
         xy_buf: deque[np.ndarray] = deque()
@@ -1039,6 +1039,8 @@ def main() -> int:
             if not frames_buf and cap_done:
                 break
 
+            t_frame_start = time.perf_counter()
+
             # Keep a lead of ~T frames (plus 1) so we can predict the next window before it is displayed.
             target_processed = int(display_idx) + int(T_final) + 1
             while not cap_done and processed_total < target_processed:
@@ -1098,7 +1100,11 @@ def main() -> int:
                 writer.write(frame_to_write)
 
             cv2.imshow(window_name, frame)
-            key = cv2.waitKey(delay_ms) & 0xFF
+            # Wait just the remaining time to hit target display FPS (accounting for processing); min 1ms keeps UI responsive.
+            elapsed_s = time.perf_counter() - t_frame_start
+            remaining_s = frame_period_s - elapsed_s
+            wait_ms = int(max(1, remaining_s * 1000)) if remaining_s > 0 else 1
+            key = cv2.waitKey(wait_ms) & 0xFF
             if key in (ord("q"), 27):
                 break
 
