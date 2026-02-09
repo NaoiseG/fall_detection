@@ -334,8 +334,9 @@ def build_temporal_model(
         )
     else:
         raise ValueError(f"Unknown --arch: {arch} (expected one of {KNOWN_ARCHES})")
-
-    return model.to(device)
+    model = model.to(device)
+    print("Model device:", next(model.parameters()).device)
+    return model
 
 
 def draw_hud(frame: np.ndarray, lines: List[str], org: Tuple[int, int] = (10, 10)) -> np.ndarray:

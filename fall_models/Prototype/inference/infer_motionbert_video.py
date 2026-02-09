@@ -533,6 +533,7 @@ def stream_infer_and_display(
     if use_dp:
         model = nn.DataParallel(model)
     model = model.to(device)
+    print("Model device:", next(model.parameters()).device)
 
     checkpoint = torch.load(str(ckpt_path), map_location="cpu")
     state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
