@@ -28,7 +28,7 @@ def main():
     OUTPUT_ROOT = Path("../../Datasets/UPFall_keypoints/outputs_npz")   # change if needed
 
     cfg = PoseExportConfig(
-        model_path=str(Path("yolo11l-pose.pt")),  # change if needed
+        model_path=str(Path("pose_models/ultralytics/yolo11l-pose.pt")),  # change if needed
         conf_thres=0.25,
         fps=30,
         max_people=1,

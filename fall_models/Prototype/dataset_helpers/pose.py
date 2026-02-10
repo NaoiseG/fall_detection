@@ -15,7 +15,7 @@ from ultralytics import YOLO
 
 @dataclass
 class PoseExportConfig:
-    model_path: str = "Prototype/yolo11l-pose.pt"
+    model_path: str = "pose_models/ultralytics/yolo11l-pose.pt"
     conf_thres: float = 0.25
     fps: int = 30
     max_people: int = 1

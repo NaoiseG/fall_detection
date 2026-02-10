@@ -698,7 +698,7 @@ def main() -> int:
     ap.add_argument("--video", type=str, required=True, help="Path to input .mp4")
     ap.add_argument("--model", type=str, required=True, help="Checkpoint *.pt/*.pkl OR model folder OR model .py")
     ap.add_argument("--arch", type=str, default=None, choices=KNOWN_ARCHES, help="Override model architecture if needed")
-    ap.add_argument("--yolo-weights", type=str, default="yolo11l-pose.pt")
+    ap.add_argument("--yolo-weights", type=str, default="pose_models/ultralytics/yolo11l-pose.pt")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--yolo-conf", type=float, default=0.25)
     ap.add_argument("--max-people", type=int, default=1)

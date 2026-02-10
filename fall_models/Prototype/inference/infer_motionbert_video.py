@@ -1024,7 +1024,7 @@ def main() -> int:
         help="MotionBERT config yaml (can be relative to models/MotionBERT/)",
     )
     ap.add_argument("--video", type=str, required=True, help="Path to input mp4")
-    ap.add_argument("--yolo-weights", type=str, default="yolo11l-pose.pt")
+    ap.add_argument("--yolo-weights", type=str, default="pose_models/ultralytics/yolo11l-pose.pt")
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--conf-thres", type=float, default=0.25)
