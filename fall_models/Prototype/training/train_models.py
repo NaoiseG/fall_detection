@@ -881,6 +881,12 @@ if __name__ == "__main__":
     parser.add_argument("--camera", type=int, default=1, help="Camera index to train on (default: 1)")
     parser.add_argument("--train-subjects", type=str, default="16-17", help="Train subject range like '1-12' or '16-17'")
     parser.add_argument("--val-subjects", type=str, default="1-1", help="Val subject range like '13-16' or '1-1'")
+    parser.add_argument(
+        "--npz-root",
+        type=str,
+        default="../../Datasets/UPFall_keypoints/outputs_npz",
+        help="Root directory containing keypoint NPZ outputs (default: ../../Datasets/UPFall_keypoints/outputs_npz).",
+    )
     parser.add_argument("--epochs", type=int, default=20, help="Epochs per model (default: 20)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64)")
@@ -1144,7 +1150,7 @@ if __name__ == "__main__":
     val_subjects = parse_range(args.val_subjects)
 
     # Paths
-    OUTPUT_ROOT = Path("../../Datasets/UPFall_keypoints/outputs_npz")
+    OUTPUT_ROOT = Path(args.npz_root)
     ckpt_root = Path("models")  # keeps your existing layout
 
     # ---- Compute T_used + num_classes exactly as before (so results stay comparable) ----

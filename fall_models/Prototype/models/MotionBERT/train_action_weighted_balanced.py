@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from lib.utils.tools import *
 from lib.utils.learning import *
@@ -60,6 +60,18 @@ def parse_args():
         default=FALL_CLASS_IDX,
         help="Class index for the priority 'fall' class used in one-vs-rest F_beta.",
     )
+    parser.add_argument(
+        '--rare-class-boost',
+        type=float,
+        default=1.0,
+        help="Multiplicative boost applied to rare classes [0,4] in class weights (default: 1.0).",
+    )
+    parser.add_argument(
+        '--weighted-sampler',
+        type=int,
+        default=0,
+        help="If 1, use WeightedRandomSampler for training loader (0/1).",
+    )
     opts = parser.parse_args()
     return opts
 
@@ -82,9 +94,18 @@ CKPT_METRIC = "composite"         # options: "top1", "balanced_acc", "composite"
 CKPT_W = 0.7
 CKPT_BETA = 2.0
 FALL_CLASS_IDX = 0
+# Rare classes to boost in class weights (merged 7-class scheme)
+RARE_CLASS_IDS = [0, 4]
 
-def compute_class_weights_from_pkl(data_path: str, train_split: str, num_classes: int,
-                                   mode: str = "inv_sqrt", eps: float = 1e-6) -> torch.Tensor:
+def compute_class_weights_from_pkl(
+    data_path: str,
+    train_split: str,
+    num_classes: int,
+    mode: str = "inv_sqrt",
+    eps: float = 1e-6,
+    rare_boost: float = 1.0,
+    rare_class_ids = None,
+) -> torch.Tensor:
     """
     Compute per-class weights from the training split of a MotionBERT action .pkl.
 
@@ -124,11 +145,18 @@ def compute_class_weights_from_pkl(data_path: str, train_split: str, num_classes
         # default: inv_sqrt
         w = 1.0 / (np.sqrt(safe.astype(np.float64)) + eps)
 
+    if rare_class_ids and float(rare_boost) != 1.0:
+        for cid in rare_class_ids:
+            if 0 <= int(cid) < num_classes:
+                w[int(cid)] *= float(rare_boost)
+
     # Normalize so average weight is 1 (keeps loss scale roughly comparable)
     w = w / (np.mean(w) + eps)
 
     print("\n[Class weighting] Train label counts:", {i: int(c) for i, c in enumerate(counts) if c > 0})
     print("[Class weighting] Example weights (first 11):", [float(x) for x in w[:min(11, len(w))]])
+    if rare_class_ids and float(rare_boost) != 1.0:
+        print(f"[Class weighting] Applied rare-class boost x{float(rare_boost):g} to ids {list(rare_class_ids)}")
     return torch.tensor(w, dtype=torch.float32)
 
 
@@ -290,10 +318,46 @@ def train_with_config(args, opts):
     # This reads the .pkl once and derives weights from the TRAIN split.
     # ------------------------------------------------------------------
     class_weights = None
+    class_weights_np = None
     if USE_CLASS_WEIGHTS:
         # args.data_split is usually 'xsub' so train split key is 'xsub_train'
         train_split_key = args.data_split + '_train'
-        class_weights = compute_class_weights_from_pkl(data_path, train_split_key, args.action_classes, mode='inv_sqrt')
+        if not np.isfinite(float(opts.rare_class_boost)):
+            raise RuntimeError("--rare-class-boost must be a finite float.")
+        class_weights = compute_class_weights_from_pkl(
+            data_path,
+            train_split_key,
+            args.action_classes,
+            mode='inv_sqrt',
+            rare_boost=float(opts.rare_class_boost),
+            rare_class_ids=RARE_CLASS_IDS,
+        )
+        class_weights_np = class_weights.detach().cpu().numpy()
+
+    # Optional: WeightedRandomSampler for imbalanced classes
+    if int(getattr(opts, "weighted_sampler", 0)) == 1:
+        if not np.isfinite(float(opts.rare_class_boost)):
+            raise RuntimeError("--rare-class-boost must be a finite float.")
+        labels_np = np.asarray(ntu60_xsub_train.labels, dtype=np.int64)
+        if class_weights_np is None:
+            # Build fallback weights from label counts (inv_sqrt)
+            counts = np.bincount(labels_np, minlength=int(args.action_classes)).astype(np.float64)
+            safe = np.maximum(counts, 1.0)
+            w = 1.0 / (np.sqrt(safe) + 1e-6)
+            if float(opts.rare_class_boost) != 1.0:
+                for cid in RARE_CLASS_IDS:
+                    if 0 <= int(cid) < int(len(w)):
+                        w[int(cid)] *= float(opts.rare_class_boost)
+            w = w / (np.mean(w) + 1e-6)
+        else:
+            w = class_weights_np
+        sample_w = torch.from_numpy(w[labels_np]).double()
+        sampler = WeightedRandomSampler(weights=sample_w, num_samples=int(len(sample_w)), replacement=True)
+        trainloader_params["shuffle"] = False
+        trainloader_params["sampler"] = sampler
+        print("Train loader: WeightedRandomSampler enabled.")
+    else:
+        trainloader_params["shuffle"] = True
 
     train_loader = DataLoader(ntu60_xsub_train, **trainloader_params)
     test_loader = DataLoader(ntu60_xsub_val, **testloader_params)

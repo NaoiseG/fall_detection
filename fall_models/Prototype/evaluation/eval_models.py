@@ -643,6 +643,12 @@ def main():
     parser.add_argument("--all", action="store_true", help="Evaluate all models (overrides --models).")
     parser.add_argument("--camera", type=int, default=1, help="Camera index (default: 1)")
     parser.add_argument("--test-subjects", type=str, default="1-1", help="Test subject range like '1-5'")
+    parser.add_argument(
+        "--npz-root",
+        type=str,
+        default="../../Datasets/UPFall_keypoints/outputs_npz",
+        help="Root directory containing keypoint NPZ outputs (default: ../../Datasets/UPFall_keypoints/outputs_npz).",
+    )
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64)")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (default: 0)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -794,7 +800,7 @@ def main():
     test_subjects = parse_range(args.test_subjects)
 
     # Load test set using the SAME NPZ->windows pipeline
-    OUTPUT_ROOT = Path("../../Datasets/UPFall_keypoints/outputs_npz")
+    OUTPUT_ROOT = Path(args.npz_root)
     test_npzs = find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=test_subjects)
     if not test_npzs:
         raise RuntimeError("No test NPZs found. Check OUTPUT_ROOT, camera, and test subjects.")
