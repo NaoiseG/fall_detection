@@ -28,7 +28,7 @@ Notes:
 - label_mode ("majority" or "center") is applied on the frame_labels inside each window slice.
 
 python .\dataset_helpers\prepare_motionbert_dataset.py --label-mode center --win-step 32 --train-subjects 1-12 \
-    --val-subjects 13-15 --data-root ..\..\Datasets\UPFall_keypoints\outputs_npz\ --camera 1 \
+    --val-subjects 13-15 --outputs-npz-root ..\..\Datasets\UPFall_keypoints\outputs_npz\ --camera 1 \
     --out-pkl .\models\MotionBERT\data\action\upfall.pkl \
     --out-label-map .\models\MotionBERT\data\action\upfall_label_map.json
 """
@@ -714,8 +714,9 @@ def build_dataset(
 
 def main():
     ap = argparse.ArgumentParser("prepare_motionbert_dataset.py")
-    ap.add_argument("--data-root", type=str, required=True,
-                    help="Root folder of outputs_npz, e.g. ../../Datasets/UPFall_keypoints/outputs_npz/")
+    ap.add_argument("--outputs-npz-root", "--data-root", dest="data_root", type=str, required=True,
+                    help="Root folder of outputs_npz, e.g. ../../Datasets/UPFall_keypoints/outputs_npz/ "
+                         "(--data-root is a deprecated alias).")
     ap.add_argument("--camera", type=int, required=True, help="Camera index, e.g. 1")
     ap.add_argument("--train-subjects", type=str, required=True,
                     help="Train subject range like '1-12' (or '1-4,7,9-10')")
