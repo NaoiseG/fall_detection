@@ -182,13 +182,31 @@ def _maybe_cuda_sync(sync_cuda: bool) -> None:
         torch.cuda.synchronize()
 
 
-def _pick_profile_out_dir(profile_out_arg: Optional[str], save_path: Optional[Path]) -> Path:
-    if profile_out_arg:
-        return Path(profile_out_arg).expanduser()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if save_path is not None:
-        return save_path.parent / f"{save_path.stem}_profiling_{stamp}"
-    return Path("runs") / "profiling" / stamp
+def _slugify_name(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name).strip())
+    s = re.sub(r"-{2,}", "-", s).strip("-._")
+    return s or "model"
+
+
+def _pick_profile_out_dir(
+    profile_out_arg: Optional[str],
+    save_path: Optional[Path],
+    ckpt_path: Path,
+    arch: str,
+) -> Path:
+    base_root = Path(profile_out_arg).expanduser() if profile_out_arg else (save_path.parent if save_path is not None else Path("runs") / "profiling")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    model_tag = _slugify_name(Path(ckpt_path).stem)
+    arch_tag = _slugify_name(str(arch).lower())
+    run_name = f"{stamp}_{arch_tag}_{model_tag}"
+    out_dir = base_root / run_name
+
+    # Very unlikely with microseconds, but keep guaranteed uniqueness.
+    suffix = 1
+    while out_dir.exists():
+        out_dir = base_root / f"{run_name}_{suffix:02d}"
+        suffix += 1
+    return out_dir
 
 
 def _parse_tegrastats_line(line: str) -> Dict[str, float]:
@@ -217,7 +235,7 @@ def _parse_tegrastats_line(line: str) -> Dict[str, float]:
                 loads.append(_safe_float(m_pct.group(1)))
         sample["cpu_pct"] = _avg_valid(loads)
 
-    m_gpu = re.search(r"\bGR3D(?:_FREQ)?\s+([+-]?\d+(?:\.\d+)?)%", line, flags=re.IGNORECASE)
+    m_gpu = re.search(r"\bGR3D(?:_FREQ)?[:=]?\s*([+-]?\d+(?:\.\d+)?)%", line, flags=re.IGNORECASE)
     if m_gpu:
         sample["gpu_pct"] = _safe_float(m_gpu.group(1))
 
@@ -269,6 +287,44 @@ def _extract_numeric_from_obj(obj: Any) -> float:
         vals = [_extract_numeric_from_obj(v) for v in obj]
         return _avg_valid(vals)
     return float("nan")
+
+
+def _collect_keyed_numeric(obj: Any, prefix: str = "") -> List[Tuple[str, float]]:
+    out: List[Tuple[str, float]] = []
+
+    def _rec(cur: Any, path: List[str]) -> None:
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                key = str(k).lower()
+                next_path = path + [key]
+                if isinstance(v, (dict, list, tuple)):
+                    _rec(v, next_path)
+                else:
+                    out.append(("_".join(next_path), _extract_numeric_from_obj(v)))
+        elif hasattr(cur, "__dict__"):
+            _rec(vars(cur), path)
+        elif isinstance(cur, (list, tuple)):
+            for i, v in enumerate(cur):
+                next_path = path + [str(i)]
+                if isinstance(v, (dict, list, tuple)):
+                    _rec(v, next_path)
+                else:
+                    out.append(("_".join(next_path), _extract_numeric_from_obj(v)))
+
+    start = [str(prefix).lower()] if prefix else []
+    _rec(obj, start)
+    return out
+
+
+def _pick_pct_from_keyed(values: List[Tuple[str, float]], tokens_any: Tuple[str, ...]) -> float:
+    cand: List[float] = []
+    for key, val in values:
+        if not np.isfinite(val):
+            continue
+        key_l = str(key).lower()
+        if any(tok in key_l for tok in tokens_any) and 0.0 <= float(val) <= 100.0:
+            cand.append(float(val))
+    return _avg_valid(cand)
 
 
 class HardwareSampler:
@@ -390,10 +446,27 @@ class HardwareSampler:
                 if hasattr(self._jtop_obj, "ok") and not self._jtop_obj.ok():
                     break
                 stats = dict(getattr(self._jtop_obj, "stats", {}))
+                gpu_obj = getattr(self._jtop_obj, "gpu", None)
+                temp_obj = getattr(self._jtop_obj, "temperature", None)
+                power_obj = getattr(self._jtop_obj, "power", None)
+                memory_obj = getattr(self._jtop_obj, "memory", None)
+                cpu_obj = getattr(self._jtop_obj, "cpu", None)
             except Exception:
                 stats = {}
+                gpu_obj = None
+                temp_obj = None
+                power_obj = None
+                memory_obj = None
+                cpu_obj = None
 
-            sample = self._sample_from_jtop_stats(stats)
+            sample = self._sample_from_jtop_stats(
+                stats=stats,
+                gpu_obj=gpu_obj,
+                temp_obj=temp_obj,
+                power_obj=power_obj,
+                memory_obj=memory_obj,
+                cpu_obj=cpu_obj,
+            )
             self._append_sample(sample)
 
             if self._stop_event.wait(self.interval_s):
@@ -458,7 +531,15 @@ class HardwareSampler:
             if self._stop_event.wait(self.interval_s):
                 break
 
-    def _sample_from_jtop_stats(self, stats: Dict[str, Any]) -> Dict[str, float]:
+    def _sample_from_jtop_stats(
+        self,
+        stats: Dict[str, Any],
+        gpu_obj: Any = None,
+        temp_obj: Any = None,
+        power_obj: Any = None,
+        memory_obj: Any = None,
+        cpu_obj: Any = None,
+    ) -> Dict[str, float]:
         out = {
             "ram_used_pct": float("nan"),
             "cpu_pct": float("nan"),
@@ -467,69 +548,119 @@ class HardwareSampler:
             "gpu_temp_c": float("nan"),
             "power_w": float("nan"),
         }
-        if not stats:
+        if not stats and gpu_obj is None and temp_obj is None and power_obj is None and memory_obj is None and cpu_obj is None:
             return out
 
-        # RAM (%)
-        ram_v = stats.get("RAM", None)
-        if isinstance(ram_v, dict):
-            used = _extract_numeric_from_obj(ram_v.get("used", ram_v.get("use", None)))
-            total = _extract_numeric_from_obj(ram_v.get("tot", ram_v.get("total", None)))
+        if stats:
+            # RAM (%)
+            ram_v = stats.get("RAM", None)
+            if isinstance(ram_v, dict):
+                used = _extract_numeric_from_obj(ram_v.get("used", ram_v.get("use", None)))
+                total = _extract_numeric_from_obj(ram_v.get("tot", ram_v.get("total", None)))
+                if np.isfinite(used) and np.isfinite(total) and total > 0:
+                    out["ram_used_pct"] = 100.0 * used / total
+                else:
+                    out["ram_used_pct"] = _extract_numeric_from_obj(ram_v)
+            elif isinstance(ram_v, (list, tuple)) and len(ram_v) >= 2:
+                used = _extract_numeric_from_obj(ram_v[0])
+                total = _extract_numeric_from_obj(ram_v[1])
+                if np.isfinite(used) and np.isfinite(total) and total > 0:
+                    out["ram_used_pct"] = 100.0 * used / total
+            else:
+                out["ram_used_pct"] = _extract_numeric_from_obj(ram_v)
+            if np.isfinite(out["ram_used_pct"]) and out["ram_used_pct"] <= 1.0:
+                out["ram_used_pct"] *= 100.0
+
+            # CPU (%): prefer explicit "CPU", then per-core CPUx keys.
+            out["cpu_pct"] = _extract_numeric_from_obj(stats.get("CPU", None))
+            if not np.isfinite(out["cpu_pct"]):
+                cpu_keys = [k for k in stats.keys() if re.fullmatch(r"cpu\d+", str(k).lower())]
+                cpu_vals = [_extract_numeric_from_obj(stats[k]) for k in cpu_keys]
+                out["cpu_pct"] = _avg_valid(cpu_vals)
+
+            # GPU (%)
+            gpu_candidates = []
+            for k, v in stats.items():
+                k_l = str(k).lower()
+                if "gpu" in k_l or "gr3d" in k_l:
+                    gpu_candidates.append(_extract_numeric_from_obj(v))
+            out["gpu_pct"] = _avg_valid(gpu_candidates)
+
+            # Temperatures.
+            cpu_t = []
+            gpu_t = []
+            for k, v in stats.items():
+                k_l = str(k).lower().replace(" ", "_")
+                if "temp" in k_l and "cpu" in k_l:
+                    cpu_t.append(_extract_numeric_from_obj(v))
+                if "temp" in k_l and "gpu" in k_l:
+                    gpu_t.append(_extract_numeric_from_obj(v))
+            out["cpu_temp_c"] = _avg_valid(cpu_t)
+            out["gpu_temp_c"] = _avg_valid(gpu_t)
+
+            # Power: prefer total/input rails if available.
+            power_candidates: List[float] = []
+            power_pref: List[float] = []
+            for k, v in stats.items():
+                k_l = str(k).lower().replace(" ", "_")
+                if "power" in k_l or "pom_" in k_l or "vdd_in" in k_l:
+                    val = _extract_numeric_from_obj(v)
+                    if np.isfinite(val):
+                        power_candidates.append(val)
+                        if "5v_in" in k_l or "vdd_in" in k_l or "tot" in k_l:
+                            power_pref.append(val)
+            raw_power = _avg_valid(power_pref) if power_pref else _avg_valid(power_candidates)
+            if np.isfinite(raw_power):
+                out["power_w"] = raw_power / 1000.0 if raw_power > 100.0 else raw_power
+
+        # Fallback/augmentation from direct jtop objects.
+        if memory_obj is not None and not np.isfinite(out["ram_used_pct"]):
+            mem_keyed = _collect_keyed_numeric(memory_obj, prefix="memory")
+            used_vals = [v for k, v in mem_keyed if np.isfinite(v) and any(tok in k for tok in ("used", "use", "util"))]
+            total_vals = [v for k, v in mem_keyed if np.isfinite(v) and any(tok in k for tok in ("total", "tot", "size"))]
+            used = _avg_valid(used_vals)
+            total = _avg_valid(total_vals)
             if np.isfinite(used) and np.isfinite(total) and total > 0:
                 out["ram_used_pct"] = 100.0 * used / total
             else:
-                out["ram_used_pct"] = _extract_numeric_from_obj(ram_v)
-        elif isinstance(ram_v, (list, tuple)) and len(ram_v) >= 2:
-            used = _extract_numeric_from_obj(ram_v[0])
-            total = _extract_numeric_from_obj(ram_v[1])
-            if np.isfinite(used) and np.isfinite(total) and total > 0:
-                out["ram_used_pct"] = 100.0 * used / total
-        else:
-            out["ram_used_pct"] = _extract_numeric_from_obj(ram_v)
-        if np.isfinite(out["ram_used_pct"]) and out["ram_used_pct"] <= 1.0:
-            out["ram_used_pct"] *= 100.0
+                out["ram_used_pct"] = _pick_pct_from_keyed(mem_keyed, tokens_any=("percent", "perc", "usage", "util"))
 
-        # CPU (%): prefer explicit "CPU", then per-core CPUx keys.
-        out["cpu_pct"] = _extract_numeric_from_obj(stats.get("CPU", None))
-        if not np.isfinite(out["cpu_pct"]):
-            cpu_keys = [k for k in stats.keys() if re.fullmatch(r"cpu\d+", str(k).lower())]
-            cpu_vals = [_extract_numeric_from_obj(stats[k]) for k in cpu_keys]
-            out["cpu_pct"] = _avg_valid(cpu_vals)
+        if cpu_obj is not None and not np.isfinite(out["cpu_pct"]):
+            cpu_keyed = _collect_keyed_numeric(cpu_obj, prefix="cpu")
+            out["cpu_pct"] = _pick_pct_from_keyed(cpu_keyed, tokens_any=("load", "usage", "util", "percent", "perc"))
+            if not np.isfinite(out["cpu_pct"]):
+                # Last fallback: average all plausible percentages.
+                all_pct = [v for _, v in cpu_keyed if np.isfinite(v) and 0.0 <= float(v) <= 100.0]
+                out["cpu_pct"] = _avg_valid(all_pct)
 
-        # GPU (%)
-        gpu_candidates = []
-        for k, v in stats.items():
-            k_l = str(k).lower()
-            if "gpu" in k_l or "gr3d" in k_l:
-                gpu_candidates.append(_extract_numeric_from_obj(v))
-        out["gpu_pct"] = _avg_valid(gpu_candidates)
+        if gpu_obj is not None and not np.isfinite(out["gpu_pct"]):
+            gpu_keyed = _collect_keyed_numeric(gpu_obj, prefix="gpu")
+            out["gpu_pct"] = _pick_pct_from_keyed(gpu_keyed, tokens_any=("load", "usage", "util", "gr3d", "gpu", "percent", "perc"))
+            if not np.isfinite(out["gpu_pct"]):
+                all_pct = [v for _, v in gpu_keyed if np.isfinite(v) and 0.0 <= float(v) <= 100.0]
+                out["gpu_pct"] = _avg_valid(all_pct)
 
-        # Temperatures.
-        cpu_t = []
-        gpu_t = []
-        for k, v in stats.items():
-            k_l = str(k).lower().replace(" ", "_")
-            if "temp" in k_l and "cpu" in k_l:
-                cpu_t.append(_extract_numeric_from_obj(v))
-            if "temp" in k_l and "gpu" in k_l:
-                gpu_t.append(_extract_numeric_from_obj(v))
-        out["cpu_temp_c"] = _avg_valid(cpu_t)
-        out["gpu_temp_c"] = _avg_valid(gpu_t)
+        if temp_obj is not None and (not np.isfinite(out["cpu_temp_c"]) or not np.isfinite(out["gpu_temp_c"])):
+            temp_keyed = _collect_keyed_numeric(temp_obj, prefix="temp")
+            if not np.isfinite(out["cpu_temp_c"]):
+                cpu_vals = [v for k, v in temp_keyed if np.isfinite(v) and ("cpu" in k or "soc" in k) and -20.0 <= float(v) <= 150.0]
+                out["cpu_temp_c"] = _avg_valid(cpu_vals)
+            if not np.isfinite(out["gpu_temp_c"]):
+                gpu_vals = [v for k, v in temp_keyed if np.isfinite(v) and "gpu" in k and -20.0 <= float(v) <= 150.0]
+                out["gpu_temp_c"] = _avg_valid(gpu_vals)
 
-        # Power: prefer total/input rails if available.
-        power_candidates: List[float] = []
-        power_pref: List[float] = []
-        for k, v in stats.items():
-            k_l = str(k).lower().replace(" ", "_")
-            if "power" in k_l or "pom_" in k_l or "vdd_in" in k_l:
-                val = _extract_numeric_from_obj(v)
-                if np.isfinite(val):
-                    power_candidates.append(val)
-                    if "5v_in" in k_l or "vdd_in" in k_l or "tot" in k_l:
-                        power_pref.append(val)
-        raw_power = _avg_valid(power_pref) if power_pref else _avg_valid(power_candidates)
-        if np.isfinite(raw_power):
-            out["power_w"] = raw_power / 1000.0 if raw_power > 100.0 else raw_power
+        if power_obj is not None and not np.isfinite(out["power_w"]):
+            power_keyed = _collect_keyed_numeric(power_obj, prefix="power")
+            pref = [v for k, v in power_keyed if np.isfinite(v) and any(tok in k for tok in ("5v_in", "vdd_in", "in", "tot", "total"))]
+            vals = pref if pref else [v for _, v in power_keyed if np.isfinite(v)]
+            raw_power = _avg_valid(vals)
+            if np.isfinite(raw_power):
+                out["power_w"] = raw_power / 1000.0 if raw_power > 100.0 else raw_power
+
+        # Last-resort GPU parse from full keyed stats.
+        if not np.isfinite(out["gpu_pct"]) and stats:
+            keyed = _collect_keyed_numeric(stats, prefix="stats")
+            out["gpu_pct"] = _pick_pct_from_keyed(keyed, tokens_any=("gr3d", "gpu"))
 
         return out
 
@@ -1428,7 +1559,12 @@ def main() -> int:
     )
     ap.add_argument("--display-fps", type=float, default=0.0, help="0 => source fps")
     ap.add_argument("--profile", type=int, default=0, help="Enable profiling outputs (0/1).")
-    ap.add_argument("--profile-out", type=str, default=None, help="Directory for profiling CSV/plots/summary.")
+    ap.add_argument(
+        "--profile-out",
+        type=str,
+        default=None,
+        help="Base directory for profiling outputs. A unique per-run subdirectory is created (timestamp + model).",
+    )
     ap.add_argument("--profile-duration-s", type=float, default=0.0, help="0 => full run, else stop after N seconds.")
     ap.add_argument("--hw-sample-hz", type=float, default=1.0, help="Hardware metrics sample rate (Hz).")
     ap.add_argument("--no-display", type=int, default=0, help="Run headless: skip imshow/waitKey (0/1).")
@@ -1452,7 +1588,7 @@ def main() -> int:
     no_display = bool(int(args.no_display))
     profile_duration_s = max(0.0, float(args.profile_duration_s))
     hw_sample_hz = max(0.1, float(args.hw_sample_hz))
-    profile_out_dir: Optional[Path] = _pick_profile_out_dir(args.profile_out, save_path) if profile_enabled else None
+    profile_out_dir: Optional[Path] = None
 
     device = pick_device(args.device)
     use_half = bool(int(args.half)) and device.startswith("cuda")
@@ -1460,6 +1596,13 @@ def main() -> int:
 
     ckpt_path, arch = resolve_ckpt_and_arch(args.model, args.arch)
     print(f"[model] arch={arch} ckpt={ckpt_path.as_posix()}")
+    if profile_enabled:
+        profile_out_dir = _pick_profile_out_dir(
+            profile_out_arg=args.profile_out,
+            save_path=save_path,
+            ckpt_path=ckpt_path,
+            arch=arch,
+        )
 
     is_rf = str(arch).lower().strip() == "rf" or ckpt_path.suffix.lower() in {".pkl", ".pickle"}
     rf_model = None
@@ -1570,6 +1713,9 @@ def main() -> int:
     hw_rows: List[Dict[str, Any]] = []
     hw_sampler: Optional[HardwareSampler] = None
     profile_run_t0 = time.perf_counter()
+    metrics_cutoff_active = False
+    metrics_cutoff_t_s: Optional[float] = None
+    metrics_cutoff_frame_idx: Optional[int] = None
 
     try:
         if profile_enabled and profile_out_dir is not None:
@@ -1810,6 +1956,21 @@ def main() -> int:
 
             compute_ready_windows()
 
+            if (
+                profile_enabled
+                and not metrics_cutoff_active
+                and cap_done
+                and next_win_start >= processed_total
+                and (int(processed_total) - int(display_idx)) <= int(T_final)
+            ):
+                metrics_cutoff_active = True
+                metrics_cutoff_t_s = float(time.perf_counter() - profile_run_t0)
+                metrics_cutoff_frame_idx = int(display_idx)
+                print(
+                    f"[profile] timing metrics cutoff at frame {int(metrics_cutoff_frame_idx)} "
+                    "(tail drain phase after final window inference)."
+                )
+
             if not frames_buf:
                 continue
 
@@ -1894,7 +2055,7 @@ def main() -> int:
             inst_fps = 1000.0 / max(1e-6, total_ms)
             fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
 
-            if profile_enabled:
+            if profile_enabled and not metrics_cutoff_active:
                 inference_ms = float(yolo_infer_ms) + float(temporal_infer_ms)
                 postprocess_ms = float(win_feature_ms) + float(post_extra_ms)
                 time_rows.append(
@@ -1945,6 +2106,8 @@ def main() -> int:
         if hw_sampler is not None:
             hw_sampler.stop()
             hw_rows = hw_sampler.get_samples()
+        if metrics_cutoff_t_s is not None:
+            hw_rows = [r for r in hw_rows if _safe_float(r.get("t_s", np.nan)) <= float(metrics_cutoff_t_s)]
         if profile_enabled and profile_out_dir is not None:
             try:
                 _save_profile_artifacts(profile_out=profile_out_dir, time_rows=time_rows, hw_rows=hw_rows)
