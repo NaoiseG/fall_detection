@@ -167,6 +167,13 @@ def _json_safe_number(v: Any) -> Optional[float]:
     return None
 
 
+def _fmt_live_metric(v: Any, unit: str = "", digits: int = 1) -> str:
+    fv = _safe_float(v)
+    if np.isfinite(fv):
+        return f"{fv:.{digits}f}{unit}"
+    return "NA"
+
+
 def _write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -423,6 +430,12 @@ class HardwareSampler:
     def get_samples(self) -> List[Dict[str, Any]]:
         with self._lock:
             return [dict(x) for x in self.samples]
+
+    def get_latest_sample(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if not self.samples:
+                return None
+            return dict(self.samples[-1])
 
     def _append_sample(self, sample: Dict[str, Any]) -> None:
         row = {
@@ -1593,6 +1606,10 @@ def main() -> int:
     device = pick_device(args.device)
     use_half = bool(int(args.half)) and device.startswith("cuda")
     sync_cuda_timing = bool(device.startswith("cuda") and torch.cuda.is_available())
+    print(
+        f"[runtime] device={device} "
+        f"(requested={args.device if args.device else 'auto'}, cuda_available={torch.cuda.is_available()}, half={int(use_half)})"
+    )
 
     ckpt_path, arch = resolve_ckpt_and_arch(args.model, args.arch)
     print(f"[model] arch={arch} ckpt={ckpt_path.as_posix()}")
@@ -1716,6 +1733,8 @@ def main() -> int:
     metrics_cutoff_active = False
     metrics_cutoff_t_s: Optional[float] = None
     metrics_cutoff_frame_idx: Optional[int] = None
+    last_hw_print_t = 0.0
+    hw_print_interval_s = max(0.5, 1.0 / max(hw_sample_hz, 1e-3))
 
     try:
         if profile_enabled and profile_out_dir is not None:
@@ -1955,6 +1974,25 @@ def main() -> int:
                 process_next_frame()
 
             compute_ready_windows()
+
+            if profile_enabled and hw_sampler is not None:
+                now_t = time.perf_counter()
+                if (now_t - last_hw_print_t) >= hw_print_interval_s:
+                    latest = hw_sampler.get_latest_sample()
+                    if latest is not None:
+                        print(
+                            "[hw] "
+                            f"t={_fmt_live_metric(latest.get('t_s', np.nan), 's')} "
+                            f"gpu={_fmt_live_metric(latest.get('gpu_pct', np.nan), '%')} "
+                            f"cpu={_fmt_live_metric(latest.get('cpu_pct', np.nan), '%')} "
+                            f"ram={_fmt_live_metric(latest.get('ram_used_pct', np.nan), '%')} "
+                            f"cpu_t={_fmt_live_metric(latest.get('cpu_temp_c', np.nan), 'C')} "
+                            f"gpu_t={_fmt_live_metric(latest.get('gpu_temp_c', np.nan), 'C')} "
+                            f"pwr={_fmt_live_metric(latest.get('power_w', np.nan), 'W')}"
+                        )
+                    else:
+                        print("[hw] waiting for first hardware sample...")
+                    last_hw_print_t = now_t
 
             if (
                 profile_enabled
