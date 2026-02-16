@@ -126,6 +126,16 @@ def pick_device(device: Optional[str]) -> str:
     return device
 
 
+def ceil_div_pos(a: int, b: int) -> int:
+    a_i = int(a)
+    b_i = int(b)
+    if a_i <= 0:
+        raise ValueError(f"Expected positive integer, got {a_i}.")
+    if b_i <= 0:
+        raise ValueError(f"Expected positive divisor, got {b_i}.")
+    return (a_i + b_i - 1) // b_i
+
+
 def resolve_path(path: str, *, desc: str) -> Path:
     """
     Resolve a user-provided path in a forgiving way:
@@ -451,7 +461,7 @@ def pad_or_trim(names: List[str], num_classes: int) -> List[str]:
     return names
 
 
-def window_start_end_from_frame_dir(frame_dir: str, total_frames: int) -> Tuple[int, int]:
+def window_start_end_from_frame_dir(frame_dir: str, total_frames: int, frame_step: int = 1) -> Tuple[int, int]:
     start_frame = 0
     try:
         parts = frame_dir.split("_s", 1)
@@ -459,8 +469,11 @@ def window_start_end_from_frame_dir(frame_dir: str, total_frames: int) -> Tuple[
             start_frame = int(parts[1].split("_len", 1)[0])
     except Exception:
         start_frame = 0
-    end_frame = int(start_frame) + int(total_frames) - 1
-    return int(start_frame), int(end_frame)
+
+    step = max(1, int(frame_step))
+    start_raw = int(start_frame) * step
+    end_raw = int(start_raw) + (max(1, int(total_frames)) - 1) * step
+    return int(start_raw), int(end_raw)
 
 
 def predict_one_window(
@@ -476,6 +489,7 @@ def predict_one_window(
     class_names_out: List[str],
     unmerged_len_expected: int,
     merged_len_expected: int,
+    frame_step: int = 1,
 ) -> dict:
     motion = build_motion_from_annotation(ann, clip_len=clip_len, scale_range=scale_range)
 
@@ -503,7 +517,11 @@ def predict_one_window(
     pred_conf = float(np.max(merged_probs))
     p_fall = float(fall_prob)
 
-    start_frame, end_frame = window_start_end_from_frame_dir(frame_dir, int(ann["total_frames"]))
+    start_frame, end_frame = window_start_end_from_frame_dir(
+        frame_dir,
+        int(ann["total_frames"]),
+        frame_step=int(frame_step),
+    )
     pred_name = class_names_out[pred_id] if 0 <= pred_id < len(class_names_out) else str(pred_id)
 
     return {
@@ -525,6 +543,10 @@ def stream_infer_and_display(
     yolo_path: Path,
     device: str,
     clip_len: int,
+    win_step: int,
+    frame_step: int,
+    clip_len_raw: int,
+    win_step_raw: int,
     save_path: Optional[Path],
     args: argparse.Namespace,
 ) -> int:
@@ -534,7 +556,8 @@ def stream_infer_and_display(
     Playback targets the source FPS (or --display-fps). If processing can't keep up, the display slows down.
     """
 
-    win_step = max(1, int(args.win_step))
+    win_step = max(1, int(win_step))
+    frame_step = max(1, int(frame_step))
     missing_conf_thres = float(args.missing_conf_thres)
     drop_empty_windows = not bool(args.keep_empty_windows)
     pad_tail = bool(args.pad_tail)
@@ -607,6 +630,7 @@ def stream_infer_and_display(
         class_names_out=class_names_out,
         unmerged_len_expected=unmerged_len_expected,
         merged_len_expected=merged_len_expected,
+        frame_step=frame_step,
     )
 
     out_csv = Path(args.out_csv)
@@ -670,13 +694,16 @@ def stream_infer_and_display(
     all_cf: List[np.ndarray] = []
 
     img_shape: Optional[Tuple[int, int]] = None
-    processed_total = 0
+    processed_total = 0  # raw frames processed
+    sampled_total = 0  # sampled frames used for MotionBERT windows
     display_idx = 0
     cap_done = False
 
     window_preds: dict[int, dict] = {}
     skipped_windows: set[int] = set()
     next_win_start = 0
+    last_xy = np.zeros((17, 2), dtype=np.float32)
+    last_cf = np.zeros((17,), dtype=np.float32)
 
     def pose_on_frame(frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         results = pose_model.predict(
@@ -707,7 +734,7 @@ def stream_infer_and_display(
         return kpts_xy, kpts_conf
 
     def process_next_frame() -> bool:
-        nonlocal processed_total, cap_done, img_shape
+        nonlocal processed_total, sampled_total, cap_done, img_shape, last_xy, last_cf
 
         if cap_done:
             return False
@@ -721,13 +748,23 @@ def stream_infer_and_display(
             h, w = frame.shape[:2]
             img_shape = (int(h), int(w))
 
-        xy, cf = pose_on_frame(frame)
+        raw_idx = int(processed_total)
+        do_pose = (int(raw_idx) % int(frame_step)) == 0
+
+        if do_pose:
+            xy, cf = pose_on_frame(frame)
+            all_xy.append(xy)
+            all_cf.append(cf)
+            sampled_total += 1
+            last_xy = xy
+            last_cf = cf
+        else:
+            xy = last_xy
+            cf = last_cf
 
         frames_buf.append(frame)
         xy_buf.append(xy)
         cf_buf.append(cf)
-        all_xy.append(xy)
-        all_cf.append(cf)
         processed_total += 1
 
         if args.limit_frames is not None and processed_total >= int(args.limit_frames):
@@ -740,19 +777,19 @@ def stream_infer_and_display(
             return None
 
         end = int(start) + int(clip_len)
-        if end <= int(processed_total):
+        if end <= int(sampled_total):
             raw_kxy = np.stack(all_xy[start:end], axis=0).astype(np.float32)
             raw_ksc = np.stack(all_cf[start:end], axis=0).astype(np.float32)
         else:
             if not cap_done or (not pad_tail):
                 return None
-            if start >= int(processed_total):
+            if start >= int(sampled_total):
                 return None
-            pad_n = int(end - int(processed_total))
+            pad_n = int(end - int(sampled_total))
             if pad_n >= int(clip_len):
                 return None
-            raw_kxy = np.stack(all_xy[start:processed_total], axis=0).astype(np.float32)
-            raw_ksc = np.stack(all_cf[start:processed_total], axis=0).astype(np.float32)
+            raw_kxy = np.stack(all_xy[start:sampled_total], axis=0).astype(np.float32)
+            raw_ksc = np.stack(all_cf[start:sampled_total], axis=0).astype(np.float32)
             last_xy = raw_kxy[-1:, :, :]
             last_sc = raw_ksc[-1:, :]
             raw_kxy = np.concatenate([raw_kxy, np.repeat(last_xy, pad_n, axis=0)], axis=0)
@@ -803,9 +840,9 @@ def stream_infer_and_display(
         window = make_window_annotation(int(start))
         if window is None:
             # Window is either not ready yet, or it was dropped (empty / too short)
-            if cap_done and (not pad_tail) and int(processed_total) < int(start) + int(clip_len):
+            if cap_done and (not pad_tail) and int(sampled_total) < int(start) + int(clip_len):
                 skipped_windows.add(int(start))
-            if drop_empty_windows and int(processed_total) >= int(start) + int(clip_len):
+            if drop_empty_windows and int(sampled_total) >= int(start) + int(clip_len):
                 skipped_windows.add(int(start))
             return None
 
@@ -824,18 +861,18 @@ def stream_infer_and_display(
                 continue
 
             if not cap_done:
-                if int(processed_total) >= int(next_win_start) + int(clip_len):
+                if int(sampled_total) >= int(next_win_start) + int(clip_len):
                     compute_window_pred(int(next_win_start), writer=writer)
                     next_win_start = int(next_win_start) + int(win_step)
                     continue
                 break
 
             # cap_done
-            if int(processed_total) >= int(next_win_start) + int(clip_len):
+            if int(sampled_total) >= int(next_win_start) + int(clip_len):
                 compute_window_pred(int(next_win_start), writer=writer)
                 next_win_start = int(next_win_start) + int(win_step)
                 continue
-            if pad_tail and int(next_win_start) < int(processed_total):
+            if pad_tail and int(next_win_start) < int(sampled_total):
                 compute_window_pred(int(next_win_start), writer=writer)
                 next_win_start = int(next_win_start) + int(win_step)
                 continue
@@ -844,7 +881,8 @@ def stream_infer_and_display(
     def get_pred_for_frame(frame_idx: int) -> Optional[dict]:
         if frame_idx < 0:
             return None
-        ws = (int(frame_idx) // int(win_step)) * int(win_step)
+        sample_idx = int(frame_idx) // int(frame_step)
+        ws = (int(sample_idx) // int(win_step)) * int(win_step)
         pred = window_preds.get(int(ws))
         if pred is not None:
             return pred
@@ -864,7 +902,7 @@ def stream_infer_and_display(
             write_header(writer)
 
             # Warm up: read enough frames to make the FIRST window prediction (if possible), then start display.
-            while int(processed_total) < int(clip_len) and not cap_done:
+            while int(sampled_total) < int(clip_len) and not cap_done:
                 process_next_frame()
             if int(processed_total) <= 0:
                 raise RuntimeError("Video had 0 frames.")
@@ -891,8 +929,9 @@ def stream_infer_and_display(
 
                 t_frame0 = time.perf_counter()
 
-                target_processed = int(display_idx) + int(clip_len) + 1
-                while (not cap_done) and int(processed_total) < int(target_processed):
+                display_sample_idx = int(display_idx) // int(frame_step)
+                target_sampled = int(display_sample_idx) + int(clip_len) + 1
+                while (not cap_done) and int(sampled_total) < int(target_sampled):
                     process_next_frame()
 
                 compute_ready_windows(writer=writer)
@@ -900,9 +939,9 @@ def stream_infer_and_display(
                 if not frames_buf:
                     continue
 
-                win_start = (int(display_idx) // int(win_step)) * int(win_step)
+                win_start = (int(display_sample_idx) // int(win_step)) * int(win_step)
                 if win_start not in window_preds and win_start not in skipped_windows:
-                    while (not cap_done) and int(processed_total) < int(win_start) + int(clip_len):
+                    while (not cap_done) and int(sampled_total) < int(win_start) + int(clip_len):
                         process_next_frame()
                         compute_ready_windows(writer=writer)
                     compute_window_pred(int(win_start), writer=writer)
@@ -920,21 +959,17 @@ def stream_infer_and_display(
                     draw_skeleton=True,
                 )
 
-                t_now = time.perf_counter()
-                dt = max(1e-6, float(t_now - t_prev))
-                inst_fps = 1.0 / dt
-                fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
-                t_prev = t_now
-
                 frame_info = f"frame {int(display_idx) + 1}"
                 if int(frame_count) > 0:
                     frame_info += f"/{int(frame_count)}"
 
                 win_id = int(win_start) // max(1, int(win_step))
+                win_start_raw = int(win_start) * int(frame_step)
+                fps_for_hud = float(fps_ema) if fps_ema is not None else float(fps_target)
                 hud = [
                     frame_info,
-                    f"fps: {float(fps_ema):.1f} (target {float(fps_target):.1f})",
-                    f"window {win_id} (start={win_start})",
+                    f"fps: {float(fps_for_hud):.1f} (target {float(fps_target):.1f})",
+                    f"window {win_id} (sample_start={win_start}, raw_start={win_start_raw})",
                 ]
                 if pred is not None:
                     hud.append(f"pred: {pred['pred_name']} ({float(pred['pred_conf']):.2f})")
@@ -942,7 +977,10 @@ def stream_infer_and_display(
                     hud.append(f"win: {int(pred['start_frame'])}-{int(pred['end_frame'])}")
                 else:
                     hud.append("pred: ... (warming up)")
-                    hud.append(f"T={int(clip_len)} stride={int(win_step)}")
+                hud.append(
+                    f"T={int(clip_len)} stride={int(win_step)} sampled "
+                    f"(raw T/stride={int(clip_len_raw)}/{int(win_step_raw)}, k={int(frame_step)})"
+                )
 
                 frame = draw_hud(frame, hud)
 
@@ -968,6 +1006,13 @@ def stream_infer_and_display(
                 cf_buf.popleft()
                 display_idx += 1
 
+                # Effective display FPS (includes processing + waitKey pacing).
+                t_now = time.perf_counter()
+                dt = max(1e-6, float(t_now - t_prev))
+                inst_fps = 1.0 / dt
+                fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+                t_prev = t_now
+
             if (not user_exit) and cap_done:
                 while True:
                     before = int(next_win_start)
@@ -983,9 +1028,14 @@ def stream_infer_and_display(
     if img_shape is None:
         raise RuntimeError("No frames read from video.")
 
-    # Build and save MotionBERT action pkl from the frames we processed.
-    kpts_xy = np.stack(all_xy, axis=0)  # (T,17,2)
-    kpts_conf = np.stack(all_cf, axis=0)  # (T,17)
+    if not all_xy or not all_cf:
+        raise RuntimeError(
+            "No sampled frames were generated. Reduce --k/--frame-step or ensure the video has readable frames."
+        )
+
+    # Build and save MotionBERT action pkl from sampled frames only.
+    kpts_xy = np.stack(all_xy, axis=0)  # (T_sampled,17,2)
+    kpts_conf = np.stack(all_cf, axis=0)  # (T_sampled,17)
     split_list, annotations = build_windows(
         kpts_xy=kpts_xy,
         kpts_conf=kpts_conf,
@@ -1028,8 +1078,28 @@ def main() -> int:
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--conf-thres", type=float, default=0.25)
-    ap.add_argument("--win-len", type=int, default=None, help="Window length (defaults to config.clip_len)")
-    ap.add_argument("--win-step", type=int, default=16)
+    ap.add_argument(
+        "--win-len",
+        type=int,
+        default=None,
+        help="Raw-frame window length (defaults to config.clip_len, then scaled by --k/--frame-step).",
+    )
+    ap.add_argument(
+        "--win-step",
+        type=int,
+        default=16,
+        help="Raw-frame window stride (scaled by --k/--frame-step for sampled inference).",
+    )
+    ap.add_argument(
+        "--frame-step",
+        "--k",
+        type=int,
+        default=1,
+        help=(
+            "Run YOLO pose every k raw frames (k>=1). "
+            "Window length/stride are defined in raw frames and scaled to sampled frames using ceil division."
+        ),
+    )
     ap.add_argument("--pad-tail", action="store_true")
     ap.add_argument("--missing-conf-thres", type=float, default=0.0)
     ap.add_argument("--keep-empty-windows", action="store_true", default=False)
@@ -1057,7 +1127,27 @@ def main() -> int:
     yolo_path = resolve_path(args.yolo_weights, desc="YOLO weights")
 
     cfg = get_config(str(cfg_path))
-    clip_len = int(args.win_len) if args.win_len is not None else int(getattr(cfg, "clip_len", 64))
+    clip_len_raw = int(args.win_len) if args.win_len is not None else int(getattr(cfg, "clip_len", 64))
+    win_step_raw = max(1, int(args.win_step))
+    frame_step = int(args.frame_step)
+    if int(frame_step) <= 0:
+        raise ValueError("--frame-step/--k must be >= 1.")
+    if int(clip_len_raw) <= 0:
+        raise ValueError(f"Invalid window length: {clip_len_raw}.")
+
+    clip_len = max(1, int(ceil_div_pos(int(clip_len_raw), int(frame_step))))
+    win_step = max(1, int(ceil_div_pos(int(win_step_raw), int(frame_step))))
+    if int(frame_step) > 1 and (
+        (int(clip_len_raw) % int(frame_step)) != 0 or (int(win_step_raw) % int(frame_step)) != 0
+    ):
+        print(
+            f"[window][WARN] raw clip_len/win_step ({int(clip_len_raw)}/{int(win_step_raw)}) "
+            f"are not divisible by frame_step={int(frame_step)}; using ceil division for sampled windows."
+        )
+    print(
+        f"[window] raw clip_len/win_step={int(clip_len_raw)}/{int(win_step_raw)} "
+        f"-> sampled clip_len/win_step={int(clip_len)}/{int(win_step)} (k={int(frame_step)})"
+    )
 
     save_path: Optional[Path] = None
     if args.save:
@@ -1080,6 +1170,10 @@ def main() -> int:
             yolo_path=yolo_path,
             device=device,
             clip_len=clip_len,
+            win_step=win_step,
+            frame_step=frame_step,
+            clip_len_raw=clip_len_raw,
+            win_step_raw=win_step_raw,
             save_path=save_path,
             args=args,
         )
@@ -1097,6 +1191,7 @@ def main() -> int:
     frames_cf: List[np.ndarray] = []
     img_shape = None
     frame_idx = 0
+    sampled_idx = 0
 
     while True:
         ok, frame = cap.read()
@@ -1107,33 +1202,36 @@ def main() -> int:
             h, w = frame.shape[:2]
             img_shape = (int(h), int(w))
 
-        results = pose_model.predict(
-            source=frame,
-            imgsz=int(args.imgsz),
-            conf=float(args.conf_thres),
-            verbose=False,
-            device=device,
-        )
+        do_pose = (int(frame_idx) % int(frame_step)) == 0
+        if do_pose:
+            results = pose_model.predict(
+                source=frame,
+                imgsz=int(args.imgsz),
+                conf=float(args.conf_thres),
+                verbose=False,
+                device=device,
+            )
 
-        kpts_xy = np.zeros((17, 2), dtype=np.float32)
-        kpts_conf = np.zeros((17,), dtype=np.float32)
+            kpts_xy = np.zeros((17, 2), dtype=np.float32)
+            kpts_conf = np.zeros((17,), dtype=np.float32)
 
-        if results and len(results) > 0 and results[0].keypoints is not None:
-            kpts = results[0].keypoints
-            xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
-            cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
+            if results and len(results) > 0 and results[0].keypoints is not None:
+                kpts = results[0].keypoints
+                xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
+                cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
 
-            if xy_all.ndim == 3 and xy_all.shape[0] > 0:
-                scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
-                best = int(np.argmax(scores)) if scores is not None else 0
-                kpts_xy = xy_all[best].astype(np.float32)
-                if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
-                    kpts_conf = cf_all[best].astype(np.float32)
-                else:
-                    kpts_conf = np.ones((17,), dtype=np.float32)
+                if xy_all.ndim == 3 and xy_all.shape[0] > 0:
+                    scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
+                    best = int(np.argmax(scores)) if scores is not None else 0
+                    kpts_xy = xy_all[best].astype(np.float32)
+                    if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
+                        kpts_conf = cf_all[best].astype(np.float32)
+                    else:
+                        kpts_conf = np.ones((17,), dtype=np.float32)
 
-        frames_xy.append(kpts_xy)
-        frames_cf.append(kpts_conf)
+            frames_xy.append(kpts_xy)
+            frames_cf.append(kpts_conf)
+            sampled_idx += 1
 
         frame_idx += 1
         if args.limit_frames is not None and frame_idx >= int(args.limit_frames):
@@ -1143,9 +1241,11 @@ def main() -> int:
 
     if img_shape is None:
         raise RuntimeError("No frames read from video.")
+    if sampled_idx <= 0:
+        raise RuntimeError("No sampled frames were generated. Reduce --k/--frame-step or remove --limit-frames.")
 
-    kpts_xy = np.stack(frames_xy, axis=0)  # (T,17,2)
-    kpts_conf = np.stack(frames_cf, axis=0)  # (T,17)
+    kpts_xy = np.stack(frames_xy, axis=0)  # (T_sampled,17,2)
+    kpts_conf = np.stack(frames_cf, axis=0)  # (T_sampled,17)
 
     # ------------------------------------------------------------------
     # 2) Build and save MotionBERT action pkl
@@ -1154,8 +1254,8 @@ def main() -> int:
         kpts_xy=kpts_xy,
         kpts_conf=kpts_conf,
         img_shape=img_shape,
-        win_len=clip_len,
-        win_step=int(args.win_step),
+        win_len=int(clip_len),
+        win_step=int(win_step),
         pad_tail=bool(args.pad_tail),
         missing_conf_thres=float(args.missing_conf_thres),
         drop_empty_windows=not bool(args.keep_empty_windows),
@@ -1280,6 +1380,7 @@ def main() -> int:
         class_names_out=class_names_out,
         unmerged_len_expected=unmerged_len_expected,
         merged_len_expected=merged_len_expected,
+        frame_step=frame_step,
     )
 
     with out_csv.open("w", newline="", encoding="utf-8") as f:
