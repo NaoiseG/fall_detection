@@ -101,6 +101,14 @@ def _slug(s: str, max_len: int = 120) -> str:
     return s[:max_len]
 
 
+def _ceil_div_pos(a: int, b: int) -> int:
+    a_i = int(a)
+    b_i = int(b)
+    if b_i <= 0:
+        raise ValueError(f"Expected positive divisor, got {b_i}")
+    return max(1, (a_i + b_i - 1) // b_i)
+
+
 def _parse_subjects(spec: str) -> List[int]:
     """
     Parse subject list specs like:
@@ -724,6 +732,12 @@ def main() -> None:
     parser.add_argument("--out-dir", type=str, default="eval_outputs", help="Base output directory (timestamped subfolder created).")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64).")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader num_workers (default: 0).")
+    parser.add_argument(
+        "--frame-step", "--k",
+        type=int,
+        default=1,
+        help="Use every k-th temporal sample for evaluation (k>=1). clip_len is interpreted in raw frames and scaled to sampled frames.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device string (cuda, cuda:0, cpu).")
     parser.add_argument("--print-freq", type=int, default=100, help="Print progress every N batches (default: 100).")
 
@@ -783,6 +797,9 @@ def main() -> None:
     parser.add_argument("--split-base", type=str, default=None, help="Override base split name (default: config data_split, e.g. xsub).")
 
     args_cli = parser.parse_args()
+    frame_step = int(args_cli.frame_step)
+    if frame_step <= 0:
+        raise SystemExit("--frame-step/--k must be >= 1.")
 
     # Make MotionBERT imports work when script is at repo root.
     repo_root = Path(__file__).resolve().parent
@@ -808,9 +825,21 @@ def main() -> None:
     if base_split is None:
         raise RuntimeError("Config missing 'data_split' (expected e.g. 'xsub').")
 
-    clip_len = int(getattr(cfg, "clip_len", 0))
-    if clip_len <= 0:
+    clip_len_raw = int(getattr(cfg, "clip_len", 0))
+    if clip_len_raw <= 0:
         raise RuntimeError("Config missing/invalid 'clip_len'.")
+    clip_len_eval = int(clip_len_raw)
+    if frame_step > 1:
+        clip_len_eval = _ceil_div_pos(clip_len_raw, frame_step)
+        if (clip_len_raw % frame_step) != 0:
+            print(
+                f"[window][WARN] raw clip_len={clip_len_raw} is not divisible by k={frame_step}; using ceil division.",
+                flush=True,
+            )
+    print(
+        f"[window] raw clip_len={clip_len_raw} -> sampled clip_len={clip_len_eval} (k={frame_step})",
+        flush=True,
+    )
 
     action_classes = int(getattr(cfg, "action_classes", 0))
     if action_classes <= 1:
@@ -861,7 +890,7 @@ def main() -> None:
     ds_kwargs = dict(
         data_path=str(fr.filtered_pkl_path),
         data_split=fr.split_key,
-        n_frames=clip_len,
+        n_frames=clip_len_eval,
         random_move=False,
     )
     if scale_range_test is not None:
@@ -1055,6 +1084,9 @@ def main() -> None:
         "device": str(device),
         "batch_size": int(args_cli.batch_size),
         "num_workers": int(args_cli.num_workers),
+        "frame_step": int(frame_step),
+        "clip_len_raw": int(clip_len_raw),
+        "clip_len_sampled": int(clip_len_eval),
     }
 
     extra_html = ""

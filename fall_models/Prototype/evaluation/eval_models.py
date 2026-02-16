@@ -70,6 +70,7 @@ import re
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -224,6 +225,64 @@ def parse_range(r: str) -> List[int]:
     a, b = r.split("-")
     a, b = int(a), int(b)
     return list(range(a, b + 1))
+
+
+def _ceil_div_pos(a: int, b: int) -> int:
+    a_i = int(a)
+    b_i = int(b)
+    if b_i <= 0:
+        raise ValueError(f"Expected positive divisor, got {b_i}")
+    return max(1, (a_i + b_i - 1) // b_i)
+
+
+def _write_frame_step_npz(src_npz: Path, dst_npz: Path, frame_step: int) -> None:
+    frame_step = int(frame_step)
+    if frame_step <= 1:
+        raise ValueError("frame_step must be >= 2 for subsampled NPZ export.")
+
+    with np.load(src_npz, allow_pickle=True) as data:
+        if "frame_labels" not in data:
+            raise KeyError(f"Missing key 'frame_labels' in {src_npz.as_posix()}")
+        n_frames = int(np.asarray(data["frame_labels"]).shape[0])
+        if n_frames <= 0:
+            raise ValueError(f"No frames in {src_npz.as_posix()}")
+
+        out = {}
+        for key in data.files:
+            arr = data[key]
+            if isinstance(arr, np.ndarray) and arr.ndim >= 1 and int(arr.shape[0]) == n_frames:
+                out[key] = arr[::frame_step]
+            else:
+                out[key] = arr
+
+    for req in ("kpts_xy", "kpts_conf", "frame_labels"):
+        if req not in out:
+            raise KeyError(f"Missing required key '{req}' in subsampled NPZ derived from {src_npz.as_posix()}")
+
+    dst_npz.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(dst_npz, **out)
+
+
+def _materialize_frame_step_npzs(
+    npz_paths: List[Path],
+    frame_step: int,
+    cache_dir: Path,
+    cache: Dict[str, Path],
+) -> List[Path]:
+    if int(frame_step) <= 1:
+        return [Path(p) for p in npz_paths]
+
+    out_paths: List[Path] = []
+    for p in npz_paths:
+        src = Path(p).resolve()
+        key = src.as_posix()
+        if key not in cache:
+            safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", src.stem)
+            dst = cache_dir / f"{len(cache):06d}_{safe_stem}.npz"
+            _write_frame_step_npz(src_npz=src, dst_npz=dst, frame_step=int(frame_step))
+            cache[key] = dst
+        out_paths.append(cache[key])
+    return out_paths
 
 
 def count_params_m(model: torch.nn.Module) -> float:
@@ -754,6 +813,12 @@ def main():
     parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
     parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
     parser.add_argument(
+        "--frame-step", "--k",
+        type=int,
+        default=1,
+        help="Subsample NPZ frames by k before windowing (k>=1). Window T/stride are interpreted in raw frames and scaled to sampled frames.",
+    )
+    parser.add_argument(
         "--label-mode",
         type=str,
         default="center",
@@ -774,6 +839,9 @@ def main():
         help="If 1, only drop ambiguous windows that contain no fall frames (helps preserve fall transitions).",
     )
     args = parser.parse_args()
+    frame_step = int(args.frame_step)
+    if frame_step <= 0:
+        raise SystemExit("--frame-step/--k must be >= 1.")
 
     normalize_cli = bool(args.normalize)
     add_vel_cli = bool(args.add_vel)
@@ -801,7 +869,7 @@ def main():
 
     # Load test set using the SAME NPZ->windows pipeline
     OUTPUT_ROOT = Path(args.npz_root)
-    test_npzs = find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=test_subjects)
+    test_npzs = [Path(p) for p in find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=test_subjects)]
     if not test_npzs:
         raise RuntimeError("No test NPZs found. Check OUTPUT_ROOT, camera, and test subjects.")
 
@@ -828,6 +896,19 @@ def main():
     ensure_dir(plots_dir)
 
     print("Eval output dir:", out_dir.as_posix())
+
+    npz_subsample_cache: Dict[str, Path] = {}
+    npz_subsample_ctx = None
+    if frame_step > 1:
+        npz_subsample_ctx = tempfile.TemporaryDirectory(prefix=f"eval_models_k{frame_step}_")
+        npz_cache_dir = Path(npz_subsample_ctx.name)
+        test_npzs = _materialize_frame_step_npzs(
+            npz_paths=test_npzs,
+            frame_step=frame_step,
+            cache_dir=npz_cache_dir,
+            cache=npz_subsample_cache,
+        )
+        print(f"[window] --frame-step={frame_step}: using subsampled NPZ cache at {npz_cache_dir.as_posix()}")
 
     summary_rows: List[Dict[str, object]] = []
     overall_rows: List[Dict[str, object]] = []
@@ -888,8 +969,8 @@ def main():
             rp_center_mode_ckpt = str(ckpt.get("rp_center_mode", args.rp_center_mode))
             rp_img_w_ckpt = ckpt.get("rp_img_w", args.rp_img_w)
             rp_img_h_ckpt = ckpt.get("rp_img_h", args.rp_img_h)
-            T_ckpt = int(ckpt.get("T", ckpt.get("T_used", args.T)))
-            stride_ckpt = int(ckpt.get("stride", args.stride))
+            T_ckpt_raw = int(ckpt.get("T", ckpt.get("T_used", args.T)))
+            stride_ckpt_raw = int(ckpt.get("stride", args.stride))
 
             fall_pct_ckpt = float(ckpt.get("fall_pct", args.fall_pct))
             label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
@@ -919,8 +1000,8 @@ def main():
             rp_center_mode_ckpt = str(ckpt.get("rp_center_mode", args.rp_center_mode))
             rp_img_w_ckpt = ckpt.get("rp_img_w", args.rp_img_w)
             rp_img_h_ckpt = ckpt.get("rp_img_h", args.rp_img_h)
-            T_ckpt = int(ckpt.get("T", ckpt.get("T_used", args.T)))  # support both keys
-            stride_ckpt = int(ckpt.get("stride", args.stride))
+            T_ckpt_raw = int(ckpt.get("T", ckpt.get("T_used", args.T)))  # support both keys
+            stride_ckpt_raw = int(ckpt.get("stride", args.stride))
 
             fall_pct_ckpt = float(ckpt.get("fall_pct", args.fall_pct))
             label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
@@ -950,8 +1031,8 @@ def main():
             rp_center_mode_ckpt = str(args.rp_center_mode)
             rp_img_w_ckpt = args.rp_img_w
             rp_img_h_ckpt = args.rp_img_h
-            T_ckpt = int(args.T)
-            stride_ckpt = int(args.stride)
+            T_ckpt_raw = int(args.T)
+            stride_ckpt_raw = int(args.stride)
 
             fall_pct_ckpt = float(args.fall_pct)
             label_mode_ckpt = str(args.label_mode)
@@ -960,6 +1041,24 @@ def main():
             drop_ambig_share_ckpt = float(args.drop_ambig_share)
             drop_ambig_nonfall_only_ckpt = bool(args.drop_ambig_nonfall_only)
             node_features_ckpt = None
+
+        T_ckpt_raw = max(1, int(T_ckpt_raw))
+        stride_ckpt_raw = max(1, int(stride_ckpt_raw))
+        T_ckpt = int(T_ckpt_raw)
+        stride_ckpt = int(stride_ckpt_raw)
+        if frame_step > 1:
+            T_ckpt = _ceil_div_pos(T_ckpt_raw, frame_step)
+            stride_ckpt = _ceil_div_pos(stride_ckpt_raw, frame_step)
+            if (T_ckpt_raw % frame_step) != 0 or (stride_ckpt_raw % frame_step) != 0:
+                print(
+                    f"[{m}][window][WARN] raw T/stride ({T_ckpt_raw}/{stride_ckpt_raw}) not divisible by k={frame_step}; "
+                    "using ceil division."
+                )
+        print(f"[{m}][window] raw T/stride={T_ckpt_raw}/{stride_ckpt_raw} -> sampled T/stride={T_ckpt}/{stride_ckpt} (k={frame_step})")
+
+        if str(m).lower().strip() == "mlp" and frame_step > 1:
+            print("[mlp][WARN] --frame-step/--k > 1 changes T and is incompatible with fixed-size MLP input. Skipping model.")
+            continue
 
         # For hybrid window labelling
         extra = {}
@@ -1129,9 +1228,16 @@ def main():
                 thr = float(args.threshold)
             elif args.tune_subjects is not None:
                 tune_subjects = parse_range(args.tune_subjects)
-                tune_npzs = find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=tune_subjects)
+                tune_npzs = [Path(p) for p in find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=tune_subjects)]
                 if not tune_npzs:
                     raise RuntimeError("No tune NPZs found. Check OUTPUT_ROOT, camera, and tune subjects.")
+                if frame_step > 1:
+                    tune_npzs = _materialize_frame_step_npzs(
+                        npz_paths=tune_npzs,
+                        frame_step=frame_step,
+                        cache_dir=npz_cache_dir,
+                        cache=npz_subsample_cache,
+                    )
 
                 X_tune, y_tune_tags, _ = load_windows_from_npzs(
                     tune_npzs,
@@ -1232,7 +1338,15 @@ def main():
             "weights": ckpt_path.as_posix(),
             "camera": int(args.camera),
             "subjects": ",".join(str(s) for s in test_subjects),
+            "frame_step": int(frame_step),
+            "window_T_raw": int(T_ckpt_raw),
+            "window_stride_raw": int(stride_ckpt_raw),
+            "window_T_sampled": int(T_ckpt),
+            "window_stride_sampled": int(stride_ckpt),
         })
+
+    if not summary_rows:
+        raise RuntimeError("No models were evaluated. Check --models/--all and --frame-step compatibility.")
 
     summary_df = pd.DataFrame(summary_rows).sort_values("macro_f1", ascending=False).reset_index(drop=True)
     f1_long = pd.DataFrame(f1_rows).sort_values(["model", "class_id"]).reset_index(drop=True)

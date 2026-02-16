@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
+import platform
 import re
 import shutil
 import subprocess
@@ -357,6 +359,18 @@ class HardwareSampler:
         # Preferred backend: jtop (jetson-stats)
         try:
             from jtop import jtop  # type: ignore
+            from jtop.core import hardware as jtop_hardware  # type: ignore
+
+            # Some old jetson-stats builds call platform.linux_distribution(), removed in Python 3.8+.
+            try:
+                src = inspect.getsource(jtop_hardware.get_platform_variables)
+                if ("linux_distribution" in src) and (not hasattr(platform, "linux_distribution")):
+                    raise RuntimeError(
+                        "Installed jetson-stats/jtop is incompatible with this Python version; falling back."
+                    )
+            except OSError:
+                # Source may be unavailable in some installations; continue and try runtime start.
+                pass
 
             self._jtop_obj = jtop()
             self._jtop_obj.start()
@@ -364,8 +378,9 @@ class HardwareSampler:
             self._thread = threading.Thread(target=self._run_jtop, name="hw-jtop", daemon=True)
             self._thread.start()
             return self.backend
-        except Exception:
+        except Exception as e:
             self._jtop_obj = None
+            print(f"[profile][WARN] jtop unavailable/incompatible: {e}")
 
         # Fallback backend: tegrastats
         if shutil.which("tegrastats") is not None:
@@ -438,14 +453,34 @@ class HardwareSampler:
             return dict(self.samples[-1])
 
     def _append_sample(self, sample: Dict[str, Any]) -> None:
+        ram_pct = _safe_float(sample.get("ram_used_pct", float("nan")))
+        cpu_pct = _safe_float(sample.get("cpu_pct", float("nan")))
+        gpu_pct = _safe_float(sample.get("gpu_pct", float("nan")))
+        cpu_temp = _safe_float(sample.get("cpu_temp_c", float("nan")))
+        gpu_temp = _safe_float(sample.get("gpu_temp_c", float("nan")))
+        power_w = _safe_float(sample.get("power_w", float("nan")))
+
+        if not (0.0 <= ram_pct <= 100.0):
+            ram_pct = float("nan")
+        if not (0.0 <= cpu_pct <= 100.0):
+            cpu_pct = float("nan")
+        if not (0.0 <= gpu_pct <= 100.0):
+            gpu_pct = float("nan")
+        if not (-20.0 <= cpu_temp <= 150.0):
+            cpu_temp = float("nan")
+        if not (-20.0 <= gpu_temp <= 150.0):
+            gpu_temp = float("nan")
+        if not (0.0 <= power_w <= 200.0):
+            power_w = float("nan")
+
         row = {
             "t_s": float(time.perf_counter() - self._start_t),
-            "ram_used_pct": sample.get("ram_used_pct", float("nan")),
-            "cpu_pct": sample.get("cpu_pct", float("nan")),
-            "gpu_pct": sample.get("gpu_pct", float("nan")),
-            "cpu_temp_c": sample.get("cpu_temp_c", float("nan")),
-            "gpu_temp_c": sample.get("gpu_temp_c", float("nan")),
-            "power_w": sample.get("power_w", float("nan")),
+            "ram_used_pct": ram_pct,
+            "cpu_pct": cpu_pct,
+            "gpu_pct": gpu_pct,
+            "cpu_temp_c": cpu_temp,
+            "gpu_temp_c": gpu_temp,
+            "power_w": power_w,
             "backend": self.backend,
         }
         with self._lock:
@@ -591,12 +626,21 @@ class HardwareSampler:
                 cpu_vals = [_extract_numeric_from_obj(stats[k]) for k in cpu_keys]
                 out["cpu_pct"] = _avg_valid(cpu_vals)
 
-            # GPU (%)
-            gpu_candidates = []
+            # GPU (%): only accept percentage-like values (0..100) to avoid MHz clocks.
+            gpu_candidates: List[float] = []
             for k, v in stats.items():
                 k_l = str(k).lower()
                 if "gpu" in k_l or "gr3d" in k_l:
-                    gpu_candidates.append(_extract_numeric_from_obj(v))
+                    keyed = _collect_keyed_numeric(v, prefix=k_l)
+                    pct_from_keys = _pick_pct_from_keyed(
+                        keyed,
+                        tokens_any=("load", "usage", "util", "percent", "perc", "gr3d", "gpu"),
+                    )
+                    if np.isfinite(pct_from_keys):
+                        gpu_candidates.append(float(pct_from_keys))
+                    scalar = _extract_numeric_from_obj(v)
+                    if np.isfinite(scalar) and 0.0 <= float(scalar) <= 100.0:
+                        gpu_candidates.append(float(scalar))
             out["gpu_pct"] = _avg_valid(gpu_candidates)
 
             # Temperatures.
@@ -674,6 +718,10 @@ class HardwareSampler:
         if not np.isfinite(out["gpu_pct"]) and stats:
             keyed = _collect_keyed_numeric(stats, prefix="stats")
             out["gpu_pct"] = _pick_pct_from_keyed(keyed, tokens_any=("gr3d", "gpu"))
+
+        # Guardrail: utilisation cannot be outside 0..100%.
+        if np.isfinite(out["gpu_pct"]) and not (0.0 <= float(out["gpu_pct"]) <= 100.0):
+            out["gpu_pct"] = float("nan")
 
         return out
 
@@ -1528,6 +1576,12 @@ def main() -> int:
     ap.add_argument("--T", type=int, default=0, help="0 => use ckpt T_used/T, else override")
     ap.add_argument("--stride", type=int, default=0, help="0 => use ckpt stride, else override")
     ap.add_argument(
+        "--frame-step", "--k",
+        type=int,
+        default=1,
+        help="Run YOLO pose every k raw frames (k>=1). Window T/stride are defined in raw frames and scaled to sampled frames.",
+    )
+    ap.add_argument(
         "--normalize-mode",
         type=str,
         default=None,
@@ -1582,6 +1636,9 @@ def main() -> int:
     ap.add_argument("--hw-sample-hz", type=float, default=1.0, help="Hardware metrics sample rate (Hz).")
     ap.add_argument("--no-display", type=int, default=0, help="Run headless: skip imshow/waitKey (0/1).")
     args = ap.parse_args()
+    frame_step = int(args.frame_step)
+    if int(frame_step) <= 0:
+        raise ValueError("--frame-step must be >= 1.")
 
     video_path = Path(args.video).expanduser()
     if not video_path.exists():
@@ -1637,10 +1694,23 @@ def main() -> int:
         state = clean_state_dict(state)
 
     # Preproc config (prefer checkpoint meta)
-    T_final = int(args.T) if int(args.T) > 0 else int(meta.get("T", meta.get("T_used", 64)) or 64)
-    stride_final = int(args.stride) if int(args.stride) > 0 else int(meta.get("stride", 16) or 16)
-    T_final = max(1, int(T_final))
-    stride_final = max(1, int(stride_final))
+    T_raw = int(args.T) if int(args.T) > 0 else int(meta.get("T", meta.get("T_used", 64)) or 64)
+    stride_raw = int(args.stride) if int(args.stride) > 0 else int(meta.get("stride", 16) or 16)
+    T_raw = max(1, int(T_raw))
+    stride_raw = max(1, int(stride_raw))
+
+    # Keep temporal coverage roughly constant when only every k-th raw frame is sampled.
+    T_final = max(1, int((int(T_raw) + int(frame_step) - 1) // int(frame_step)))
+    stride_final = max(1, int((int(stride_raw) + int(frame_step) - 1) // int(frame_step)))
+    if int(frame_step) > 1 and ((int(T_raw) % int(frame_step)) != 0 or (int(stride_raw) % int(frame_step)) != 0):
+        print(
+            f"[window][WARN] raw T/stride ({int(T_raw)}/{int(stride_raw)}) are not divisible by frame_step={int(frame_step)}; "
+            "using ceil division for sampled windows."
+        )
+    print(
+        f"[window] raw T/stride={int(T_raw)}/{int(stride_raw)} "
+        f"-> sampled T/stride={int(T_final)}/{int(stride_final)} (frame_step={int(frame_step)})"
+    )
 
     use_conf = bool(meta.get("use_conf", True))
     normalize = bool(meta.get("normalize", True))
@@ -1753,15 +1823,20 @@ def main() -> int:
         frame_period_s = 1.0 / max(1e-6, float(fps_play))
 
         frames_buf: deque[np.ndarray] = deque()
-        xy_buf: deque[np.ndarray] = deque()
-        cf_buf: deque[np.ndarray] = deque()
+        draw_xy_buf: deque[np.ndarray] = deque()
+        draw_cf_buf: deque[np.ndarray] = deque()
         prep_ms_buf: deque[float] = deque()
         yolo_ms_buf: deque[float] = deque()
 
-        base_idx = 0        # absolute frame index of frames_buf[0]
-        display_idx = 0     # absolute frame index being displayed
-        processed_total = 0 # absolute count of frames processed by YOLO
+        sample_xy_seq: List[np.ndarray] = []
+        sample_cf_seq: List[np.ndarray] = []
+
+        display_idx = 0      # absolute raw frame index being displayed
+        processed_total = 0  # absolute raw frame count read from video
+        sampled_total = 0    # absolute sampled-frame count used by temporal model
         cap_done = False
+        last_xy = np.zeros((K, 2), dtype=np.float32)
+        last_cf = np.zeros((K,), dtype=np.float32)
 
         window_preds: Dict[int, Tuple[int, float, Optional[float]]] = {}
         window_stage_ms: Dict[int, Tuple[float, float]] = {}
@@ -1777,7 +1852,7 @@ def main() -> int:
             return (time.perf_counter() - profile_run_t0) >= profile_duration_s
 
         def process_next_frame() -> bool:
-            nonlocal processed_total, cap_done
+            nonlocal processed_total, sampled_total, cap_done, last_xy, last_cf
 
             cap_read_ms = 0.0
             if profile_enabled:
@@ -1789,26 +1864,36 @@ def main() -> int:
                 cap_done = True
                 return False
 
+            raw_idx = int(processed_total)
+            do_pose = (int(raw_idx) % int(frame_step)) == 0
             yolo_infer_ms = 0.0
-            if profile_enabled:
-                _maybe_cuda_sync(sync_cuda_timing)
-                t_yolo0 = time.perf_counter()
-            xy, cf = pose_on_frame(
-                pose_model=pose_model,
-                frame_bgr=frame,
-                imgsz=int(args.imgsz),
-                yolo_conf=float(args.yolo_conf),
-                device=device,
-                max_people=int(args.max_people),
-                use_half=use_half,
-            )
-            if profile_enabled:
-                _maybe_cuda_sync(sync_cuda_timing)
-                yolo_infer_ms = (time.perf_counter() - t_yolo0) * 1000.0
+            xy = last_xy
+            cf = last_cf
+            if do_pose:
+                if profile_enabled:
+                    _maybe_cuda_sync(sync_cuda_timing)
+                    t_yolo0 = time.perf_counter()
+                xy, cf = pose_on_frame(
+                    pose_model=pose_model,
+                    frame_bgr=frame,
+                    imgsz=int(args.imgsz),
+                    yolo_conf=float(args.yolo_conf),
+                    device=device,
+                    max_people=int(args.max_people),
+                    use_half=use_half,
+                )
+                if profile_enabled:
+                    _maybe_cuda_sync(sync_cuda_timing)
+                    yolo_infer_ms = (time.perf_counter() - t_yolo0) * 1000.0
+                sample_xy_seq.append(xy)
+                sample_cf_seq.append(cf)
+                sampled_total += 1
+                last_xy = xy
+                last_cf = cf
 
             frames_buf.append(frame)
-            xy_buf.append(xy)
-            cf_buf.append(cf)
+            draw_xy_buf.append(xy)
+            draw_cf_buf.append(cf)
             if profile_enabled:
                 prep_ms_buf.append(cap_read_ms)
                 yolo_ms_buf.append(yolo_infer_ms)
@@ -1818,28 +1903,25 @@ def main() -> int:
                 dt = time.perf_counter() - t_pose0
                 if frame_count > 0:
                     pct = 100.0 * float(processed_total) / float(frame_count)
-                    print(f"[pose] {processed_total}/{frame_count} ({pct:.1f}%) | {dt:.1f}s")
+                    print(f"[pose] raw={processed_total}/{frame_count} ({pct:.1f}%) sampled={sampled_total} | {dt:.1f}s")
                 else:
-                    print(f"[pose] {processed_total} frames | {dt:.1f}s")
+                    print(f"[pose] raw={processed_total} sampled={sampled_total} | {dt:.1f}s")
 
             return True
 
         def compute_window_pred(start: int) -> Tuple[int, float, Optional[float]]:
             if start in window_preds:
                 return window_preds[start]
-            if start < base_idx:
-                raise RuntimeError(f"Cannot compute window {start}: frames already dropped (base_idx={base_idx}).")
-            if start >= processed_total:
-                raise RuntimeError(f"Cannot compute window {start}: frame not processed yet (processed_total={processed_total}).")
+            if start >= sampled_total:
+                raise RuntimeError(f"Cannot compute window {start}: sampled frame not processed yet (sampled_total={sampled_total}).")
 
-            off = int(start - base_idx)
-            avail = int(processed_total - start)
+            avail = int(sampled_total - start)
             L = int(min(int(T_final), max(0, avail)))
             if L <= 0:
-                raise RuntimeError(f"Window start {start} has no available frames (processed_total={processed_total}).")
+                raise RuntimeError(f"Window start {start} has no available sampled frames (sampled_total={sampled_total}).")
 
-            xy_seq = np.stack([xy_buf[off + i] for i in range(L)], axis=0)
-            conf_seq = np.stack([cf_buf[off + i] for i in range(L)], axis=0)
+            xy_seq = np.stack(sample_xy_seq[int(start): int(start) + int(L)], axis=0)
+            conf_seq = np.stack(sample_cf_seq[int(start): int(start) + int(L)], axis=0)
 
             win_feat_ms = 0.0
             if profile_enabled:
@@ -1922,13 +2004,13 @@ def main() -> int:
                     continue
 
                 if cap_done:
-                    if next_win_start >= processed_total:
+                    if next_win_start >= sampled_total:
                         break
                     compute_window_pred(int(next_win_start))
                     next_win_start += int(stride_final)
                     continue
 
-                if processed_total >= int(next_win_start) + int(T_final):
+                if sampled_total >= int(next_win_start) + int(T_final):
                     compute_window_pred(int(next_win_start))
                     next_win_start += int(stride_final)
                     continue
@@ -1936,7 +2018,7 @@ def main() -> int:
                 break
 
         # Warm up: read enough frames to make the first window prediction, then start display.
-        while processed_total < int(T_final) and not cap_done and not stop_due_profile_duration():
+        while sampled_total < int(T_final) and not cap_done and not stop_due_profile_duration():
             process_next_frame()
         if processed_total <= 0:
             raise RuntimeError("Video had 0 frames.")
@@ -1967,10 +2049,11 @@ def main() -> int:
                 break
 
             t_frame_start = time.perf_counter()
+            display_sample_idx = int(display_idx // max(1, int(frame_step)))
 
             # Keep a lead of ~T frames (plus 1) so we can predict the next window before it is displayed.
-            target_processed = int(display_idx) + int(T_final) + 1
-            while not cap_done and processed_total < target_processed and not stop_due_profile_duration():
+            target_sampled = int(display_sample_idx) + int(T_final) + 1
+            while not cap_done and sampled_total < target_sampled and not stop_due_profile_duration():
                 process_next_frame()
 
             compute_ready_windows()
@@ -1998,8 +2081,8 @@ def main() -> int:
                 profile_enabled
                 and not metrics_cutoff_active
                 and cap_done
-                and next_win_start >= processed_total
-                and (int(processed_total) - int(display_idx)) <= int(T_final)
+                and next_win_start >= sampled_total
+                and (int(sampled_total) - int(display_sample_idx)) <= int(T_final)
             ):
                 metrics_cutoff_active = True
                 metrics_cutoff_t_s = float(time.perf_counter() - profile_run_t0)
@@ -2016,10 +2099,10 @@ def main() -> int:
             if profile_enabled:
                 t_post_extra0 = time.perf_counter()
 
-            win_start = (int(display_idx) // int(stride_final)) * int(stride_final)
+            win_start = (int(display_sample_idx) // int(stride_final)) * int(stride_final)
             if win_start not in window_preds:
                 # If we're behind (slow device), wait until we can compute it, then continue.
-                while not cap_done and processed_total < int(win_start) + int(T_final) and not stop_due_profile_duration():
+                while not cap_done and sampled_total < int(win_start) + int(T_final) and not stop_due_profile_duration():
                     process_next_frame()
                     compute_ready_windows()
                 if win_start not in window_preds:
@@ -2029,8 +2112,8 @@ def main() -> int:
             label = class_names[pred] if 0 <= int(pred) < len(class_names) else "..."
 
             frame = frames_buf[0].copy()
-            xy = xy_buf[0]
-            cf = cf_buf[0]
+            xy = draw_xy_buf[0]
+            cf = draw_cf_buf[0]
 
             preprocess_ms = float(prep_ms_buf[0]) if profile_enabled and prep_ms_buf else 0.0
             yolo_infer_ms = float(yolo_ms_buf[0]) if profile_enabled and yolo_ms_buf else 0.0
@@ -2051,17 +2134,15 @@ def main() -> int:
             t_draw0 = time.perf_counter()
             frame = draw_pose(frame, xy, cf, conf_thres=conf_thres)
 
-            total_so_far_s = max(1e-6, time.perf_counter() - t_frame_start)
-            inst_fps_preview = 1.0 / total_so_far_s
-            fps_ema = inst_fps_preview if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps_preview
-
+            fps_for_hud = float(fps_ema) if fps_ema is not None else float(fps_play)
             win_id = int(win_start) // max(1, int(stride_final))
+            win_start_raw = int(win_start) * int(frame_step)
             hud = [
                 frame_info,
-                f"fps: {float(fps_ema):.1f} (target {float(fps_play):.1f})",
-                f"window {win_id} (start={win_start})",
+                f"fps: {float(fps_for_hud):.1f} (target {float(fps_play):.1f})",
+                f"window {win_id} (sample_start={win_start}, raw_start={win_start_raw})",
                 f"pred: {label} ({float(pconf):.2f})" if int(pred) >= 0 else "pred: ...",
-                f"T={int(T_final)} stride={int(stride_final)}",
+                f"T={int(T_final)} stride={int(stride_final)} sampled (k={int(frame_step)})",
             ]
             if p_fall is not None:
                 hud.append(f"fall_prob: {float(p_fall):.2f}")
@@ -2121,14 +2202,13 @@ def main() -> int:
             should_quit = (key in (ord("q"), 27))
 
             frames_buf.popleft()
-            xy_buf.popleft()
-            cf_buf.popleft()
+            draw_xy_buf.popleft()
+            draw_cf_buf.popleft()
             if profile_enabled:
                 if prep_ms_buf:
                     prep_ms_buf.popleft()
                 if yolo_ms_buf:
                     yolo_ms_buf.popleft()
-            base_idx += 1
             display_idx += 1
 
             if should_quit:
