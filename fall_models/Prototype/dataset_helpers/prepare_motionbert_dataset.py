@@ -28,7 +28,7 @@ Notes:
 - label_mode ("majority" or "center") is applied on the frame_labels inside each window slice.
 
 python .\dataset_helpers\prepare_motionbert_dataset.py --label-mode center --win-step 32 --train-subjects 1-12 \
-    --val-subjects 13-15 --outputs-npz-root ..\..\Datasets\UPFall_keypoints\outputs_npz\ --camera 1 \
+    --val-subjects 13-15 --outputs-npz-root ..\..\Datasets\UPFall_keypoints\outputs_npz\ --camera 1 2 \
     --out-pkl .\models\MotionBERT\data\action\upfall.pkl \
     --out-label-map .\models\MotionBERT\data\action\upfall_label_map.json
 """
@@ -56,21 +56,31 @@ except Exception:
 # NPZ discovery (mirrors your dataset.py)
 # ----------------------------
 
-def find_keypoints_npzs_subjects(output_root: Path, camera: int = 1, subjects=range(1, 6)) -> List[str]:
+def find_keypoints_npzs_subjects(
+    output_root: Path,
+    cameras: Sequence[int] = (1, 2),
+    subjects=range(1, 6),
+) -> List[str]:
     """
     Matches:
       Subject{s}/Activity*/Trial*/Subject{s}Activity*Trial*Camera{camera}/keypoints.npz
+    for each requested camera.
     """
+    if isinstance(cameras, (int, np.integer)):
+        cameras = [int(cameras)]
+    camera_ids = sorted(set(int(c) for c in cameras))
+
     npzs: List[str] = []
     for s in subjects:
         subj_root = output_root / f"Subject{s}"
         if not subj_root.exists():
             continue
 
-        pat = subj_root / "Activity*" / "Trial*" / f"Subject{s}Activity*Trial*Camera{camera}" / "keypoints.npz"
-        npzs.extend(glob.glob(str(pat), recursive=True))
+        for camera in camera_ids:
+            pat = subj_root / "Activity*" / "Trial*" / f"Subject{s}Activity*Trial*Camera{camera}" / "keypoints.npz"
+            npzs.extend(glob.glob(str(pat), recursive=True))
 
-    return sorted(npzs)
+    return sorted(set(npzs))
 
 
 # ----------------------------
@@ -717,7 +727,13 @@ def main():
     ap.add_argument("--outputs-npz-root", "--data-root", dest="data_root", type=str, required=True,
                     help="Root folder of outputs_npz, e.g. ../../Datasets/UPFall_keypoints/outputs_npz/ "
                          "(--data-root is a deprecated alias).")
-    ap.add_argument("--camera", type=int, required=True, help="Camera index, e.g. 1")
+    ap.add_argument(
+        "--camera",
+        nargs="+",
+        type=int,
+        default=[1, 2],
+        help="One or more camera indices, e.g. --camera 1 or --camera 1 2 (default: 1 2)",
+    )
     ap.add_argument("--train-subjects", type=str, required=True,
                     help="Train subject range like '1-12' (or '1-4,7,9-10')")
     ap.add_argument("--val-subjects", type=str, required=True,
@@ -760,6 +776,14 @@ def main():
     data_root = Path(args.data_root)
     train_subjects = parse_range_expr(args.train_subjects)
     val_subjects = parse_range_expr(args.val_subjects)
+    camera_ids = sorted(set(int(c) for c in args.camera))
+
+    if not camera_ids:
+        raise SystemExit("--camera must contain at least one camera index.")
+    if any(c <= 0 for c in camera_ids):
+        raise SystemExit(f"--camera values must be positive integers. Got: {camera_ids}")
+
+    print(f"Using camera(s): {camera_ids}")
 
     fall_class_ids = parse_range_expr(args.fall_class_ids)
     if args.merge_fall and not fall_class_ids:
@@ -770,8 +794,8 @@ def main():
     if not val_subjects:
         raise SystemExit("No val subjects parsed.")
 
-    npz_train = find_keypoints_npzs_subjects(data_root, camera=args.camera, subjects=train_subjects)
-    npz_val = find_keypoints_npzs_subjects(data_root, camera=args.camera, subjects=val_subjects)
+    npz_train = find_keypoints_npzs_subjects(data_root, cameras=camera_ids, subjects=train_subjects)
+    npz_val = find_keypoints_npzs_subjects(data_root, cameras=camera_ids, subjects=val_subjects)
 
     build_dataset(
         npz_paths_train=npz_train,

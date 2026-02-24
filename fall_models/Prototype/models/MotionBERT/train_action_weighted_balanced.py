@@ -5,6 +5,7 @@ import sys
 import argparse
 import pickle
 import errno
+import re
 from collections import OrderedDict
 import tensorboardX
 from tqdm import tqdm
@@ -72,6 +73,13 @@ def parse_args():
         default=0,
         help="If 1, use WeightedRandomSampler for training loader (0/1).",
     )
+    parser.add_argument(
+        "--camera",
+        nargs="+",
+        type=int,
+        default=[1, 2],
+        help="One or more camera indices to train on, e.g. --camera 1 or --camera 1 2 (default: 1 2).",
+    )
     opts = parser.parse_args()
     return opts
 
@@ -96,6 +104,100 @@ CKPT_BETA = 2.0
 FALL_CLASS_IDX = 0
 # Rare classes to boost in class weights (merged 7-class scheme)
 RARE_CLASS_IDS = [0, 4]
+
+_CAMERA_RE = re.compile(r"(?:^|_)(?:cam|camera)(\d+)(?:_|$)", re.IGNORECASE)
+
+def _camera_from_frame_dir(frame_dir: str):
+    m = _CAMERA_RE.search(str(frame_dir))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+def filter_action_pkl_by_cameras(
+    data_path: str,
+    data_split_base: str,
+    camera_ids,
+    out_path: str,
+) -> str:
+    """
+    Filter MotionBERT action pkl train/val splits to selected camera IDs based on frame_dir.
+    For UP-Fall, frame_dir typically contains tokens like "..._Cam1_...".
+    """
+    camera_ids = sorted(set(int(c) for c in camera_ids))
+    if not camera_ids:
+        raise RuntimeError("--camera must contain at least one camera index.")
+    if any(c <= 0 for c in camera_ids):
+        raise RuntimeError(f"--camera values must be positive integers. Got: {camera_ids}")
+
+    with open(data_path, "rb") as f:
+        ds = pickle.load(f)
+
+    split = ds.get("split", {})
+    ann = ds.get("annotations", [])
+    train_key = f"{data_split_base}_train"
+    val_key = f"{data_split_base}_val"
+    split_keys = [k for k in (train_key, val_key) if k in split]
+
+    if not split_keys:
+        raise KeyError(
+            f"Expected split keys '{train_key}' and/or '{val_key}' in {data_path}. "
+            f"Available: {list(split.keys())}"
+        )
+
+    parsed_by_split = {}
+    parseable_total = 0
+    cameras_found = set()
+    for sk in split_keys:
+        entries = []
+        for fd in list(split[sk]):
+            cam = _camera_from_frame_dir(str(fd))
+            entries.append((fd, cam))
+            if cam is not None:
+                parseable_total += 1
+                cameras_found.add(int(cam))
+        parsed_by_split[sk] = entries
+
+    if parseable_total == 0:
+        print(
+            f"[camera] WARNING: could not parse camera IDs from frame_dir for splits {split_keys}; "
+            f"skipping camera filtering. Using original pkl: {data_path}"
+        )
+        return data_path
+
+    camera_set = set(camera_ids)
+    filtered_split = {}
+    keep_frame_dirs = set()
+    for sk in split_keys:
+        entries = parsed_by_split[sk]
+        kept = [fd for (fd, cam) in entries if cam in camera_set]
+        if len(kept) == 0:
+            raise RuntimeError(
+                f"No samples matched camera(s)={camera_ids} in split '{sk}'. "
+                f"Cameras found in parsed samples: {sorted(cameras_found)}"
+            )
+        filtered_split[sk] = kept
+        keep_frame_dirs.update(kept)
+        print(f"[camera] {sk}: kept {len(kept)}/{len(entries)} samples for camera(s) {camera_ids}")
+
+    filtered_ann = [a for a in ann if a.get("frame_dir") in keep_frame_dirs]
+    if len(filtered_ann) != len(keep_frame_dirs):
+        missing = len(keep_frame_dirs) - len(filtered_ann)
+        print(
+            f"[camera] WARNING: split lists contain {len(keep_frame_dirs)} kept frame_dirs but "
+            f"only {len(filtered_ann)} annotations matched (missing={missing})."
+        )
+
+    filtered_obj = {
+        "split": filtered_split,
+        "annotations": filtered_ann,
+    }
+    with open(out_path, "wb") as f:
+        pickle.dump(filtered_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[camera] Filtered pkl saved to: {out_path}")
+    return out_path
 
 def compute_class_weights_from_pkl(
     data_path: str,
@@ -309,7 +411,22 @@ def train_with_config(args, opts):
           'prefetch_factor': 4,
           'persistent_workers': True
     }
+    camera_ids = sorted(set(int(c) for c in opts.camera))
+    if not camera_ids:
+        raise RuntimeError("--camera must contain at least one camera index.")
+    if any(c <= 0 for c in camera_ids):
+        raise RuntimeError(f"--camera values must be positive integers. Got: {camera_ids}")
+    print("Cameras:", camera_ids)
+
     data_path = 'data/action/%s.pkl' % args.dataset
+    cam_tag = "_".join(str(c) for c in camera_ids)
+    filtered_data_path = os.path.join(opts.checkpoint, f"{args.dataset}_{args.data_split}_cam_{cam_tag}.pkl")
+    data_path = filter_action_pkl_by_cameras(
+        data_path=data_path,
+        data_split_base=args.data_split,
+        camera_ids=camera_ids,
+        out_path=filtered_data_path,
+    )
     ntu60_xsub_train = NTURGBD(data_path=data_path, data_split=args.data_split+'_train', n_frames=args.clip_len, random_move=args.random_move, scale_range=args.scale_range_train)
     ntu60_xsub_val = NTURGBD(data_path=data_path, data_split=args.data_split+'_val', n_frames=args.clip_len, random_move=False, scale_range=args.scale_range_test)
 

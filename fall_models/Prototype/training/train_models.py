@@ -878,7 +878,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Train all models (overrides --model).",
     )
-    parser.add_argument("--camera", type=int, default=1, help="Camera index to train on (default: 1)")
+    parser.add_argument(
+        "--camera",
+        nargs="+",
+        type=int,
+        default=[1, 2],
+        help="One or more camera indices to train on, e.g. --camera 1 or --camera 1 2 (default: 1 2).",
+    )
     parser.add_argument("--train-subjects", type=str, default="16-17", help="Train subject range like '1-12' or '16-17'")
     parser.add_argument("--val-subjects", type=str, default="1-1", help="Val subject range like '13-16' or '1-1'")
     parser.add_argument(
@@ -1148,20 +1154,31 @@ if __name__ == "__main__":
 
     train_subjects = parse_range(args.train_subjects)
     val_subjects = parse_range(args.val_subjects)
+    camera_ids = sorted(set(int(c) for c in args.camera))
+    if not camera_ids:
+        raise SystemExit("--camera must contain at least one camera index.")
+    if any(c <= 0 for c in camera_ids):
+        raise SystemExit(f"--camera values must be positive integers. Got: {camera_ids}")
 
     # Paths
     OUTPUT_ROOT = Path(args.npz_root)
     ckpt_root = Path("models")  # keeps your existing layout
 
     # ---- Compute T_used + num_classes exactly as before (so results stay comparable) ----
-    train_npzs = find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=train_subjects)
-    val_npzs   = find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=val_subjects)
+    train_npzs = []
+    val_npzs = []
+    for camera_id in camera_ids:
+        train_npzs.extend(find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=camera_id, subjects=train_subjects))
+        val_npzs.extend(find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=camera_id, subjects=val_subjects))
+    train_npzs = sorted(set(train_npzs))
+    val_npzs = sorted(set(val_npzs))
 
     if not train_npzs:
-        raise RuntimeError("No training NPZs found. Check OUTPUT_ROOT, camera, and train subjects.")
+        raise RuntimeError(f"No training NPZs found. Check OUTPUT_ROOT, camera(s)={camera_ids}, and train subjects.")
     if not val_npzs:
-        raise RuntimeError("No validation NPZs found. Check OUTPUT_ROOT, camera, and val subjects.")
+        raise RuntimeError(f"No validation NPZs found. Check OUTPUT_ROOT, camera(s)={camera_ids}, and val subjects.")
 
+    print("Cameras:", camera_ids)
     print("Train sequences:", len(train_npzs))
     print("Val sequences:", len(val_npzs))
     print("Models to train:", model_list)

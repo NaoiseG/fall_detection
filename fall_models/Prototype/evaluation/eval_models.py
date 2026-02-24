@@ -15,7 +15,7 @@ Outputs (in --out-dir):
 
 Run (from project root):
 python -m models.eval_models --models tcn lstm gru \
-  --camera 1 \
+  --camera 1 2 \
   --test-subjects 1-1 \
   --fall-class-ids 9 10 11 \
   --ckpt-root models \
@@ -700,7 +700,13 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate trained models on UP-Fall windowed pose tensors.")
     parser.add_argument("--models", nargs="+", default=None, help="Models to evaluate, e.g. --models tcn lstm")
     parser.add_argument("--all", action="store_true", help="Evaluate all models (overrides --models).")
-    parser.add_argument("--camera", type=int, default=1, help="Camera index (default: 1)")
+    parser.add_argument(
+        "--camera",
+        nargs="+",
+        type=int,
+        default=[1, 2],
+        help="One or more camera indices to evaluate on, e.g. --camera 1 or --camera 1 2 (default: 1 2).",
+    )
     parser.add_argument("--test-subjects", type=str, default="1-1", help="Test subject range like '1-5'")
     parser.add_argument(
         "--npz-root",
@@ -866,12 +872,28 @@ def main():
         use_conf = True
 
     test_subjects = parse_range(args.test_subjects)
+    camera_ids = sorted(set(int(c) for c in args.camera))
+    if not camera_ids:
+        raise SystemExit("--camera must contain at least one camera index.")
+    if any(c <= 0 for c in camera_ids):
+        raise SystemExit(f"--camera values must be positive integers. Got: {camera_ids}")
 
     # Load test set using the SAME NPZ->windows pipeline
     OUTPUT_ROOT = Path(args.npz_root)
-    test_npzs = [Path(p) for p in find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=test_subjects)]
+    test_npzs: List[Path] = []
+    for camera_id in camera_ids:
+        test_npzs.extend(
+            Path(p)
+            for p in find_keypoints_npzs_subjects(
+                OUTPUT_ROOT,
+                camera=camera_id,
+                subjects=test_subjects,
+            )
+        )
+    test_npzs = sorted(set(test_npzs), key=lambda p: p.as_posix())
     if not test_npzs:
-        raise RuntimeError("No test NPZs found. Check OUTPUT_ROOT, camera, and test subjects.")
+        raise RuntimeError(f"No test NPZs found. Check OUTPUT_ROOT, camera(s)={camera_ids}, and test subjects.")
+    print("Cameras:", camera_ids)
 
     # ---- Detect raw label convention once (1-11 vs 0-10), then keep it consistent ----
     label_convention, label_stats = detect_label_convention_from_npzs(test_npzs)
@@ -1228,9 +1250,19 @@ def main():
                 thr = float(args.threshold)
             elif args.tune_subjects is not None:
                 tune_subjects = parse_range(args.tune_subjects)
-                tune_npzs = [Path(p) for p in find_keypoints_npzs_subjects(OUTPUT_ROOT, camera=args.camera, subjects=tune_subjects)]
+                tune_npzs: List[Path] = []
+                for camera_id in camera_ids:
+                    tune_npzs.extend(
+                        Path(p)
+                        for p in find_keypoints_npzs_subjects(
+                            OUTPUT_ROOT,
+                            camera=camera_id,
+                            subjects=tune_subjects,
+                        )
+                    )
+                tune_npzs = sorted(set(tune_npzs), key=lambda p: p.as_posix())
                 if not tune_npzs:
-                    raise RuntimeError("No tune NPZs found. Check OUTPUT_ROOT, camera, and tune subjects.")
+                    raise RuntimeError(f"No tune NPZs found. Check OUTPUT_ROOT, camera(s)={camera_ids}, and tune subjects.")
                 if frame_step > 1:
                     tune_npzs = _materialize_frame_step_npzs(
                         npz_paths=tune_npzs,
@@ -1336,7 +1368,7 @@ def main():
             "binary_f1_fall": float(f1b[1]),
             "binary_f1_no_fall": float(f1b[0]),
             "weights": ckpt_path.as_posix(),
-            "camera": int(args.camera),
+            "camera": ",".join(str(c) for c in camera_ids),
             "subjects": ",".join(str(s) for s in test_subjects),
             "frame_step": int(frame_step),
             "window_T_raw": int(T_ckpt_raw),

@@ -5,7 +5,7 @@ This file ONLY contains the main() logic.
 All pose logic, batching, timestamp parsing, etc. remain in pose_alphapose.py unchanged.
 
 Usage examples:
-  python dataset_helpers/get_keypoints_files_alphapose.py
+  python dataset_helpers/get_keypoints_files_alphapose.py --camera 1
   python dataset_helpers/get_keypoints_files_alphapose.py --subjects 12-12
   python dataset_helpers/get_keypoints_files_alphapose.py --subjects 2,4,7
   python dataset_helpers/get_keypoints_files_alphapose.py --camera 2 --subjects 1-3
@@ -69,7 +69,7 @@ def parse_subjects(subjects_str):
     return sorted(set(subjects))
 
 
-def build_arg_parser(default_upfall_root):
+def build_arg_parser(default_upfall_root, default_output_root):
     parser = argparse.ArgumentParser(
         description="Run AlphaPose extraction on UP-Fall frames."
     )
@@ -82,14 +82,20 @@ def build_arg_parser(default_upfall_root):
     parser.add_argument(
         "--camera",
         type=int,
-        default=1,
-        help="Camera index to process (default: 1).",
+        required=True,
+        help="Camera index to process (e.g., 1 for Camera1).",
     )
     parser.add_argument(
         "--upfall-root",
         type=str,
         default=str(default_upfall_root),
         help="Root directory of the UP-Fall dataset.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=str,
+        default=str(default_output_root),
+        help="Root directory where keypoint outputs are written.",
     )
     return parser
 
@@ -99,7 +105,7 @@ def main():
     UPFALL_ROOT = Path("../../../scratch/UPFall")  # change if needed
     OUTPUT_ROOT = Path("../../Datasets/UPFall_keypoints_alpha/outputs_npz")  # change if needed
 
-    parser = build_arg_parser(UPFALL_ROOT)
+    parser = build_arg_parser(UPFALL_ROOT, OUTPUT_ROOT)
     args = parser.parse_args()
 
     try:
@@ -108,6 +114,7 @@ def main():
         parser.error(str(exc))
 
     upfall_root = Path(args.upfall_root)
+    output_root = Path(args.output_root)
 
     cfg = AlphaPoseExportConfig(
         alphapose_root="pose_models/AlphaPose",
@@ -146,7 +153,7 @@ def main():
         windows_csv = matches[0]
 
         rel = os.path.relpath(frames_dir, str(upfall_root))
-        out_dir = OUTPUT_ROOT / rel
+        out_dir = output_root / rel
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if (out_dir / "keypoints.npz").exists():
