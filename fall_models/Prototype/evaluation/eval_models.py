@@ -66,6 +66,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import re
+import math
 
 import argparse
 from pathlib import Path
@@ -233,6 +234,78 @@ def _ceil_div_pos(a: int, b: int) -> int:
     if b_i <= 0:
         raise ValueError(f"Expected positive divisor, got {b_i}")
     return max(1, (a_i + b_i - 1) // b_i)
+
+
+def resolve_preprocess_config(
+    *,
+    ckpt: Optional[Dict[str, object]],
+    is_rf: bool,
+    use_conf_default: bool,
+    normalize_default: bool,
+    normalize_mode_default: str,
+    add_vel_default: bool,
+    add_acc_default: bool,
+    add_global_default: bool,
+    feature_mode_default: str,
+    motion_xy_scale_default: float,
+    conf_thres_default: float,
+    max_interp_gap_default: int,
+    missing_mode_default: str,
+    interp_mode_default: str,
+    interp_group_default: int,
+    rp_center_mode_default: str,
+    rp_img_w_default: Optional[int],
+    rp_img_h_default: Optional[int],
+    T_default: int,
+    stride_default: int,
+    fall_pct_default: float,
+    label_mode_default: str,
+    min_valid_frac_default: float,
+    add_mask_channel_default: bool,
+    drop_ambig_share_default: float,
+    drop_ambig_nonfall_only_default: bool,
+) -> Dict[str, object]:
+    """
+    Resolve preprocessing config from checkpoint metadata with CLI fallback.
+    For RF checkpoints, "feature_mode" is reserved for sklearn feature extraction,
+    so preprocessing feature mode is read from preprocess_feature_mode/window_feature_mode.
+    """
+    d = ckpt if isinstance(ckpt, dict) else {}
+
+    if is_rf:
+        preprocess_feature_mode = str(d.get("preprocess_feature_mode", d.get("window_feature_mode", feature_mode_default)))
+    else:
+        preprocess_feature_mode = str(d.get("feature_mode", d.get("preprocess_feature_mode", feature_mode_default)))
+
+    mxy_raw = d.get("motion_xy_scale", motion_xy_scale_default)
+    motion_xy_scale = float(motion_xy_scale_default if mxy_raw is None else mxy_raw)
+
+    return {
+        "use_conf": bool(d.get("use_conf", use_conf_default)),
+        "normalize": bool(d.get("normalize", normalize_default)),
+        "normalize_mode": str(d.get("normalize_mode", normalize_mode_default)),
+        "add_vel": bool(d.get("add_vel", add_vel_default)),
+        "add_acc": bool(d.get("add_acc", add_acc_default)),
+        "add_global": bool(d.get("add_global", add_global_default)),
+        "feature_mode": preprocess_feature_mode,
+        "motion_xy_scale": motion_xy_scale,
+        "conf_thres": float(d.get("conf_thres", conf_thres_default)),
+        "max_interp_gap": int(d.get("max_interp_gap", max_interp_gap_default)),
+        "missing_mode": str(d.get("missing_mode", missing_mode_default)),
+        "interp_mode": str(d.get("interp_mode", interp_mode_default)),
+        "interp_group": int(d.get("interp_group", interp_group_default)),
+        "rp_center_mode": str(d.get("rp_center_mode", rp_center_mode_default)),
+        "rp_img_w": d.get("rp_img_w", rp_img_w_default),
+        "rp_img_h": d.get("rp_img_h", rp_img_h_default),
+        "T_raw": int(d.get("T", d.get("T_used", T_default))),
+        "stride_raw": int(d.get("stride", stride_default)),
+        "fall_pct": float(d.get("fall_pct", fall_pct_default)),
+        "label_mode": str(d.get("label_mode", label_mode_default)),
+        "min_valid_frac": float(d.get("min_valid_frac", min_valid_frac_default)),
+        "add_mask_channel": bool(d.get("add_mask_channel", add_mask_channel_default)),
+        "drop_ambig_share": float(d.get("drop_ambig_share", drop_ambig_share_default)),
+        "drop_ambig_nonfall_only": bool(d.get("drop_ambig_nonfall_only", drop_ambig_nonfall_only_default)),
+    }
 
 
 def _write_frame_step_npz(src_npz: Path, dst_npz: Path, frame_step: int) -> None:
@@ -784,12 +857,25 @@ def main():
         "--normalize-mode",
         type=str,
         default="center_scale",
-        choices=["center_scale", "paper_rp"],
-        help="Normalisation mode when --normalize 1. center_scale=legacy translation+scale; paper_rp=paper Relative Position (translation only).",
+        choices=["center_scale", "root_scale", "paper_rp"],
+        help="Normalisation mode when --normalize 1. center_scale=legacy; root_scale=hip-root relative + robust scale; paper_rp=paper Relative Position (translation only).",
     )
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
     parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")
     parser.add_argument("--add-global", type=int, default=1, help="Add global features (0/1).")
+    parser.add_argument(
+        "--feature-mode",
+        type=str,
+        default="full",
+        choices=["full", "motion_primary"],
+        help="Feature composition fallback for checkpoints missing this metadata.",
+    )
+    parser.add_argument(
+        "--motion-xy-scale",
+        type=float,
+        default=0.25,
+        help="Only for --feature-mode motion_primary: fallback reduced-xy scale when checkpoint metadata is missing.",
+    )
     parser.add_argument("--conf-thres", type=float, default=0.2, help="Conf threshold for missing joints.")
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for interpolation.")
     parser.add_argument(
@@ -854,6 +940,11 @@ def main():
     add_acc_cli = bool(args.add_acc)
     add_global_cli = bool(args.add_global)
     add_mask_channel_cli = bool(args.add_mask_channel)
+    feature_mode_cli = str(args.feature_mode).lower().strip()
+    if feature_mode_cli not in {"full", "motion_primary"}:
+        raise SystemExit(f"Unknown --feature-mode: {args.feature_mode}")
+    if not math.isfinite(float(args.motion_xy_scale)) or float(args.motion_xy_scale) < 0.0:
+        raise SystemExit("--motion-xy-scale must be a finite float >= 0.")
 
     if args.all:
         model_list = ALL_MODELS
@@ -969,37 +1060,65 @@ def main():
                 raise TypeError(f"[rf] Unsupported checkpoint format: expected dict with key 'model' at {ckpt_path.as_posix()}")
 
             rf_model = ckpt.get("model", None)
-            rf_feature_mode = str(ckpt.get("feature_mode", "flatten"))
+            rf_feature_mode = str(ckpt.get("feature_mode", ckpt.get("rf_feature_mode", "flatten")))
             rf_feature_dim = ckpt.get("feature_dim", None)
 
             state = None
             T_used = None
             in_features = None
             num_classes = int(ckpt.get("num_classes", NUM_CLASSES_MERGED))
-            use_conf_ckpt = bool(ckpt.get("use_conf", True))
-
-            normalize_ckpt = bool(ckpt.get("normalize", normalize_cli))
-            normalize_mode_ckpt = str(ckpt.get("normalize_mode", args.normalize_mode))
-            add_vel_ckpt = bool(ckpt.get("add_vel", add_vel_cli))
-            add_acc_ckpt = bool(ckpt.get("add_acc", add_acc_cli))
-            add_global_ckpt = bool(ckpt.get("add_global", add_global_cli))
-            conf_thres_ckpt = float(ckpt.get("conf_thres", args.conf_thres))
-            max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
-            missing_mode_ckpt = str(ckpt.get("missing_mode", args.missing_mode))
-            interp_mode_ckpt = str(ckpt.get("interp_mode", args.interp_mode))
-            interp_group_ckpt = int(ckpt.get("interp_group", args.interp_group))
-            rp_center_mode_ckpt = str(ckpt.get("rp_center_mode", args.rp_center_mode))
-            rp_img_w_ckpt = ckpt.get("rp_img_w", args.rp_img_w)
-            rp_img_h_ckpt = ckpt.get("rp_img_h", args.rp_img_h)
-            T_ckpt_raw = int(ckpt.get("T", ckpt.get("T_used", args.T)))
-            stride_ckpt_raw = int(ckpt.get("stride", args.stride))
-
-            fall_pct_ckpt = float(ckpt.get("fall_pct", args.fall_pct))
-            label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
-            min_valid_frac_ckpt = float(ckpt.get("min_valid_frac", args.min_valid_frac))
-            add_mask_channel_ckpt = bool(ckpt.get("add_mask_channel", add_mask_channel_cli))
-            drop_ambig_share_ckpt = float(ckpt.get("drop_ambig_share", args.drop_ambig_share))
-            drop_ambig_nonfall_only_ckpt = bool(ckpt.get("drop_ambig_nonfall_only", bool(args.drop_ambig_nonfall_only)))
+            pre_cfg = resolve_preprocess_config(
+                ckpt=ckpt,
+                is_rf=True,
+                use_conf_default=True,
+                normalize_default=normalize_cli,
+                normalize_mode_default=str(args.normalize_mode),
+                add_vel_default=add_vel_cli,
+                add_acc_default=add_acc_cli,
+                add_global_default=add_global_cli,
+                feature_mode_default=feature_mode_cli,
+                motion_xy_scale_default=float(args.motion_xy_scale),
+                conf_thres_default=float(args.conf_thres),
+                max_interp_gap_default=int(args.max_interp_gap),
+                missing_mode_default=str(args.missing_mode),
+                interp_mode_default=str(args.interp_mode),
+                interp_group_default=int(args.interp_group),
+                rp_center_mode_default=str(args.rp_center_mode),
+                rp_img_w_default=args.rp_img_w,
+                rp_img_h_default=args.rp_img_h,
+                T_default=int(args.T),
+                stride_default=int(args.stride),
+                fall_pct_default=float(args.fall_pct),
+                label_mode_default=str(args.label_mode),
+                min_valid_frac_default=float(args.min_valid_frac),
+                add_mask_channel_default=add_mask_channel_cli,
+                drop_ambig_share_default=float(args.drop_ambig_share),
+                drop_ambig_nonfall_only_default=bool(args.drop_ambig_nonfall_only),
+            )
+            use_conf_ckpt = bool(pre_cfg["use_conf"])
+            normalize_ckpt = bool(pre_cfg["normalize"])
+            normalize_mode_ckpt = str(pre_cfg["normalize_mode"])
+            add_vel_ckpt = bool(pre_cfg["add_vel"])
+            add_acc_ckpt = bool(pre_cfg["add_acc"])
+            add_global_ckpt = bool(pre_cfg["add_global"])
+            feature_mode_ckpt = str(pre_cfg["feature_mode"])
+            motion_xy_scale_ckpt = float(pre_cfg["motion_xy_scale"])
+            conf_thres_ckpt = float(pre_cfg["conf_thres"])
+            max_interp_gap_ckpt = int(pre_cfg["max_interp_gap"])
+            missing_mode_ckpt = str(pre_cfg["missing_mode"])
+            interp_mode_ckpt = str(pre_cfg["interp_mode"])
+            interp_group_ckpt = int(pre_cfg["interp_group"])
+            rp_center_mode_ckpt = str(pre_cfg["rp_center_mode"])
+            rp_img_w_ckpt = pre_cfg["rp_img_w"]
+            rp_img_h_ckpt = pre_cfg["rp_img_h"]
+            T_ckpt_raw = int(pre_cfg["T_raw"])
+            stride_ckpt_raw = int(pre_cfg["stride_raw"])
+            fall_pct_ckpt = float(pre_cfg["fall_pct"])
+            label_mode_ckpt = str(pre_cfg["label_mode"])
+            min_valid_frac_ckpt = float(pre_cfg["min_valid_frac"])
+            add_mask_channel_ckpt = bool(pre_cfg["add_mask_channel"])
+            drop_ambig_share_ckpt = float(pre_cfg["drop_ambig_share"])
+            drop_ambig_nonfall_only_ckpt = bool(pre_cfg["drop_ambig_nonfall_only"])
             node_features_ckpt = None
 
         elif "state_dict" in ckpt:
@@ -1007,30 +1126,58 @@ def main():
             T_used = int(ckpt["T_used"])
             in_features = int(ckpt["in_features"])
             num_classes = int(ckpt["num_classes"])
-            use_conf_ckpt = bool(ckpt.get("use_conf", True))
-
-            normalize_ckpt = bool(ckpt.get("normalize", normalize_cli))
-            normalize_mode_ckpt = str(ckpt.get("normalize_mode", args.normalize_mode))
-            add_vel_ckpt = bool(ckpt.get("add_vel", add_vel_cli))
-            add_acc_ckpt = bool(ckpt.get("add_acc", add_acc_cli))
-            add_global_ckpt = bool(ckpt.get("add_global", add_global_cli))
-            conf_thres_ckpt = float(ckpt.get("conf_thres", args.conf_thres))
-            max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
-            missing_mode_ckpt = str(ckpt.get("missing_mode", args.missing_mode))
-            interp_mode_ckpt = str(ckpt.get("interp_mode", args.interp_mode))
-            interp_group_ckpt = int(ckpt.get("interp_group", args.interp_group))
-            rp_center_mode_ckpt = str(ckpt.get("rp_center_mode", args.rp_center_mode))
-            rp_img_w_ckpt = ckpt.get("rp_img_w", args.rp_img_w)
-            rp_img_h_ckpt = ckpt.get("rp_img_h", args.rp_img_h)
-            T_ckpt_raw = int(ckpt.get("T", ckpt.get("T_used", args.T)))  # support both keys
-            stride_ckpt_raw = int(ckpt.get("stride", args.stride))
-
-            fall_pct_ckpt = float(ckpt.get("fall_pct", args.fall_pct))
-            label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
-            min_valid_frac_ckpt = float(ckpt.get("min_valid_frac", args.min_valid_frac))
-            add_mask_channel_ckpt = bool(ckpt.get("add_mask_channel", add_mask_channel_cli))
-            drop_ambig_share_ckpt = float(ckpt.get("drop_ambig_share", args.drop_ambig_share))
-            drop_ambig_nonfall_only_ckpt = bool(ckpt.get("drop_ambig_nonfall_only", bool(args.drop_ambig_nonfall_only)))
+            pre_cfg = resolve_preprocess_config(
+                ckpt=ckpt,
+                is_rf=False,
+                use_conf_default=True,
+                normalize_default=normalize_cli,
+                normalize_mode_default=str(args.normalize_mode),
+                add_vel_default=add_vel_cli,
+                add_acc_default=add_acc_cli,
+                add_global_default=add_global_cli,
+                feature_mode_default=feature_mode_cli,
+                motion_xy_scale_default=float(args.motion_xy_scale),
+                conf_thres_default=float(args.conf_thres),
+                max_interp_gap_default=int(args.max_interp_gap),
+                missing_mode_default=str(args.missing_mode),
+                interp_mode_default=str(args.interp_mode),
+                interp_group_default=int(args.interp_group),
+                rp_center_mode_default=str(args.rp_center_mode),
+                rp_img_w_default=args.rp_img_w,
+                rp_img_h_default=args.rp_img_h,
+                T_default=int(args.T),
+                stride_default=int(args.stride),
+                fall_pct_default=float(args.fall_pct),
+                label_mode_default=str(args.label_mode),
+                min_valid_frac_default=float(args.min_valid_frac),
+                add_mask_channel_default=add_mask_channel_cli,
+                drop_ambig_share_default=float(args.drop_ambig_share),
+                drop_ambig_nonfall_only_default=bool(args.drop_ambig_nonfall_only),
+            )
+            use_conf_ckpt = bool(pre_cfg["use_conf"])
+            normalize_ckpt = bool(pre_cfg["normalize"])
+            normalize_mode_ckpt = str(pre_cfg["normalize_mode"])
+            add_vel_ckpt = bool(pre_cfg["add_vel"])
+            add_acc_ckpt = bool(pre_cfg["add_acc"])
+            add_global_ckpt = bool(pre_cfg["add_global"])
+            feature_mode_ckpt = str(pre_cfg["feature_mode"])
+            motion_xy_scale_ckpt = float(pre_cfg["motion_xy_scale"])
+            conf_thres_ckpt = float(pre_cfg["conf_thres"])
+            max_interp_gap_ckpt = int(pre_cfg["max_interp_gap"])
+            missing_mode_ckpt = str(pre_cfg["missing_mode"])
+            interp_mode_ckpt = str(pre_cfg["interp_mode"])
+            interp_group_ckpt = int(pre_cfg["interp_group"])
+            rp_center_mode_ckpt = str(pre_cfg["rp_center_mode"])
+            rp_img_w_ckpt = pre_cfg["rp_img_w"]
+            rp_img_h_ckpt = pre_cfg["rp_img_h"]
+            T_ckpt_raw = int(pre_cfg["T_raw"])
+            stride_ckpt_raw = int(pre_cfg["stride_raw"])
+            fall_pct_ckpt = float(pre_cfg["fall_pct"])
+            label_mode_ckpt = str(pre_cfg["label_mode"])
+            min_valid_frac_ckpt = float(pre_cfg["min_valid_frac"])
+            add_mask_channel_ckpt = bool(pre_cfg["add_mask_channel"])
+            drop_ambig_share_ckpt = float(pre_cfg["drop_ambig_share"])
+            drop_ambig_nonfall_only_ckpt = bool(pre_cfg["drop_ambig_nonfall_only"])
             node_features_ckpt = ckpt.get("node_features", None)
             if node_features_ckpt is None and (in_features % 17 == 0):
                 node_features_ckpt = in_features // 17
@@ -1039,29 +1186,58 @@ def main():
         else:
             state = ckpt
             T_used = None
-            use_conf_ckpt = use_conf
-            normalize_ckpt = normalize_cli
-            normalize_mode_ckpt = str(args.normalize_mode)
-            add_vel_ckpt = add_vel_cli
-            add_acc_ckpt = add_acc_cli
-            add_global_ckpt = add_global_cli
-            conf_thres_ckpt = float(args.conf_thres)
-            max_interp_gap_ckpt = int(args.max_interp_gap)
-            missing_mode_ckpt = str(args.missing_mode)
-            interp_mode_ckpt = str(args.interp_mode)
-            interp_group_ckpt = int(args.interp_group)
-            rp_center_mode_ckpt = str(args.rp_center_mode)
-            rp_img_w_ckpt = args.rp_img_w
-            rp_img_h_ckpt = args.rp_img_h
-            T_ckpt_raw = int(args.T)
-            stride_ckpt_raw = int(args.stride)
-
-            fall_pct_ckpt = float(args.fall_pct)
-            label_mode_ckpt = str(args.label_mode)
-            min_valid_frac_ckpt = float(args.min_valid_frac)
-            add_mask_channel_ckpt = add_mask_channel_cli
-            drop_ambig_share_ckpt = float(args.drop_ambig_share)
-            drop_ambig_nonfall_only_ckpt = bool(args.drop_ambig_nonfall_only)
+            pre_cfg = resolve_preprocess_config(
+                ckpt=None,
+                is_rf=False,
+                use_conf_default=use_conf,
+                normalize_default=normalize_cli,
+                normalize_mode_default=str(args.normalize_mode),
+                add_vel_default=add_vel_cli,
+                add_acc_default=add_acc_cli,
+                add_global_default=add_global_cli,
+                feature_mode_default=feature_mode_cli,
+                motion_xy_scale_default=float(args.motion_xy_scale),
+                conf_thres_default=float(args.conf_thres),
+                max_interp_gap_default=int(args.max_interp_gap),
+                missing_mode_default=str(args.missing_mode),
+                interp_mode_default=str(args.interp_mode),
+                interp_group_default=int(args.interp_group),
+                rp_center_mode_default=str(args.rp_center_mode),
+                rp_img_w_default=args.rp_img_w,
+                rp_img_h_default=args.rp_img_h,
+                T_default=int(args.T),
+                stride_default=int(args.stride),
+                fall_pct_default=float(args.fall_pct),
+                label_mode_default=str(args.label_mode),
+                min_valid_frac_default=float(args.min_valid_frac),
+                add_mask_channel_default=add_mask_channel_cli,
+                drop_ambig_share_default=float(args.drop_ambig_share),
+                drop_ambig_nonfall_only_default=bool(args.drop_ambig_nonfall_only),
+            )
+            use_conf_ckpt = bool(pre_cfg["use_conf"])
+            normalize_ckpt = bool(pre_cfg["normalize"])
+            normalize_mode_ckpt = str(pre_cfg["normalize_mode"])
+            add_vel_ckpt = bool(pre_cfg["add_vel"])
+            add_acc_ckpt = bool(pre_cfg["add_acc"])
+            add_global_ckpt = bool(pre_cfg["add_global"])
+            feature_mode_ckpt = str(pre_cfg["feature_mode"])
+            motion_xy_scale_ckpt = float(pre_cfg["motion_xy_scale"])
+            conf_thres_ckpt = float(pre_cfg["conf_thres"])
+            max_interp_gap_ckpt = int(pre_cfg["max_interp_gap"])
+            missing_mode_ckpt = str(pre_cfg["missing_mode"])
+            interp_mode_ckpt = str(pre_cfg["interp_mode"])
+            interp_group_ckpt = int(pre_cfg["interp_group"])
+            rp_center_mode_ckpt = str(pre_cfg["rp_center_mode"])
+            rp_img_w_ckpt = pre_cfg["rp_img_w"]
+            rp_img_h_ckpt = pre_cfg["rp_img_h"]
+            T_ckpt_raw = int(pre_cfg["T_raw"])
+            stride_ckpt_raw = int(pre_cfg["stride_raw"])
+            fall_pct_ckpt = float(pre_cfg["fall_pct"])
+            label_mode_ckpt = str(pre_cfg["label_mode"])
+            min_valid_frac_ckpt = float(pre_cfg["min_valid_frac"])
+            add_mask_channel_ckpt = bool(pre_cfg["add_mask_channel"])
+            drop_ambig_share_ckpt = float(pre_cfg["drop_ambig_share"])
+            drop_ambig_nonfall_only_ckpt = bool(pre_cfg["drop_ambig_nonfall_only"])
             node_features_ckpt = None
 
         T_ckpt_raw = max(1, int(T_ckpt_raw))
@@ -1082,6 +1258,14 @@ def main():
             print("[mlp][WARN] --frame-step/--k > 1 changes T and is incompatible with fixed-size MLP input. Skipping model.")
             continue
 
+        if str(feature_mode_ckpt).lower().strip() == "motion_primary" and (not bool(add_vel_ckpt) or not bool(add_acc_ckpt)):
+            raise RuntimeError(
+                f"[{m}] checkpoint requests feature_mode=motion_primary but add_vel/add_acc are not both enabled "
+                f"(add_vel={bool(add_vel_ckpt)}, add_acc={bool(add_acc_ckpt)})."
+            )
+        if not math.isfinite(float(motion_xy_scale_ckpt)) or float(motion_xy_scale_ckpt) < 0.0:
+            raise RuntimeError(f"[{m}] motion_xy_scale must be finite and >=0. Got {motion_xy_scale_ckpt}")
+
         # For hybrid window labelling
         extra = {}
         if label_mode_ckpt == "hybrid_center_fallpct":
@@ -1098,6 +1282,8 @@ def main():
             add_vel=add_vel_ckpt,
             add_acc=add_acc_ckpt,
             add_global=add_global_ckpt,
+            feature_mode=feature_mode_ckpt,
+            motion_xy_scale=motion_xy_scale_ckpt,
             conf_thres=conf_thres_ckpt,
             max_interp_gap=max_interp_gap_ckpt,
             missing_mode=missing_mode_ckpt,
@@ -1280,6 +1466,8 @@ def main():
                     add_vel=add_vel_ckpt,
                     add_acc=add_acc_ckpt,
                     add_global=add_global_ckpt,
+                    feature_mode=feature_mode_ckpt,
+                    motion_xy_scale=motion_xy_scale_ckpt,
                     conf_thres=conf_thres_ckpt,
                     max_interp_gap=max_interp_gap_ckpt,
                     missing_mode=missing_mode_ckpt,
@@ -1375,6 +1563,15 @@ def main():
             "window_stride_raw": int(stride_ckpt_raw),
             "window_T_sampled": int(T_ckpt),
             "window_stride_sampled": int(stride_ckpt),
+            "normalize_mode": str(normalize_mode_ckpt),
+            "missing_mode": str(missing_mode_ckpt),
+            "interp_mode": str(interp_mode_ckpt),
+            "interp_group": int(interp_group_ckpt),
+            "rp_center_mode": str(rp_center_mode_ckpt),
+            "rp_img_w": rp_img_w_ckpt,
+            "rp_img_h": rp_img_h_ckpt,
+            "feature_mode": str(feature_mode_ckpt),
+            "motion_xy_scale": float(motion_xy_scale_ckpt),
         })
 
     if not summary_rows:

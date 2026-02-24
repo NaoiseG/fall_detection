@@ -23,7 +23,7 @@ Save results table:
 """
 
 from dataclasses import dataclass, asdict
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict, Any
 import argparse
 import math
 from pathlib import Path
@@ -39,6 +39,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dataset_helpers.dataset import (
     load_windows_from_npzs,
+    load_windows_with_source_meta_from_npzs,
     find_keypoints_npzs_subjects,
     WindowTensorDataset,
     detect_label_convention_from_npzs,
@@ -170,6 +171,136 @@ def compute_class_weights(
 
     w = w / (np.mean(w) + float(eps))
     return w.astype(np.float32, copy=False)
+
+
+def _inverse_count_factors(
+    counts_by_key: Dict[Any, int],
+    *,
+    exp: float = 1.0,
+    smooth: float = 1.0,
+    eps: float = 1e-12,
+) -> Dict[Any, float]:
+    """
+    Build inverse-frequency factors normalized to mean=1.
+    """
+    if not counts_by_key:
+        return {}
+    if not math.isfinite(float(exp)) or float(exp) < 0.0:
+        raise ValueError(f"exp must be finite and >=0, got {exp}")
+    if not math.isfinite(float(smooth)) or float(smooth) < 0.0:
+        raise ValueError(f"smooth must be finite and >=0, got {smooth}")
+
+    keys = sorted(counts_by_key.keys())
+    counts = np.array([float(counts_by_key[k]) for k in keys], dtype=np.float64)
+    target = float(np.mean(counts)) if counts.size > 0 else 1.0
+    fac = ((target + float(smooth)) / (counts + float(smooth) + float(eps))) ** float(exp)
+    fac = fac / (float(np.mean(fac)) + float(eps))
+    return {k: float(v) for k, v in zip(keys, fac.tolist())}
+
+
+def _summarize_sampler_weights(sample_w: np.ndarray) -> Dict[str, float]:
+    w = np.asarray(sample_w, dtype=np.float64).reshape(-1)
+    if w.size == 0:
+        return {"min": 0.0, "p10": 0.0, "p50": 0.0, "p90": 0.0, "max": 0.0, "mean": 0.0}
+    return {
+        "min": float(np.min(w)),
+        "p10": float(np.percentile(w, 10)),
+        "p50": float(np.percentile(w, 50)),
+        "p90": float(np.percentile(w, 90)),
+        "max": float(np.max(w)),
+        "mean": float(np.mean(w)),
+    }
+
+
+def build_sampler_weights(
+    *,
+    y_train: np.ndarray,
+    train_camera_ids: np.ndarray,
+    num_classes: int,
+    class_weights_np: Optional[np.ndarray],
+    rare_class_boost: float,
+    weighted_sampler_mode: str,
+    camera_exp: float,
+    camera_smooth: float,
+    joint_exp: float,
+    joint_smooth: float,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Build per-sample weights for WeightedRandomSampler.
+
+    Modes:
+      - class: legacy class-only weighting
+      - class_camera: class term * camera correction * (class,camera) correction
+    """
+    y = np.asarray(y_train, dtype=np.int64).reshape(-1)
+    cams = np.asarray(train_camera_ids, dtype=np.int64).reshape(-1)
+    if y.shape[0] != cams.shape[0]:
+        raise ValueError(f"y_train and train_camera_ids length mismatch: {y.shape[0]} vs {cams.shape[0]}")
+
+    mode = str(weighted_sampler_mode).lower().strip()
+    if mode not in {"class", "class_camera"}:
+        raise ValueError(f"Unknown weighted_sampler_mode: {weighted_sampler_mode}")
+
+    class_term = class_weights_np
+    if class_term is None:
+        class_term = compute_class_weights(
+            y,
+            num_classes=int(num_classes),
+            mode="inv_sqrt",
+            rare_boost=float(rare_class_boost),
+            rare_class_ids=RARE_CLASS_IDS_MERGED,
+        )
+    class_term = np.asarray(class_term, dtype=np.float64).reshape(-1)
+    if class_term.shape[0] < int(num_classes):
+        raise ValueError(f"class_term has length {class_term.shape[0]} < num_classes={num_classes}")
+
+    sample_w = class_term[y].astype(np.float64, copy=True)
+
+    class_counts = np.bincount(y, minlength=int(num_classes)).astype(np.int64)
+    cam_vals, cam_counts_arr = np.unique(cams, return_counts=True)
+    camera_counts = {int(k): int(v) for k, v in zip(cam_vals.tolist(), cam_counts_arr.tolist())}
+
+    pair_counts: Dict[Tuple[int, int], int] = {}
+    for cls_i, cam_i in zip(y.tolist(), cams.tolist()):
+        key = (int(cls_i), int(cam_i))
+        pair_counts[key] = int(pair_counts.get(key, 0) + 1)
+
+    camera_factors = _inverse_count_factors(
+        camera_counts,
+        exp=float(camera_exp),
+        smooth=float(camera_smooth),
+    )
+
+    pair_factors: Dict[Tuple[int, int], float] = {}
+    if mode == "class_camera":
+        pair_factors = _inverse_count_factors(
+            pair_counts,
+            exp=float(joint_exp),
+            smooth=float(joint_smooth),
+        )
+
+    if mode == "class_camera":
+        for i in range(sample_w.shape[0]):
+            cls_i = int(y[i])
+            cam_i = int(cams[i])
+            sample_w[i] *= float(camera_factors.get(cam_i, 1.0))
+            sample_w[i] *= float(pair_factors.get((cls_i, cam_i), 1.0))
+
+    sample_w = sample_w / (float(np.mean(sample_w)) + 1e-12)
+
+    per_class_counts = {int(i): int(c) for i, c in enumerate(class_counts.tolist()) if int(c) > 0}
+    per_camera_counts = {int(k): int(v) for k, v in sorted(camera_counts.items(), key=lambda kv: kv[0])}
+    per_pair_counts = {f"{int(k[0])}|cam{int(k[1])}": int(v) for k, v in sorted(pair_counts.items())}
+
+    summary = {
+        "class_counts": per_class_counts,
+        "camera_counts": per_camera_counts,
+        "class_camera_counts": per_pair_counts,
+        "weight_summary": _summarize_sampler_weights(sample_w),
+        "camera_factors": {f"cam{int(k)}": float(v) for k, v in sorted(camera_factors.items(), key=lambda kv: kv[0])},
+        "pair_factors": {f"{int(k[0])}|cam{int(k[1])}": float(v) for k, v in sorted(pair_factors.items())},
+    }
+    return sample_w.astype(np.float64, copy=False), summary
 
 
 @torch.no_grad()
@@ -609,9 +740,12 @@ def train_model_once(
     new_label_names: List[str],
     use_conf: bool,
     normalize: bool,
+    normalize_mode: str,
     add_vel: bool,
     add_acc: bool,
     add_global: bool,
+    feature_mode: str,
+    motion_xy_scale: float,
     T_used: int,
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -619,12 +753,19 @@ def train_model_once(
     run_id: str,
     conf_thres: float,
     max_interp_gap: int,
+    missing_mode: str,
+    interp_mode: str,
+    interp_group: int,
     stride: int,
     label_mode: str,
+    fall_pct: float,
     min_valid_frac: float,
     add_mask_channel: bool,
     drop_ambig_share: float,
     drop_ambig_nonfall_only: bool,
+    rp_center_mode: str,
+    rp_img_w: Optional[int],
+    rp_img_h: Optional[int],
     fall_class_ids_raw: Optional[List[int]] = None,
     node_features: Optional[int] = None,
     fall_ids_0based: Optional[List[int]] = None,
@@ -722,18 +863,28 @@ def train_model_once(
                 "fall_class_id": int(FALL_CLASS_ID),
                 "use_conf": bool(use_conf),
                 "normalize": bool(normalize),
+                "normalize_mode": str(normalize_mode),
                 "add_vel": bool(add_vel),
                 "add_acc": bool(add_acc),
                 "add_global": bool(add_global),
+                "feature_mode": str(feature_mode),
+                "motion_xy_scale": float(motion_xy_scale),
                 "conf_thres": float(conf_thres),
                 "max_interp_gap": int(max_interp_gap),
+                "missing_mode": str(missing_mode),
+                "interp_mode": str(interp_mode),
+                "interp_group": int(interp_group),
                 "T_used": int(T_used),
                 "stride": int(stride),
                 "label_mode": str(label_mode),
+                "fall_pct": float(fall_pct),
                 "min_valid_frac": float(min_valid_frac),
                 "add_mask_channel": bool(add_mask_channel),
                 "drop_ambig_share": float(drop_ambig_share),
                 "drop_ambig_nonfall_only": bool(drop_ambig_nonfall_only),
+                "rp_center_mode": str(rp_center_mode),
+                "rp_img_w": int(rp_img_w) if rp_img_w is not None else None,
+                "rp_img_h": int(rp_img_h) if rp_img_h is not None else None,
                 "fall_class_ids_raw": list(fall_class_ids_raw) if fall_class_ids_raw is not None else None,
                 "fall_ids_0based": list(fall_ids_0based) if fall_ids_0based is not None else None,
                 "pos_weight": float(pos_weight) if pos_weight is not None else None,
@@ -910,12 +1061,25 @@ if __name__ == "__main__":
         "--normalize-mode",
         type=str,
         default="center_scale",
-        choices=["center_scale", "paper_rp"],
-        help="Normalisation mode when --normalize 1. center_scale=legacy translation+scale; paper_rp=paper Relative Position (translation only).",
+        choices=["center_scale", "root_scale", "paper_rp"],
+        help="Normalisation mode when --normalize 1. center_scale=legacy; root_scale=hip-root relative + robust scale; paper_rp=paper Relative Position (translation only).",
     )
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
     parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")
     parser.add_argument("--add-global", type=int, default=1, help="Add global features (0/1).")
+    parser.add_argument(
+        "--feature-mode",
+        type=str,
+        default="full",
+        choices=["full", "motion_primary"],
+        help="Feature composition. full=legacy channels; motion_primary=vel/acc primary with optional reduced xy.",
+    )
+    parser.add_argument(
+        "--motion-xy-scale",
+        type=float,
+        default=0.25,
+        help="Only for --feature-mode motion_primary: scale factor for optional xy channels (0 disables xy).",
+    )
     parser.add_argument("--conf-thres", type=float, default=0.2, help="Conf threshold below which joints are treated as missing.")
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for linear interpolation of missing joints.")
     parser.add_argument(
@@ -989,6 +1153,37 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="If 1, use WeightedRandomSampler for the training loader (0/1).",
+    )
+    parser.add_argument(
+        "--weighted-sampler-mode",
+        type=str,
+        default="class",
+        choices=["class", "class_camera"],
+        help="Weighted sampler mode. class=legacy class-only weights; class_camera=class * camera * (class,camera) balancing.",
+    )
+    parser.add_argument(
+        "--weighted-sampler-camera-exp",
+        type=float,
+        default=1.0,
+        help="Exponent for camera balancing factor in class_camera mode (default: 1.0).",
+    )
+    parser.add_argument(
+        "--weighted-sampler-camera-smooth",
+        type=float,
+        default=1.0,
+        help="Additive smoothing for camera balancing counts (default: 1.0).",
+    )
+    parser.add_argument(
+        "--weighted-sampler-joint-exp",
+        type=float,
+        default=1.0,
+        help="Exponent for (class,camera) joint balancing factor in class_camera mode (default: 1.0).",
+    )
+    parser.add_argument(
+        "--weighted-sampler-joint-smooth",
+        type=float,
+        default=1.0,
+        help="Additive smoothing for (class,camera) joint balancing counts (default: 1.0).",
     )
     parser.add_argument(
         "--selection-metric",
@@ -1117,6 +1312,16 @@ if __name__ == "__main__":
         raise SystemExit("--selection-beta must be a finite float > 0.")
     args.selection_beta = float(args.selection_beta)
 
+    for name in (
+        "weighted_sampler_camera_exp",
+        "weighted_sampler_camera_smooth",
+        "weighted_sampler_joint_exp",
+        "weighted_sampler_joint_smooth",
+    ):
+        v = float(getattr(args, name))
+        if not math.isfinite(v) or v < 0.0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be a finite float >= 0.")
+
     use_conf = bool(args.use_conf)
     normalize = bool(args.normalize)
     add_vel = bool(args.add_vel)
@@ -1125,6 +1330,13 @@ if __name__ == "__main__":
         raise SystemExit("--add-acc 1 requires --add-vel 1 (acc is computed from vel).")
     add_global = bool(args.add_global)
     add_mask_channel = bool(args.add_mask_channel)
+    feature_mode = str(args.feature_mode).lower().strip()
+    if feature_mode not in {"full", "motion_primary"}:
+        raise SystemExit(f"Unknown --feature-mode: {args.feature_mode}")
+    if feature_mode == "motion_primary" and (not add_vel or not add_acc):
+        raise SystemExit("--feature-mode motion_primary requires --add-vel 1 and --add-acc 1.")
+    if not math.isfinite(float(args.motion_xy_scale)) or float(args.motion_xy_scale) < 0.0:
+        raise SystemExit("--motion-xy-scale must be a finite float >= 0.")
     fall_class_ids_raw = None
     if args.fall_class_ids is not None and len(args.fall_class_ids) > 0:
         fall_class_ids_raw = [int(x) for x in args.fall_class_ids]
@@ -1190,7 +1402,7 @@ if __name__ == "__main__":
     FALL_MERGE_SET = fall_merge_set(label_convention)
     print(f"[labels] Using raw convention: {label_convention} | New labels: {NEW_LABEL_NAMES}")
     fall_ids_0based = [int(FALL_CLASS_ID)]
-    X_train, y_train_tags, T_used = load_windows_from_npzs(
+    X_train, y_train_tags, T_used, train_meta = load_windows_with_source_meta_from_npzs(
         train_npzs,
         T=int(args.T),
         use_conf=use_conf,
@@ -1199,6 +1411,8 @@ if __name__ == "__main__":
         add_vel=add_vel,
         add_acc=add_acc,
         add_global=add_global,
+        feature_mode=feature_mode,
+        motion_xy_scale=float(args.motion_xy_scale),
         conf_thres=float(args.conf_thres),
         max_interp_gap=int(args.max_interp_gap),
         missing_mode=str(args.missing_mode),
@@ -1227,6 +1441,8 @@ if __name__ == "__main__":
         add_vel=add_vel,
         add_acc=add_acc,
         add_global=add_global,
+        feature_mode=feature_mode,
+        motion_xy_scale=float(args.motion_xy_scale),
         conf_thres=float(args.conf_thres),
         max_interp_gap=int(args.max_interp_gap),
         missing_mode=str(args.missing_mode),
@@ -1249,6 +1465,11 @@ if __name__ == "__main__":
     # Labels are already remapped to the merged 7-class space (0..6)
     y_train = y_train_tags.astype(np.int64, copy=False)
     y_val   = y_val_tags.astype(np.int64, copy=False)
+    train_camera_ids = np.asarray(train_meta.get("window_camera_ids", np.zeros((len(y_train),), dtype=np.int64)), dtype=np.int64)
+    if int(train_camera_ids.shape[0]) != int(y_train.shape[0]):
+        raise RuntimeError(
+            f"train camera metadata mismatch: windows={int(y_train.shape[0])}, camera_ids={int(train_camera_ids.shape[0])}"
+        )
 
     num_classes = int(NUM_CLASSES_MERGED)
     if int(y_train.max()) >= num_classes or int(y_val.max()) >= num_classes:
@@ -1325,17 +1546,31 @@ if __name__ == "__main__":
     )
 
     if bool(args.weighted_sampler):
-        sampler_weights_np = class_weights_np
-        if sampler_weights_np is None:
-            # If CE weights are disabled, still build sampler weights from inverse-sqrt counts.
-            sampler_weights_np = compute_class_weights(
-                y_train,
-                num_classes=int(num_classes),
-                mode="inv_sqrt",
-                rare_boost=float(args.rare_class_boost),
-                rare_class_ids=RARE_CLASS_IDS_MERGED,
-            )
-        sample_w = torch.from_numpy(sampler_weights_np[y_train]).double()
+        sampler_mode = str(args.weighted_sampler_mode).lower().strip()
+        sample_w_np, sampler_diag = build_sampler_weights(
+            y_train=y_train,
+            train_camera_ids=train_camera_ids,
+            num_classes=int(num_classes),
+            class_weights_np=class_weights_np,
+            rare_class_boost=float(args.rare_class_boost),
+            weighted_sampler_mode=sampler_mode,
+            camera_exp=float(args.weighted_sampler_camera_exp),
+            camera_smooth=float(args.weighted_sampler_camera_smooth),
+            joint_exp=float(args.weighted_sampler_joint_exp),
+            joint_smooth=float(args.weighted_sampler_joint_smooth),
+        )
+
+        print(f"Sampler mode: {sampler_mode}")
+        print("Sampler class counts:", sampler_diag["class_counts"])
+        print("Sampler camera counts:", sampler_diag["camera_counts"])
+        print("Sampler class-camera counts:", sampler_diag["class_camera_counts"])
+        if sampler_diag.get("camera_factors"):
+            print("Sampler camera factors:", sampler_diag["camera_factors"])
+        if sampler_diag.get("pair_factors"):
+            print("Sampler class-camera factors:", sampler_diag["pair_factors"])
+        print("Sampler weight summary:", sampler_diag["weight_summary"])
+
+        sample_w = torch.from_numpy(sample_w_np).double()
         sampler = WeightedRandomSampler(weights=sample_w, num_samples=int(len(sample_w)), replacement=True)
         train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=sampler, shuffle=False, drop_last=False, num_workers=0)
         print("Train loader: WeightedRandomSampler enabled.")
@@ -1363,18 +1598,28 @@ if __name__ == "__main__":
                 new_label_names=NEW_LABEL_NAMES,
                 use_conf=use_conf,
                 normalize=normalize,
+                normalize_mode=str(args.normalize_mode),
                 add_vel=add_vel,
                 add_acc=add_acc,
                 add_global=add_global,
+                feature_mode=feature_mode,
+                motion_xy_scale=float(args.motion_xy_scale),
                 T_used=T_used,
                 conf_thres=float(args.conf_thres),
                 max_interp_gap=int(args.max_interp_gap),
+                missing_mode=str(args.missing_mode),
+                interp_mode=str(args.interp_mode),
+                interp_group=int(args.interp_group),
                 stride=int(args.stride),
                 label_mode=str(args.label_mode),
+                fall_pct=float(args.fall_pct),
                 min_valid_frac=float(args.min_valid_frac),
                 add_mask_channel=add_mask_channel,
                 drop_ambig_share=float(args.drop_ambig_share),
                 drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
+                rp_center_mode=str(args.rp_center_mode),
+                rp_img_w=args.rp_img_w,
+                rp_img_h=args.rp_img_h,
                 fall_class_ids_raw=fall_class_ids_raw,
                 fall_ids_0based=fall_ids_0based,
                 selection_metric=str(args.selection_metric),
@@ -1413,17 +1658,27 @@ if __name__ == "__main__":
                 node_features=node_features,
                 use_conf=use_conf,
                 normalize=normalize,
+                normalize_mode=str(args.normalize_mode),
                 add_vel=add_vel,
                 add_acc=add_acc,
                 add_global=add_global,
+                feature_mode=feature_mode,
+                motion_xy_scale=float(args.motion_xy_scale),
                 conf_thres=float(args.conf_thres),
                 max_interp_gap=int(args.max_interp_gap),
+                missing_mode=str(args.missing_mode),
+                interp_mode=str(args.interp_mode),
+                interp_group=int(args.interp_group),
                 stride=int(args.stride),
                 label_mode=str(args.label_mode),
+                fall_pct=float(args.fall_pct),
                 min_valid_frac=float(args.min_valid_frac),
                 add_mask_channel=add_mask_channel,
                 drop_ambig_share=float(args.drop_ambig_share),
                 drop_ambig_nonfall_only=bool(args.drop_ambig_nonfall_only),
+                rp_center_mode=str(args.rp_center_mode),
+                rp_img_w=args.rp_img_w,
+                rp_img_h=args.rp_img_h,
                 fall_class_ids_raw=fall_class_ids_raw,
                 fall_ids_0based=fall_ids_0based,
                 pos_weight=pos_weight,

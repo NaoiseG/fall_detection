@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Tuple, Optional, Iterable, Dict, Any
+from typing import Tuple, Optional, Iterable, Dict, Any, List
 from pathlib import Path
 import glob
+import re
 
 import numpy as np
 import torch
@@ -233,6 +234,26 @@ def find_keypoints_npzs_subjects(output_root: Path, camera: int = 1, subjects=ra
         npzs.extend(glob.glob(str(pat), recursive=True))
 
     return sorted(npzs)
+
+
+_CAMERA_ID_RE = re.compile(r"camera[_-]?(\d+)", flags=re.IGNORECASE)
+
+
+def infer_camera_id_from_npz_path(npz_path: str, default: int = 0) -> int:
+    """
+    Best-effort camera id parser from an NPZ path.
+
+    Expected patterns include "...Camera1/..." or "...camera_2/...".
+    Returns `default` when no camera token can be parsed.
+    """
+    s = str(npz_path)
+    m = _CAMERA_ID_RE.search(s)
+    if m is None:
+        return int(default)
+    try:
+        return int(m.group(1))
+    except Exception:
+        return int(default)
 
 
 # ----------------------------
@@ -498,6 +519,81 @@ def _frame_center_scale(xy_t: np.ndarray, conf_t: np.ndarray) -> Tuple[np.ndarra
     return center, scale
 
 
+def _frame_root(xy_t: np.ndarray, conf_t: np.ndarray) -> np.ndarray:
+    """
+    Root (translation anchor) for one frame.
+    Preferred: mid-hip; fallback to single hip; then shoulder center/single shoulder;
+    then mean(valid); finally zeros.
+    """
+    K = int(xy_t.shape[0])
+    valid = conf_t > 0.0
+
+    def _ok(idx: int) -> bool:
+        return 0 <= int(idx) < K and bool(valid[int(idx)])
+
+    if _ok(L_HIP) and _ok(R_HIP):
+        return (0.5 * (xy_t[L_HIP] + xy_t[R_HIP])).astype(np.float32, copy=False)
+    if _ok(L_HIP):
+        return xy_t[L_HIP].astype(np.float32, copy=False)
+    if _ok(R_HIP):
+        return xy_t[R_HIP].astype(np.float32, copy=False)
+
+    if _ok(L_SHOULDER) and _ok(R_SHOULDER):
+        return (0.5 * (xy_t[L_SHOULDER] + xy_t[R_SHOULDER])).astype(np.float32, copy=False)
+    if _ok(L_SHOULDER):
+        return xy_t[L_SHOULDER].astype(np.float32, copy=False)
+    if _ok(R_SHOULDER):
+        return xy_t[R_SHOULDER].astype(np.float32, copy=False)
+
+    if bool(np.any(valid)):
+        return xy_t[valid].mean(axis=0).astype(np.float32, copy=False)
+    return np.zeros((2,), dtype=np.float32)
+
+
+def _frame_scale_root_relative(xy_t: np.ndarray, conf_t: np.ndarray, root: np.ndarray, eps: float = 1e-6) -> float:
+    """
+    Robust per-frame scale for root-relative normalization.
+    Fallback order: shoulder width -> hip width -> torso length -> robust joint spread.
+    """
+    K = int(xy_t.shape[0])
+    valid = conf_t > 0.0
+
+    def _ok(idx: int) -> bool:
+        return 0 <= int(idx) < K and bool(valid[int(idx)])
+
+    scale = 0.0
+    if _ok(L_SHOULDER) and _ok(R_SHOULDER):
+        scale = float(np.linalg.norm(xy_t[L_SHOULDER] - xy_t[R_SHOULDER]))
+    elif _ok(L_HIP) and _ok(R_HIP):
+        scale = float(np.linalg.norm(xy_t[L_HIP] - xy_t[R_HIP]))
+    else:
+        sh_pts: List[np.ndarray] = []
+        hp_pts: List[np.ndarray] = []
+        if _ok(L_SHOULDER):
+            sh_pts.append(xy_t[L_SHOULDER])
+        if _ok(R_SHOULDER):
+            sh_pts.append(xy_t[R_SHOULDER])
+        if _ok(L_HIP):
+            hp_pts.append(xy_t[L_HIP])
+        if _ok(R_HIP):
+            hp_pts.append(xy_t[R_HIP])
+        if sh_pts and hp_pts:
+            sh_mid = np.mean(np.stack(sh_pts, axis=0), axis=0)
+            hp_mid = np.mean(np.stack(hp_pts, axis=0), axis=0)
+            scale = float(np.linalg.norm(sh_mid - hp_mid))
+        else:
+            pts = xy_t[valid]
+            if pts.shape[0] >= 2:
+                d = np.linalg.norm(pts - root[None, :], axis=1)
+                d = d[np.isfinite(d)]
+                if d.size > 0:
+                    scale = float(np.percentile(d, 75.0))
+
+    if not np.isfinite(scale) or scale < float(eps):
+        scale = 1.0
+    return float(scale)
+
+
 def _normalize_xy(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
     """
     Per-frame translation + scale normalisation.
@@ -510,6 +606,19 @@ def _normalize_xy(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
         center, scale = _frame_center_scale(xy[t], conf[t])
         out[t] = (xy[t] - center[None, :]) / float(scale)
 
+    return out
+
+
+def _normalize_xy_root_scale(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
+    """
+    Root-relative + scale-normalized coordinates.
+    """
+    N, _, _ = xy.shape
+    out = np.empty_like(xy, dtype=np.float32)
+    for t in range(N):
+        root = _frame_root(xy[t], conf[t])
+        scale = _frame_scale_root_relative(xy[t], conf[t], root=root, eps=1e-6)
+        out[t] = (xy[t] - root[None, :]) / float(scale)
     return out
 
 
@@ -638,6 +747,152 @@ def _add_acceleration_channels(vel: np.ndarray) -> np.ndarray:
 # Window building
 # ----------------------------
 
+def _load_windows_from_npzs_core(
+    *,
+    npz_paths,
+    T: Optional[int] = None,
+    use_conf: bool = True,
+    normalize: bool = True,
+    add_vel: bool = True,
+    add_acc: bool = True,
+    add_global: bool = True,
+    conf_thres: float = 0.2,
+    max_interp_gap: int = 5,
+    stride: int = 16,
+    label_mode: str = "majority",
+    binary_any_fall: bool = False,
+    fall_ids_0based: Optional[list[int]] = None,
+    fall_pct: float = 0.25,
+    min_valid_frac: float = 0.3,
+    add_mask_channel: bool = True,
+    drop_ambig_share: float = 0.0,
+    drop_ambig_nonfall_only: bool = True,
+    label_convention: Optional[str] = None,
+    normalize_mode: str = "center_scale",
+    missing_mode: str = "conf_thres",
+    interp_mode: str = "short_gap_hold",
+    interp_group: int = 100,
+    rp_center_mode: str = "auto",
+    rp_img_w: Optional[int] = None,
+    rp_img_h: Optional[int] = None,
+    feature_mode: str = "full",
+    motion_xy_scale: float = 0.25,
+    collect_source_meta: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, int, Optional[Dict[str, Any]]]:
+    """
+    Core implementation shared by public NPZ loading helpers.
+    """
+    npz_list: List[Path] = [Path(p) for p in npz_paths]
+    X_all: List[np.ndarray] = []
+    y_all: List[np.ndarray] = []
+    T_used = T
+
+    window_camera_ids: List[np.ndarray] = []
+    window_source_indices: List[np.ndarray] = []
+    source_paths: List[str] = [p.as_posix() for p in npz_list]
+    source_camera_ids = np.array([infer_camera_id_from_npz_path(p.as_posix()) for p in npz_list], dtype=np.int64)
+
+    conv = label_convention
+    if conv is None:
+        conv, stats = detect_label_convention_from_npzs(npz_list)
+        print(f"[labels] Auto-detected convention={conv} from NPZs (min={stats['min_label']}, max={stats['max_label']}).")
+    else:
+        if conv not in {"1-11", "0-10"}:
+            raise ValueError("label_convention must be '1-11' or '0-10'.")
+
+    global FALL_MERGE_SET, NEW_LABEL_NAMES
+    FALL_MERGE_SET = get_fall_merge_set(conv)
+    NEW_LABEL_NAMES = get_new_label_names(conv)
+
+    for i, p in enumerate(npz_list):
+        if i == 0 and T_used is None:
+            X, y, T_used = make_window_tensors(
+                p.as_posix(),
+                T=None,
+                use_conf=use_conf,
+                normalize=normalize,
+                normalize_mode=normalize_mode,
+                add_vel=add_vel,
+                add_acc=add_acc,
+                add_global=add_global,
+                conf_thres=conf_thres,
+                max_interp_gap=max_interp_gap,
+                missing_mode=missing_mode,
+                interp_mode=interp_mode,
+                interp_group=interp_group,
+                stride=stride,
+                label_mode=label_mode,
+                binary_any_fall=binary_any_fall,
+                fall_ids_0based=fall_ids_0based,
+                fall_pct=fall_pct,
+                min_valid_frac=min_valid_frac,
+                add_mask_channel=add_mask_channel,
+                drop_ambig_share=drop_ambig_share,
+                drop_ambig_nonfall_only=drop_ambig_nonfall_only,
+                label_convention=conv,
+                rp_center_mode=rp_center_mode,
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
+                feature_mode=feature_mode,
+                motion_xy_scale=motion_xy_scale,
+            )
+        else:
+            X, y, _ = make_window_tensors(
+                p.as_posix(),
+                T=T_used,
+                use_conf=use_conf,
+                normalize=normalize,
+                normalize_mode=normalize_mode,
+                add_vel=add_vel,
+                add_acc=add_acc,
+                add_global=add_global,
+                conf_thres=conf_thres,
+                max_interp_gap=max_interp_gap,
+                missing_mode=missing_mode,
+                interp_mode=interp_mode,
+                interp_group=interp_group,
+                stride=stride,
+                label_mode=label_mode,
+                binary_any_fall=binary_any_fall,
+                fall_ids_0based=fall_ids_0based,
+                fall_pct=fall_pct,
+                min_valid_frac=min_valid_frac,
+                add_mask_channel=add_mask_channel,
+                drop_ambig_share=drop_ambig_share,
+                drop_ambig_nonfall_only=drop_ambig_nonfall_only,
+                label_convention=conv,
+                rp_center_mode=rp_center_mode,
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
+                feature_mode=feature_mode,
+                motion_xy_scale=motion_xy_scale,
+            )
+
+        X_all.append(X)
+        y_all.append(y)
+
+        if bool(collect_source_meta):
+            cam_id = int(infer_camera_id_from_npz_path(p.as_posix()))
+            window_camera_ids.append(np.full((int(y.shape[0]),), cam_id, dtype=np.int64))
+            window_source_indices.append(np.full((int(y.shape[0]),), int(i), dtype=np.int64))
+
+    if not X_all:
+        raise RuntimeError("No NPZs found / no windows loaded.")
+
+    X_cat = np.concatenate(X_all, axis=0)
+    y_cat = np.concatenate(y_all, axis=0)
+    if not bool(collect_source_meta):
+        return X_cat, y_cat, int(T_used), None
+
+    meta: Dict[str, Any] = {
+        "window_camera_ids": np.concatenate(window_camera_ids, axis=0) if window_camera_ids else np.zeros((0,), dtype=np.int64),
+        "window_source_indices": np.concatenate(window_source_indices, axis=0) if window_source_indices else np.zeros((0,), dtype=np.int64),
+        "source_npz_paths": source_paths,
+        "source_camera_ids": source_camera_ids,
+    }
+    return X_cat, y_cat, int(T_used), meta
+
+
 def load_windows_from_npzs(
     npz_paths,
     T: Optional[int] = None,
@@ -669,6 +924,9 @@ def load_windows_from_npzs(
     rp_center_mode: str = "auto",
     rp_img_w: Optional[int] = None,
     rp_img_h: Optional[int] = None,
+    # NEW: feature composition
+    feature_mode: str = "full",
+    motion_xy_scale: float = 0.25,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Loads multiple trial NPZs, converts each to (W, T, K, C) windows,
@@ -677,88 +935,113 @@ def load_windows_from_npzs(
     IMPORTANT:
       Returned y is in the merged 7-class space (0..6), not the raw 11-class IDs.
     """
-    X_all, y_all = [], []
-    T_used = T
+    X_cat, y_cat, T_used, _ = _load_windows_from_npzs_core(
+        npz_paths=npz_paths,
+        T=T,
+        use_conf=use_conf,
+        normalize=normalize,
+        add_vel=add_vel,
+        add_acc=add_acc,
+        add_global=add_global,
+        conf_thres=conf_thres,
+        max_interp_gap=max_interp_gap,
+        stride=stride,
+        label_mode=label_mode,
+        binary_any_fall=binary_any_fall,
+        fall_ids_0based=fall_ids_0based,
+        fall_pct=fall_pct,
+        min_valid_frac=min_valid_frac,
+        add_mask_channel=add_mask_channel,
+        drop_ambig_share=drop_ambig_share,
+        drop_ambig_nonfall_only=drop_ambig_nonfall_only,
+        label_convention=label_convention,
+        normalize_mode=normalize_mode,
+        missing_mode=missing_mode,
+        interp_mode=interp_mode,
+        interp_group=interp_group,
+        rp_center_mode=rp_center_mode,
+        rp_img_w=rp_img_w,
+        rp_img_h=rp_img_h,
+        feature_mode=feature_mode,
+        motion_xy_scale=motion_xy_scale,
+        collect_source_meta=False,
+    )
+    return X_cat, y_cat, int(T_used)
 
-    conv = label_convention
-    if conv is None:
-        conv, stats = detect_label_convention_from_npzs(npz_paths)
-        print(f"[labels] Auto-detected convention={conv} from NPZs (min={stats['min_label']}, max={stats['max_label']}).")
-    else:
-        if conv not in {"1-11", "0-10"}:
-            raise ValueError("label_convention must be '1-11' or '0-10'.")
 
-    global FALL_MERGE_SET, NEW_LABEL_NAMES
-    FALL_MERGE_SET = get_fall_merge_set(conv)
-    NEW_LABEL_NAMES = get_new_label_names(conv)
-
-    for i, p in enumerate(npz_paths):
-        if i == 0 and T_used is None:
-            X, y, T_used = make_window_tensors(
-                p,
-                T=None,
-                use_conf=use_conf,
-                normalize=normalize,
-                normalize_mode=normalize_mode,
-                add_vel=add_vel,
-                add_acc=add_acc,
-                add_global=add_global,
-                conf_thres=conf_thres,
-                max_interp_gap=max_interp_gap,
-                missing_mode=missing_mode,
-                interp_mode=interp_mode,
-                interp_group=interp_group,
-                stride=stride,
-                label_mode=label_mode,
-                binary_any_fall=binary_any_fall,
-                fall_ids_0based=fall_ids_0based,
-                fall_pct=fall_pct,
-                min_valid_frac=min_valid_frac,
-                add_mask_channel=add_mask_channel,
-                drop_ambig_share=drop_ambig_share,
-                drop_ambig_nonfall_only=drop_ambig_nonfall_only,
-                label_convention=conv,
-                rp_center_mode=rp_center_mode,
-                rp_img_w=rp_img_w,
-                rp_img_h=rp_img_h,
-            )
-        else:
-            X, y, _ = make_window_tensors(
-                p,
-                T=T_used,
-                use_conf=use_conf,
-                normalize=normalize,
-                normalize_mode=normalize_mode,
-                add_vel=add_vel,
-                add_acc=add_acc,
-                add_global=add_global,
-                conf_thres=conf_thres,
-                max_interp_gap=max_interp_gap,
-                missing_mode=missing_mode,
-                interp_mode=interp_mode,
-                interp_group=interp_group,
-                stride=stride,
-                label_mode=label_mode,
-                binary_any_fall=binary_any_fall,
-                fall_ids_0based=fall_ids_0based,
-                fall_pct=fall_pct,
-                min_valid_frac=min_valid_frac,
-                add_mask_channel=add_mask_channel,
-                drop_ambig_share=drop_ambig_share,
-                drop_ambig_nonfall_only=drop_ambig_nonfall_only,
-                label_convention=conv,
-                rp_center_mode=rp_center_mode,
-                rp_img_w=rp_img_w,
-                rp_img_h=rp_img_h,
-            )
-
-        X_all.append(X)
-        y_all.append(y)
-
-    if not X_all:
-        raise RuntimeError("No NPZs found / no windows loaded.")
-
-    return np.concatenate(X_all, axis=0), np.concatenate(y_all, axis=0), int(T_used)
+def load_windows_with_source_meta_from_npzs(
+    npz_paths,
+    T: Optional[int] = None,
+    use_conf: bool = True,
+    normalize: bool = True,
+    add_vel: bool = True,
+    add_acc: bool = True,
+    add_global: bool = True,
+    conf_thres: float = 0.2,
+    max_interp_gap: int = 5,
+    stride: int = 16,
+    label_mode: str = "majority",
+    binary_any_fall: bool = False,
+    fall_ids_0based: Optional[list[int]] = None,
+    fall_pct: float = 0.25,
+    min_valid_frac: float = 0.3,
+    add_mask_channel: bool = True,
+    drop_ambig_share: float = 0.0,
+    drop_ambig_nonfall_only: bool = True,
+    label_convention: Optional[str] = None,
+    normalize_mode: str = "center_scale",
+    missing_mode: str = "conf_thres",
+    interp_mode: str = "short_gap_hold",
+    interp_group: int = 100,
+    rp_center_mode: str = "auto",
+    rp_img_w: Optional[int] = None,
+    rp_img_h: Optional[int] = None,
+    feature_mode: str = "full",
+    motion_xy_scale: float = 0.25,
+) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
+    """
+    Same as load_windows_from_npzs, but also returns source metadata aligned
+    with each window (camera id + source NPZ index).
+    """
+    X_cat, y_cat, T_used, meta = _load_windows_from_npzs_core(
+        npz_paths=npz_paths,
+        T=T,
+        use_conf=use_conf,
+        normalize=normalize,
+        add_vel=add_vel,
+        add_acc=add_acc,
+        add_global=add_global,
+        conf_thres=conf_thres,
+        max_interp_gap=max_interp_gap,
+        stride=stride,
+        label_mode=label_mode,
+        binary_any_fall=binary_any_fall,
+        fall_ids_0based=fall_ids_0based,
+        fall_pct=fall_pct,
+        min_valid_frac=min_valid_frac,
+        add_mask_channel=add_mask_channel,
+        drop_ambig_share=drop_ambig_share,
+        drop_ambig_nonfall_only=drop_ambig_nonfall_only,
+        label_convention=label_convention,
+        normalize_mode=normalize_mode,
+        missing_mode=missing_mode,
+        interp_mode=interp_mode,
+        interp_group=interp_group,
+        rp_center_mode=rp_center_mode,
+        rp_img_w=rp_img_w,
+        rp_img_h=rp_img_h,
+        feature_mode=feature_mode,
+        motion_xy_scale=motion_xy_scale,
+        collect_source_meta=True,
+    )
+    if meta is None:
+        meta = {
+            "window_camera_ids": np.zeros((0,), dtype=np.int64),
+            "window_source_indices": np.zeros((0,), dtype=np.int64),
+            "source_npz_paths": [],
+            "source_camera_ids": np.zeros((0,), dtype=np.int64),
+        }
+    return X_cat, y_cat, int(T_used), meta
 
 
 def _make_sliding_windows(
@@ -930,6 +1213,151 @@ def _global_features(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
     return g
 
 
+def feature_channels_per_joint(
+    *,
+    use_conf: bool,
+    add_vel: bool,
+    add_acc: bool,
+    add_global: bool,
+    add_mask_channel: bool,
+    feature_mode: str = "full",
+    motion_xy_scale: float = 0.25,
+) -> int:
+    """
+    Deterministic feature-channel count per joint after preprocessing/windowing.
+    """
+    mode = str(feature_mode).lower().strip()
+    if mode not in {"full", "motion_primary"}:
+        raise ValueError(f"Unknown feature_mode: {feature_mode}")
+
+    has_vel = bool(add_vel)
+    has_acc = bool(add_acc)
+    if has_acc and not has_vel:
+        raise ValueError("add_acc=True requires add_vel=True")
+    if mode == "motion_primary" and (not has_vel or not has_acc):
+        raise ValueError("feature_mode='motion_primary' requires add_vel=True and add_acc=True")
+
+    channels = 0
+    if mode == "full":
+        channels += 2  # xy
+    else:
+        if float(motion_xy_scale) > 0.0:
+            channels += 2  # reduced xy
+
+    if bool(use_conf):
+        channels += 1
+    if has_vel:
+        channels += 2
+    if has_acc:
+        channels += 2
+    if bool(add_global):
+        channels += 4
+    if bool(add_mask_channel):
+        channels += 1
+    return int(channels)
+
+
+def _compose_window_features(
+    *,
+    xy_used: np.ndarray,
+    conf_filled: np.ndarray,
+    use_conf: bool,
+    add_vel: bool,
+    add_acc: bool,
+    add_global: bool,
+    feature_mode: str,
+    motion_xy_scale: float,
+) -> Tuple[np.ndarray, Dict[str, Any], bool, bool]:
+    """
+    Build per-frame joint features and expose channel layout for downstream padding logic.
+    """
+    mode = str(feature_mode).lower().strip()
+    if mode not in {"full", "motion_primary"}:
+        raise ValueError(f"Unknown feature_mode: {feature_mode}")
+
+    has_vel = bool(add_vel)
+    has_acc = bool(add_acc)
+    if has_acc and not has_vel:
+        raise ValueError("add_acc=True requires add_vel=True")
+    if mode == "motion_primary" and (not has_vel or not has_acc):
+        raise ValueError("feature_mode='motion_primary' requires add_vel=True and add_acc=True")
+
+    vel = None
+    acc = None
+    if has_vel:
+        vel = _add_velocity_channels(xy_used)
+    if has_acc:
+        assert vel is not None
+        acc = _add_acceleration_channels(vel)
+
+    parts: List[np.ndarray] = []
+    idx = 0
+
+    conf_idx = None
+    vel_slice = None
+    acc_slice = None
+    global_slice = None
+
+    if mode == "full":
+        parts.append(xy_used)
+        idx += 2
+
+        if bool(use_conf):
+            conf_idx = idx
+            parts.append(conf_filled[..., None])
+            idx += 1
+
+        if has_vel:
+            vel_slice = slice(idx, idx + 2)
+            parts.append(vel)
+            idx += 2
+
+        if has_acc:
+            acc_slice = slice(idx, idx + 2)
+            assert acc is not None
+            parts.append(acc)
+            idx += 2
+
+    else:
+        if has_vel:
+            vel_slice = slice(idx, idx + 2)
+            parts.append(vel)
+            idx += 2
+
+        if has_acc:
+            acc_slice = slice(idx, idx + 2)
+            assert acc is not None
+            parts.append(acc)
+            idx += 2
+
+        if float(motion_xy_scale) > 0.0:
+            parts.append((float(motion_xy_scale) * xy_used).astype(np.float32, copy=False))
+            idx += 2
+
+        if bool(use_conf):
+            conf_idx = idx
+            parts.append(conf_filled[..., None])
+            idx += 1
+
+    if bool(add_global):
+        g = _global_features(xy_used, conf_filled)
+        gk = np.repeat(g[:, None, :], repeats=xy_used.shape[1], axis=1)
+        global_slice = slice(idx, idx + 4)
+        parts.append(gk)
+        idx += 4
+
+    Xf = np.concatenate(parts, axis=-1).astype(np.float32, copy=False)
+
+    layout: Dict[str, Any] = {
+        "conf_idx": conf_idx,
+        "vel_slice": vel_slice,
+        "acc_slice": acc_slice,
+        "global_slice": global_slice,
+        "mask_idx": None,
+    }
+    return Xf, layout, has_vel, has_acc
+
+
 def make_window_tensors(
     npz_path: str,
     T: Optional[int] = None,
@@ -962,6 +1390,9 @@ def make_window_tensors(
     rp_center_mode: str = "auto",
     rp_img_w: Optional[int] = None,
     rp_img_h: Optional[int] = None,
+    # NEW: feature composition controls
+    feature_mode: str = "full",
+    motion_xy_scale: float = 0.25,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Converts frame-level pose data into window-level tensors.
@@ -1008,6 +1439,8 @@ def make_window_tensors(
         nm = str(normalize_mode).lower().strip()
         if nm == "center_scale":
             xy_used = _normalize_xy(xy_filled, conf_filled)
+        elif nm == "root_scale":
+            xy_used = _normalize_xy_root_scale(xy_filled, conf_filled)
         elif nm == "paper_rp":
             center = _compute_image_center(
                 xy=xy_filled,
@@ -1019,64 +1452,21 @@ def make_window_tensors(
         else:
             raise ValueError(f"Unknown normalize_mode: {normalize_mode}")
 
-    has_vel = bool(add_vel)
-    if has_vel:
-        vel = _add_velocity_channels(xy_used)
+    Xf, layout, has_vel, has_acc = _compose_window_features(
+        xy_used=xy_used,
+        conf_filled=conf_filled,
+        use_conf=bool(use_conf),
+        add_vel=bool(add_vel),
+        add_acc=bool(add_acc),
+        add_global=bool(add_global),
+        feature_mode=str(feature_mode),
+        motion_xy_scale=float(motion_xy_scale),
+    )
 
-    has_acc = bool(add_acc)
-    if has_acc:
-        if not has_vel:
-            raise ValueError("add_acc=True requires add_vel=True")
-        acc = _add_acceleration_channels(vel)
-
-    parts = [xy_used]
-
-    if use_conf:
-        parts.append(conf_filled[..., None])
-
-    if has_vel:
-        parts.append(vel)
-
-    if has_acc:
-        parts.append(acc)
-
-    if add_global:
-        g = _global_features(xy_used, conf_filled)
-        gk = np.repeat(g[:, None, :], repeats=xy_used.shape[1], axis=1)
-        parts.append(gk)
-
-    Xf = np.concatenate(parts, axis=-1).astype(np.float32, copy=False)
-
-    idx = 2
-    conf_idx = None
-    if use_conf:
-        conf_idx = idx
-        idx += 1
-
-    vel_slice = None
-    if has_vel:
-        vel_slice = slice(idx, idx + 2)
-        idx += 2
-
-    acc_slice = None
-    if has_acc:
-        acc_slice = slice(idx, idx + 2)
-        idx += 2
-
-    global_slice = None
-    if add_global:
-        global_slice = slice(idx, idx + 4)
-        idx += 4
-
-    mask_idx = idx if add_mask_channel else None
-
-    layout = {
-        "conf_idx": conf_idx,
-        "vel_slice": vel_slice,
-        "acc_slice": acc_slice,
-        "global_slice": global_slice,
-        "mask_idx": mask_idx,
-    }
+    if bool(add_mask_channel):
+        layout["mask_idx"] = int(Xf.shape[-1])
+    else:
+        layout["mask_idx"] = None
 
     if T is None:
         T = 64
