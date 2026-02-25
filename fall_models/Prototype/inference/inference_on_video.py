@@ -2139,9 +2139,8 @@ def main() -> int:
             win_start_raw = int(win_start) * int(frame_step)
             hud = [
                 frame_info,
-                f"fps: {float(fps_for_hud):.1f} (target {float(fps_play):.1f})",
-                f"window {win_id} (sample_start={win_start}, raw_start={win_start_raw})",
-                f"pred: {label} ({float(pconf):.2f})" if int(pred) >= 0 else "pred: ...",
+                f"fps: {float(fps_for_hud):.1f}",
+                f"pose: {label} ({float(pconf):.2f})" if int(pred) >= 0 else "pose: ...",
                 f"T={int(T_final)} stride={int(stride_final)} sampled (k={int(frame_step)})",
             ]
             if p_fall is not None:
