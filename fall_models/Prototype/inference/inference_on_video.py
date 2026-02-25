@@ -1752,6 +1752,7 @@ def main() -> int:
     merge_fall_11_to_7 = int(num_classes) == 11
     display_num_classes = 7 if merge_fall_11_to_7 else int(num_classes)
     class_names = load_class_names(num_classes=display_num_classes, meta=meta, labels_file=args.labels_file)
+    standing_label = next((str(name) for name in class_names if "stand" in str(name).lower()), "standing")
 
     in_features = expected_in_features(
         use_conf=use_conf,
@@ -1827,6 +1828,8 @@ def main() -> int:
         draw_cf_buf: deque[np.ndarray] = deque()
         prep_ms_buf: deque[float] = deque()
         yolo_ms_buf: deque[float] = deque()
+        hud_delay_frames = 32
+        hud_delay_buf: deque[List[str]] = deque()
 
         sample_xy_seq: List[np.ndarray] = []
         sample_cf_seq: List[np.ndarray] = []
@@ -2145,7 +2148,17 @@ def main() -> int:
             ]
             if p_fall is not None:
                 hud.append(f"fall_prob: {float(p_fall):.2f}")
-            frame = draw_hud(frame, hud)
+            hud_delay_buf.append(list(hud))
+            if len(hud_delay_buf) <= int(hud_delay_frames):
+                hud_to_draw = list(hud)
+                if len(hud_to_draw) > 2:
+                    hud_to_draw[2] = f"pose: {standing_label} (1.00)"
+                for i, line in enumerate(hud_to_draw):
+                    if line.startswith("fall_prob:"):
+                        hud_to_draw[i] = "fall_prob: 0.00"
+            else:
+                hud_to_draw = hud_delay_buf.popleft()
+            frame = draw_hud(frame, hud_to_draw)
             draw_ms = (time.perf_counter() - t_draw0) * 1000.0
 
             if writer is not None:
