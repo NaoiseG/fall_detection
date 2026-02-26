@@ -17,11 +17,19 @@ from ultralytics import YOLO
 class PoseExportConfig:
     model_path: str = "pose_models/ultralytics/yolo11l-pose.pt"
     conf_thres: float = 0.25
+    conf_min: float = 0.75
     fps: int = 30
     max_people: int = 1
     num_kpts: int = 17               # COCO keypoints for Ultralytics pose models
     video_codec: str = "mp4v"        # mp4v is widely supported
     save_csv: bool = False
+    max_jump_px: Optional[float] = None
+    max_jump_diag_frac: float = 0.25
+    max_lost: int = 10
+    target_x_frac: float = 0.5
+    target_y_frac: float = 0.5
+    draw_kpt_threshold: float = 0.30
+    draw_no_target_text: bool = True
 
 
 # ----------------------------- SORTING -----------------------------
@@ -77,20 +85,177 @@ def init_pose_arrays(num_frames: int, max_people: int, num_kpts: int) -> Dict[st
     return {"kpts_xy": kpts_xy, "kpts_conf": kpts_conf, "person_conf": person_conf}
 
 
-def choose_people_order(r) -> np.ndarray:
-    """
-    Choose ordering for people in frame.
-    Prefer box confidence if available, otherwise mean keypoint confidence.
-    """
-    if r.boxes is not None and r.boxes.conf is not None:
-        conf = r.boxes.conf.detach().cpu().numpy()
-        return np.argsort(-conf)
+COCO_SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (5, 6),
+    (5, 7), (7, 9),
+    (6, 8), (8, 10),
+    (5, 11), (6, 12),
+    (11, 12),
+    (11, 13), (13, 15),
+    (12, 14), (14, 16),
+]
 
-    if r.keypoints is not None and r.keypoints.conf is not None:
-        kc = r.keypoints.conf.detach().cpu().numpy()
-        return np.argsort(-np.nanmean(kc, axis=1))
 
-    return np.array([], dtype=int)
+def _to_numpy_or_none(x: Any) -> Optional[np.ndarray]:
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    if isinstance(x, np.ndarray):
+        return x
+    return np.asarray(x)
+
+
+def extract_box_centers_conf(r) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+    """
+    Safely extract:
+      - box centers: (P, 2)
+      - box conf: (P,) or None
+      - boxes xyxy: (P, 4)
+    """
+    if r.boxes is None:
+        empty_centers = np.empty((0, 2), dtype=np.float32)
+        empty_boxes = np.empty((0, 4), dtype=np.float32)
+        return empty_centers, None, empty_boxes
+
+    boxes_xyxy = _to_numpy_or_none(getattr(r.boxes, "xyxy", None))
+    if boxes_xyxy is None:
+        empty_centers = np.empty((0, 2), dtype=np.float32)
+        empty_boxes = np.empty((0, 4), dtype=np.float32)
+        return empty_centers, None, empty_boxes
+
+    boxes_xyxy = np.asarray(boxes_xyxy, dtype=np.float32)
+    if boxes_xyxy.ndim != 2 or boxes_xyxy.shape[0] == 0 or boxes_xyxy.shape[1] < 4:
+        empty_centers = np.empty((0, 2), dtype=np.float32)
+        empty_boxes = np.empty((0, 4), dtype=np.float32)
+        return empty_centers, None, empty_boxes
+
+    boxes_xyxy = boxes_xyxy[:, :4]
+    centers = np.column_stack((
+        0.5 * (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]),
+        0.5 * (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]),
+    )).astype(np.float32)
+
+    box_conf = _to_numpy_or_none(getattr(r.boxes, "conf", None))
+    if box_conf is not None:
+        box_conf = np.asarray(box_conf, dtype=np.float32).reshape(-1)
+        if box_conf.shape[0] < boxes_xyxy.shape[0]:
+            pad = boxes_xyxy.shape[0] - box_conf.shape[0]
+            box_conf = np.pad(box_conf, (0, pad), mode="constant", constant_values=np.nan)
+        elif box_conf.shape[0] > boxes_xyxy.shape[0]:
+            box_conf = box_conf[: boxes_xyxy.shape[0]]
+
+    return centers, box_conf, boxes_xyxy
+
+
+def select_person_idx(
+    box_centers: np.ndarray,
+    box_conf: Optional[np.ndarray],
+    prev_center: Optional[np.ndarray],
+    target_center: np.ndarray,
+    conf_min: float,
+    max_jump_px: float,
+) -> Tuple[Optional[int], Optional[np.ndarray]]:
+    """
+    Temporal target selection:
+      - Acquire (no prev_center): prefer conf >= conf_min, closest to target center.
+      - Track (has prev_center): closest to prev_center with max-jump gate.
+    """
+    num_people = int(box_centers.shape[0])
+    if num_people == 0:
+        return None, prev_center
+
+    if prev_center is None:
+        candidate_idx = np.arange(num_people, dtype=np.int32)
+        if box_conf is not None and box_conf.shape[0] >= num_people:
+            high_conf = np.where(np.isfinite(box_conf[:num_people]) & (box_conf[:num_people] >= conf_min))[0]
+            if high_conf.size > 0:
+                candidate_idx = high_conf.astype(np.int32, copy=False)
+
+        dists = np.linalg.norm(box_centers[candidate_idx] - target_center[None, :], axis=1)
+        if dists.size == 0:
+            return None, prev_center
+
+        best_rel = int(np.argmin(dists))
+        best_idx = int(candidate_idx[best_rel])
+        return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+
+    dists = np.linalg.norm(box_centers - prev_center[None, :], axis=1)
+    if dists.size == 0:
+        return None, prev_center
+
+    best_idx = int(np.argmin(dists))
+    best_dist = float(dists[best_idx])
+    if not np.isfinite(best_dist) or best_dist > max_jump_px:
+        return None, prev_center
+
+    return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+
+
+def draw_selected_pose(
+    frame: np.ndarray,
+    kpts_xy: Optional[np.ndarray],
+    kpts_conf: Optional[np.ndarray],
+    box_xyxy: Optional[np.ndarray],
+    draw_kpt_threshold: float,
+    draw_no_target_text: bool,
+) -> np.ndarray:
+    out = frame.copy()
+    if kpts_xy is None:
+        if draw_no_target_text:
+            cv2.putText(
+                out,
+                "NO TARGET",
+                (12, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 165, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        return out
+
+    xy = np.asarray(kpts_xy, dtype=np.float32)
+    conf = None
+    if kpts_conf is not None:
+        conf = np.asarray(kpts_conf, dtype=np.float32).reshape(-1)
+
+    if box_xyxy is not None:
+        box_xyxy = np.asarray(box_xyxy, dtype=np.float32).reshape(-1)
+        if box_xyxy.shape[0] >= 4 and np.all(np.isfinite(box_xyxy[:4])):
+            x1, y1, x2, y2 = np.round(box_xyxy[:4]).astype(int).tolist()
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+    for a, b in COCO_SKELETON:
+        if a >= xy.shape[0] or b >= xy.shape[0]:
+            continue
+        if not np.isfinite(xy[a]).all() or not np.isfinite(xy[b]).all():
+            continue
+        if conf is not None:
+            if a >= conf.shape[0] or b >= conf.shape[0]:
+                continue
+            if not np.isfinite(conf[a]) or not np.isfinite(conf[b]):
+                continue
+            if conf[a] < draw_kpt_threshold or conf[b] < draw_kpt_threshold:
+                continue
+
+        pt1 = tuple(np.round(xy[a]).astype(int).tolist())
+        pt2 = tuple(np.round(xy[b]).astype(int).tolist())
+        cv2.line(out, pt1, pt2, (0, 255, 0), 2, cv2.LINE_AA)
+
+    for k in range(xy.shape[0]):
+        if not np.isfinite(xy[k]).all():
+            continue
+        if conf is not None:
+            if k >= conf.shape[0] or not np.isfinite(conf[k]):
+                continue
+            if conf[k] < draw_kpt_threshold:
+                continue
+        pt = tuple(np.round(xy[k]).astype(int).tolist())
+        cv2.circle(out, pt, 3, (0, 0, 255), -1, cv2.LINE_AA)
+
+    return out
 
 
 def extract_pose_for_frame(r) -> Optional[Dict[str, Any]]:
@@ -99,20 +264,32 @@ def extract_pose_for_frame(r) -> Optional[Dict[str, Any]]:
       xy: (P, K, 2)
       kc: (P, K)
       box_conf: (P,) or None
+      box_centers: (P, 2)
+      boxes_xyxy: (P, 4)
     """
-    if r.keypoints is None:
+    if r.keypoints is None or getattr(r.keypoints, "xy", None) is None:
         return None
 
-    xy = r.keypoints.xy.detach().cpu().numpy()  # (people, kpts, 2)
-    kc = None
-    if r.keypoints.conf is not None:
-        kc = r.keypoints.conf.detach().cpu().numpy()
+    xy = _to_numpy_or_none(r.keypoints.xy)
+    if xy is None:
+        return None
+    xy = np.asarray(xy, dtype=np.float32)
+    if xy.ndim != 3 or xy.shape[0] == 0:
+        return None
 
-    box_conf = None
-    if r.boxes is not None and r.boxes.conf is not None:
-        box_conf = r.boxes.conf.detach().cpu().numpy()
+    kc = _to_numpy_or_none(getattr(r.keypoints, "conf", None))
+    if kc is not None:
+        kc = np.asarray(kc, dtype=np.float32)
 
-    return {"xy": xy, "kc": kc, "box_conf": box_conf}
+    box_centers, box_conf, boxes_xyxy = extract_box_centers_conf(r)
+
+    return {
+        "xy": xy,
+        "kc": kc,
+        "box_conf": box_conf,
+        "box_centers": box_centers,
+        "boxes_xyxy": boxes_xyxy,
+    }
 
 
 # ----------------------------- CORE PIPELINE -----------------------------
@@ -183,6 +360,15 @@ def run_pose_on_frames(
     frame_labels = frames_df["label"].to_numpy()
     frame_window_ids = frames_df["window_id"].to_numpy()
 
+    target_center = np.array(
+        [w * config.target_x_frac, h * config.target_y_frac],
+        dtype=np.float32,
+    )
+    frame_diag = float(np.hypot(float(w), float(h)))
+    max_jump_px = float(config.max_jump_px) if config.max_jump_px is not None else float(config.max_jump_diag_frac * frame_diag)
+    prev_center: Optional[np.ndarray] = None
+    lost_count = 0
+
     for i, p in enumerate(frame_paths):
         frame = cv2.imread(p)
         if frame is None:
@@ -191,40 +377,93 @@ def run_pose_on_frames(
 
         results = model(frame, conf=config.conf_thres, verbose=False)
         r = results[0]
-
-        annotated = r.plot()
-        writer.write(annotated)
+        selected_xy: Optional[np.ndarray] = None
+        selected_kc: Optional[np.ndarray] = None
+        selected_box_xyxy: Optional[np.ndarray] = None
+        selected_person_conf = float("nan")
 
         pose = extract_pose_for_frame(r)
         if pose is None:
-            continue
+            lost_count += 1
+        else:
+            xy = pose["xy"]
+            kc = pose["kc"]
+            box_conf = pose["box_conf"]
+            box_centers = pose["box_centers"]
+            boxes_xyxy = pose["boxes_xyxy"]
 
-        xy = pose["xy"]
-        kc = pose["kc"]
-        box_conf = pose["box_conf"]
-
-        order = choose_people_order(r)
-        for j, idx in enumerate(order[:config.max_people]):
-            arrays["kpts_xy"][i, j] = xy[idx].astype(np.float32)
-
-            if kc is not None:
-                arrays["kpts_conf"][i, j] = kc[idx].astype(np.float32)
+            # Match pose rows to bbox rows before selection.
+            num_candidates = min(int(xy.shape[0]), int(box_centers.shape[0]), int(boxes_xyxy.shape[0]))
+            if num_candidates <= 0:
+                lost_count += 1
             else:
-                arrays["kpts_conf"][i, j] = np.nan
+                xy = xy[:num_candidates]
+                box_centers = box_centers[:num_candidates]
+                boxes_xyxy = boxes_xyxy[:num_candidates]
+                if box_conf is not None:
+                    box_conf = box_conf[:num_candidates]
+                if kc is not None and kc.ndim >= 2:
+                    kc = kc[:num_candidates]
+                else:
+                    kc = None
 
-            if box_conf is not None and idx < len(box_conf):
-                arrays["person_conf"][i, j] = float(box_conf[idx])
-            elif kc is not None:
-                arrays["person_conf"][i, j] = float(np.nanmean(kc[idx]))
-            else:
-                arrays["person_conf"][i, j] = np.nan
+                idx, new_center = select_person_idx(
+                    box_centers=box_centers,
+                    box_conf=box_conf,
+                    prev_center=prev_center,
+                    target_center=target_center,
+                    conf_min=config.conf_min,
+                    max_jump_px=max_jump_px,
+                )
 
-            if config.save_csv:
-                for k in range(config.num_kpts):
-                    x, y = arrays["kpts_xy"][i, j, k]
-                    kconf = arrays["kpts_conf"][i, j, k]
-                    pconf = arrays["person_conf"][i, j]
-                    csv_rows.append([i, j, k, float(x), float(y), float(kconf), float(pconf), p])
+                if idx is None:
+                    lost_count += 1
+                else:
+                    prev_center = new_center
+                    lost_count = 0
+
+                    selected_xy = xy[idx]
+                    selected_box_xyxy = boxes_xyxy[idx]
+                    if kc is not None and idx < kc.shape[0]:
+                        selected_kc = kc[idx]
+
+                    if box_conf is not None and idx < box_conf.shape[0] and np.isfinite(box_conf[idx]):
+                        selected_person_conf = float(box_conf[idx])
+                    elif selected_kc is not None:
+                        selected_person_conf = float(np.nanmean(selected_kc))
+
+                    if config.max_people > 0:
+                        j = 0
+                        xy_sel = np.asarray(selected_xy, dtype=np.float32)
+                        xy_count = min(config.num_kpts, int(xy_sel.shape[0]))
+                        arrays["kpts_xy"][i, j, :xy_count] = xy_sel[:xy_count]
+
+                        if selected_kc is not None:
+                            kc_sel = np.asarray(selected_kc, dtype=np.float32).reshape(-1)
+                            kc_count = min(config.num_kpts, int(kc_sel.shape[0]))
+                            arrays["kpts_conf"][i, j, :kc_count] = kc_sel[:kc_count]
+
+                        arrays["person_conf"][i, j] = selected_person_conf
+
+                        if config.save_csv:
+                            for k in range(config.num_kpts):
+                                x, y = arrays["kpts_xy"][i, j, k]
+                                kconf = arrays["kpts_conf"][i, j, k]
+                                pconf = arrays["person_conf"][i, j]
+                                csv_rows.append([i, j, k, float(x), float(y), float(kconf), float(pconf), p])
+
+        if lost_count > config.max_lost:
+            prev_center = None
+
+        annotated = draw_selected_pose(
+            frame=frame,
+            kpts_xy=selected_xy,
+            kpts_conf=selected_kc,
+            box_xyxy=selected_box_xyxy,
+            draw_kpt_threshold=config.draw_kpt_threshold,
+            draw_no_target_text=config.draw_no_target_text,
+        )
+        writer.write(annotated)
 
     writer.release()
 

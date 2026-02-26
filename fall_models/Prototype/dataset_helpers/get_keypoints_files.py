@@ -113,8 +113,11 @@ def main():
     cfg = PoseExportConfig(
         model_path=str(Path("pose_models/ultralytics/yolo11l-pose.pt")),
         conf_thres=0.25,
+        conf_min=0.75,
         fps=30,
         max_people=1,
+        max_jump_px=None,  # None => use max_jump_diag_frac * image_diagonal
+        max_lost=10,
         save_csv=False,
     )
 

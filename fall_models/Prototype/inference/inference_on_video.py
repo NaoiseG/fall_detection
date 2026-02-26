@@ -1295,6 +1295,95 @@ def feature_layout(use_conf: bool, add_vel: bool, add_acc: bool) -> Dict[str, Op
     return {"conf_idx": conf_idx, "vel_slice": vel_slice, "acc_slice": acc_slice}
 
 
+def _to_numpy_or_none(x: Any) -> Optional[np.ndarray]:
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    if isinstance(x, np.ndarray):
+        return x
+    return np.asarray(x)
+
+
+def _extract_box_centers_conf(r: Any) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Safely extract:
+      - box centers: (P, 2)
+      - box conf: (P,) or None
+    """
+    if r is None or getattr(r, "boxes", None) is None:
+        return np.empty((0, 2), dtype=np.float32), None
+
+    boxes_xyxy = _to_numpy_or_none(getattr(r.boxes, "xyxy", None))
+    if boxes_xyxy is None:
+        return np.empty((0, 2), dtype=np.float32), None
+    boxes_xyxy = np.asarray(boxes_xyxy, dtype=np.float32)
+    if boxes_xyxy.ndim != 2 or boxes_xyxy.shape[0] == 0 or boxes_xyxy.shape[1] < 4:
+        return np.empty((0, 2), dtype=np.float32), None
+
+    boxes_xyxy = boxes_xyxy[:, :4]
+    centers = np.column_stack(
+        (
+            0.5 * (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]),
+            0.5 * (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]),
+        )
+    ).astype(np.float32, copy=False)
+
+    box_conf = _to_numpy_or_none(getattr(r.boxes, "conf", None))
+    if box_conf is not None:
+        box_conf = np.asarray(box_conf, dtype=np.float32).reshape(-1)
+        if box_conf.shape[0] < centers.shape[0]:
+            pad = centers.shape[0] - box_conf.shape[0]
+            box_conf = np.pad(box_conf, (0, pad), mode="constant", constant_values=np.nan)
+        elif box_conf.shape[0] > centers.shape[0]:
+            box_conf = box_conf[: centers.shape[0]]
+
+    return centers, box_conf
+
+
+def select_person_idx(
+    box_centers: np.ndarray,
+    box_conf: Optional[np.ndarray],
+    prev_center: Optional[np.ndarray],
+    target_center: np.ndarray,
+    conf_min: float,
+    max_jump_px: float,
+) -> Tuple[Optional[int], Optional[np.ndarray]]:
+    """
+    Temporal target selection:
+      - Acquire (no prev_center): prefer conf >= conf_min, closest to target center.
+      - Track (has prev_center): closest to prev_center with max-jump gate.
+    """
+    num_people = int(box_centers.shape[0])
+    if num_people == 0:
+        return None, prev_center
+
+    if prev_center is None:
+        candidate_idx = np.arange(num_people, dtype=np.int32)
+        if box_conf is not None and box_conf.shape[0] >= num_people:
+            high_conf = np.where(np.isfinite(box_conf[:num_people]) & (box_conf[:num_people] >= float(conf_min)))[0]
+            if high_conf.size > 0:
+                candidate_idx = high_conf.astype(np.int32, copy=False)
+
+        dists = np.linalg.norm(box_centers[candidate_idx] - target_center[None, :], axis=1)
+        if dists.size == 0:
+            return None, prev_center
+
+        best_rel = int(np.argmin(dists))
+        best_idx = int(candidate_idx[best_rel])
+        return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+
+    dists = np.linalg.norm(box_centers - prev_center[None, :], axis=1)
+    if dists.size == 0:
+        return None, prev_center
+
+    best_idx = int(np.argmin(dists))
+    best_dist = float(dists[best_idx])
+    if not np.isfinite(best_dist) or best_dist > float(max_jump_px):
+        return None, prev_center
+    return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+
+
 def expected_in_features(
     use_conf: bool,
     add_vel: bool,
@@ -1326,7 +1415,11 @@ def pose_on_frame(
     device: str,
     max_people: int,
     use_half: bool,
-) -> Tuple[np.ndarray, np.ndarray]:
+    prev_center: Optional[np.ndarray],
+    target_center: np.ndarray,
+    conf_min: float,
+    max_jump_px: float,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], bool]:
     xy_zeros = np.zeros((K, 2), dtype=np.float32)
     cf_zeros = np.zeros((K,), dtype=np.float32)
 
@@ -1340,29 +1433,64 @@ def pose_on_frame(
         max_det=max(1, int(max_people)),
     )
     if not results or len(results) == 0 or results[0].keypoints is None:
-        return xy_zeros, cf_zeros
+        return xy_zeros, cf_zeros, prev_center, False
 
-    kpts = results[0].keypoints
+    r = results[0]
+    kpts = r.keypoints
     xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
     cf_all = kpts.conf.cpu().numpy() if (hasattr(kpts, "conf") and hasattr(kpts.conf, "cpu")) else None
+    box_centers, box_conf = _extract_box_centers_conf(r)
 
     if xy_all.ndim != 3 or xy_all.shape[0] == 0:
-        return xy_zeros, cf_zeros
+        return xy_zeros, cf_zeros, prev_center, False
     if xy_all.shape[1] != K:
         raise ValueError(f"Expected {K} keypoints, got {xy_all.shape[1]}")
 
-    if cf_all is not None and cf_all.ndim == 2:
-        scores = cf_all.sum(axis=1)
-        best = int(np.argmax(scores))
-        xy = xy_all[best].astype(np.float32, copy=False)
-        cf = cf_all[best].astype(np.float32, copy=False)
-        return xy, cf
+    num_candidates = int(xy_all.shape[0])
+    if box_centers.shape[0] > 0:
+        num_candidates = min(num_candidates, int(box_centers.shape[0]))
+    else:
+        box_centers = np.mean(xy_all, axis=1).astype(np.float32, copy=False)
 
-    # No confidences available: treat as all-ones (model will likely ignore if use_conf=False)
-    best = 0
-    xy = xy_all[best].astype(np.float32, copy=False)
-    cf = np.ones((K,), dtype=np.float32)
-    return xy, cf
+    if cf_all is not None and cf_all.ndim == 2:
+        num_candidates = min(num_candidates, int(cf_all.shape[0]))
+    else:
+        cf_all = None
+
+    if box_conf is not None:
+        num_candidates = min(num_candidates, int(box_conf.shape[0]))
+
+    if num_candidates <= 0:
+        return xy_zeros, cf_zeros, prev_center, False
+
+    xy_all = xy_all[:num_candidates]
+    box_centers = box_centers[:num_candidates]
+    if cf_all is not None:
+        cf_all = cf_all[:num_candidates]
+    if box_conf is not None:
+        box_conf = box_conf[:num_candidates]
+
+    idx, new_center = select_person_idx(
+        box_centers=box_centers,
+        box_conf=box_conf,
+        prev_center=prev_center,
+        target_center=target_center,
+        conf_min=float(conf_min),
+        max_jump_px=float(max_jump_px),
+    )
+    if idx is None:
+        return xy_zeros, cf_zeros, prev_center, False
+
+    xy = xy_all[idx].astype(np.float32, copy=False)
+    if cf_all is not None and idx < cf_all.shape[0]:
+        cf = cf_all[idx].astype(np.float32, copy=False)
+        if cf.shape[0] != K:
+            cf = np.ones((K,), dtype=np.float32)
+    else:
+        # No confidences available: treat as all-ones (model will likely ignore if use_conf=False)
+        cf = np.ones((K,), dtype=np.float32)
+
+    return xy, cf, new_center, True
 
 
 def make_window_features(
@@ -1570,7 +1698,33 @@ def main() -> int:
     ap.add_argument("--yolo-weights", type=str, default="pose_models/ultralytics/yolo11l-pose.pt")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--yolo-conf", type=float, default=0.25)
-    ap.add_argument("--max-people", type=int, default=1)
+    ap.add_argument(
+        "--max-people",
+        type=int,
+        default=10,
+        help="Maximum YOLO pose candidates per frame to consider for center-based target tracking.",
+    )
+    ap.add_argument(
+        "--track-conf-min",
+        type=float,
+        default=0.75,
+        help="During acquisition (no prior track), prefer boxes with conf >= this threshold.",
+    )
+    ap.add_argument(
+        "--track-max-jump-px",
+        type=float,
+        default=0.0,
+        help="Max tracked-center jump in pixels. <=0 => use frame diagonal * --track-max-jump-diag-frac.",
+    )
+    ap.add_argument(
+        "--track-max-jump-diag-frac",
+        type=float,
+        default=0.25,
+        help="Fallback jump gate as a fraction of frame diagonal when --track-max-jump-px <= 0.",
+    )
+    ap.add_argument("--track-max-lost", type=int, default=10, help="Reset tracking after this many consecutive misses.")
+    ap.add_argument("--track-target-x-frac", type=float, default=0.5, help="Target x location as fraction of frame width.")
+    ap.add_argument("--track-target-y-frac", type=float, default=0.5, help="Target y location as fraction of frame height.")
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--half", type=int, default=0, help="Use FP16 on CUDA for YOLO+temporal model (0/1)")
     ap.add_argument("--T", type=int, default=0, help="0 => use ckpt T_used/T, else override")
@@ -1639,6 +1793,25 @@ def main() -> int:
     frame_step = int(args.frame_step)
     if int(frame_step) <= 0:
         raise ValueError("--frame-step must be >= 1.")
+    if int(args.max_people) <= 0:
+        raise ValueError("--max-people must be >= 1.")
+
+    track_conf_min = float(args.track_conf_min)
+    if not np.isfinite(track_conf_min) or track_conf_min < 0.0:
+        raise ValueError("--track-conf-min must be a finite float >= 0.")
+    track_max_jump_px_arg = float(args.track_max_jump_px)
+    if not np.isfinite(track_max_jump_px_arg):
+        raise ValueError("--track-max-jump-px must be finite.")
+    track_max_jump_diag_frac = float(args.track_max_jump_diag_frac)
+    if not np.isfinite(track_max_jump_diag_frac) or track_max_jump_diag_frac <= 0.0:
+        raise ValueError("--track-max-jump-diag-frac must be a finite float > 0.")
+    track_max_lost = int(args.track_max_lost)
+    if track_max_lost < 0:
+        raise ValueError("--track-max-lost must be >= 0.")
+    track_target_x_frac = float(args.track_target_x_frac)
+    track_target_y_frac = float(args.track_target_y_frac)
+    if not np.isfinite(track_target_x_frac) or not np.isfinite(track_target_y_frac):
+        raise ValueError("--track-target-x-frac and --track-target-y-frac must be finite.")
 
     video_path = Path(args.video).expanduser()
     if not video_path.exists():
@@ -1667,6 +1840,8 @@ def main() -> int:
         f"[runtime] device={device} "
         f"(requested={args.device if args.device else 'auto'}, cuda_available={torch.cuda.is_available()}, half={int(use_half)})"
     )
+    if int(args.max_people) <= 1:
+        print("[track][WARN] --max-people=1 limits disambiguation when multiple people are present.")
 
     ckpt_path, arch = resolve_ckpt_and_arch(args.model, args.arch)
     print(f"[model] arch={arch} ckpt={ckpt_path.as_posix()}")
@@ -1819,6 +1994,14 @@ def main() -> int:
         if not np.isfinite(src_fps) or src_fps <= 1e-3:
             src_fps = 30.0
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        print(
+            "[track] "
+            f"conf_min={float(track_conf_min):.2f} "
+            f"max_lost={int(track_max_lost)} "
+            f"target=({float(track_target_x_frac):.2f},{float(track_target_y_frac):.2f}) "
+            f"jump_px={'auto' if float(track_max_jump_px_arg) <= 0.0 else f'{float(track_max_jump_px_arg):.1f}'} "
+            f"jump_diag_frac={float(track_max_jump_diag_frac):.3f}"
+        )
 
         fps_play = float(args.display_fps) if float(args.display_fps) > 1e-3 else float(src_fps)
         frame_period_s = 1.0 / max(1e-6, float(fps_play))
@@ -1840,6 +2023,10 @@ def main() -> int:
         cap_done = False
         last_xy = np.zeros((K, 2), dtype=np.float32)
         last_cf = np.zeros((K,), dtype=np.float32)
+        track_prev_center: Optional[np.ndarray] = None
+        track_target_center: Optional[np.ndarray] = None
+        track_max_jump_px: Optional[float] = None
+        track_lost_count = 0
 
         window_preds: Dict[int, Tuple[int, float, Optional[float]]] = {}
         window_stage_ms: Dict[int, Tuple[float, float]] = {}
@@ -1856,6 +2043,7 @@ def main() -> int:
 
         def process_next_frame() -> bool:
             nonlocal processed_total, sampled_total, cap_done, last_xy, last_cf
+            nonlocal track_prev_center, track_target_center, track_max_jump_px, track_lost_count
 
             cap_read_ms = 0.0
             if profile_enabled:
@@ -1873,10 +2061,22 @@ def main() -> int:
             xy = last_xy
             cf = last_cf
             if do_pose:
+                if track_target_center is None or track_max_jump_px is None:
+                    h_img, w_img = frame.shape[:2]
+                    track_target_center = np.array(
+                        [float(w_img) * float(track_target_x_frac), float(h_img) * float(track_target_y_frac)],
+                        dtype=np.float32,
+                    )
+                    frame_diag = float(np.hypot(float(w_img), float(h_img)))
+                    if float(track_max_jump_px_arg) > 0.0:
+                        track_max_jump_px = float(track_max_jump_px_arg)
+                    else:
+                        track_max_jump_px = float(track_max_jump_diag_frac) * float(frame_diag)
+
                 if profile_enabled:
                     _maybe_cuda_sync(sync_cuda_timing)
                     t_yolo0 = time.perf_counter()
-                xy, cf = pose_on_frame(
+                xy, cf, new_center, found = pose_on_frame(
                     pose_model=pose_model,
                     frame_bgr=frame,
                     imgsz=int(args.imgsz),
@@ -1884,7 +2084,18 @@ def main() -> int:
                     device=device,
                     max_people=int(args.max_people),
                     use_half=use_half,
+                    prev_center=track_prev_center,
+                    target_center=track_target_center,
+                    conf_min=float(track_conf_min),
+                    max_jump_px=float(track_max_jump_px),
                 )
+                if found:
+                    track_prev_center = new_center
+                    track_lost_count = 0
+                else:
+                    track_lost_count += 1
+                    if int(track_lost_count) > int(track_max_lost):
+                        track_prev_center = None
                 if profile_enabled:
                     _maybe_cuda_sync(sync_cuda_timing)
                     yolo_infer_ms = (time.perf_counter() - t_yolo0) * 1000.0

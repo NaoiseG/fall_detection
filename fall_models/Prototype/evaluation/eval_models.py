@@ -5,11 +5,11 @@ Evaluate one or more trained models on a chosen set of UP-Fall subjects, using t
 same NPZ -> window loading pipeline as training (dataset.py).
 
 Outputs (in --out-dir):
-- metrics_summary.csv   : per-model summary including
+- metrics_summary.csv   : per-model/per-split summary including
     * binary sensitivity (recall) and precision macro-averaged over fall/no-fall
     * per-class (fall, no-fall) precision/recall
     * multi-class macro F1
-- f1_per_class.csv      : per-model, per-class F1 (multi-class)
+- f1_per_class.csv      : per-model/per-split, per-class F1 (multi-class)
 - report.html           : tables + plots
 - plots/*.png           : quick comparison plots
 
@@ -178,6 +178,14 @@ def slug_models(models: List[str], max_len: int = 80) -> str:
     # safe folder component: letters, numbers, underscore and dash only
     s = "-".join(models)
     s = re.sub(r"[^a-zA-Z0-9_-]+", "_", s)
+    return s[:max_len]
+
+
+def slug_token(text: str, max_len: int = 80) -> str:
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(text))
+    s = s.strip("_")
+    if not s:
+        s = "na"
     return s[:max_len]
 
 
@@ -662,9 +670,18 @@ def make_plots(summary_df: pd.DataFrame, plots_dir: Path):
     import matplotlib.pyplot as plt
     ensure_dir(plots_dir)
 
+    if "eval_split" in summary_df.columns:
+        x_labels = [
+            f"{str(m)} [{str(s)}]"
+            for m, s in zip(summary_df["model"].tolist(), summary_df["eval_split"].tolist())
+        ]
+    else:
+        x_labels = [str(m) for m in summary_df["model"].tolist()]
+
     plt.figure()
-    plt.bar(summary_df["model"], summary_df["macro_f1"])
-    plt.xticks(rotation=30, ha="right")
+    x = np.arange(len(summary_df))
+    plt.bar(x, summary_df["macro_f1"])
+    plt.xticks(x, x_labels, rotation=30, ha="right")
     plt.ylabel("Macro F1 (multi-class)")
     plt.title("Macro F1 by model")
     plt.tight_layout()
@@ -676,7 +693,7 @@ def make_plots(summary_df: pd.DataFrame, plots_dir: Path):
     w = 0.4
     plt.bar(x - w/2, summary_df["binary_sensitivity_avg"], width=w, label="Sensitivity (avg)")
     plt.bar(x + w/2, summary_df["binary_precision_avg"], width=w, label="Precision (avg)")
-    plt.xticks(x, summary_df["model"], rotation=30, ha="right")
+    plt.xticks(x, x_labels, rotation=30, ha="right")
     plt.ylabel("Score")
     plt.title("Binary fall/no-fall metrics (macro-averaged)")
     plt.legend()
@@ -708,10 +725,23 @@ def make_html_report(
     """
 
     conf_parts = []
-    for m in model_list:
-        p = plots_dir / f"confusion_matrix_{m}.png"
-        if p.exists():
-            conf_parts.append(f"<div><h3>{m}</h3><img src='{plots_dir.name}/confusion_matrix_{m}.png' alt='Confusion matrix {m}'/></div>")
+    if "eval_split" in summary_df.columns:
+        unique_pairs = summary_df[["model", "eval_split"]].drop_duplicates()
+        for _, row in unique_pairs.iterrows():
+            m = str(row["model"])
+            split_name = str(row["eval_split"])
+            split_slug = slug_token(split_name)
+            rel_png = f"confusion_matrix_{m}_{split_slug}.png"
+            p = plots_dir / rel_png
+            if p.exists():
+                conf_parts.append(
+                    f"<div><h3>{m} [{split_name}]</h3><img src='{plots_dir.name}/{rel_png}' alt='Confusion matrix {m} {split_name}'/></div>"
+                )
+    else:
+        for m in model_list:
+            p = plots_dir / f"confusion_matrix_{m}.png"
+            if p.exists():
+                conf_parts.append(f"<div><h3>{m}</h3><img src='{plots_dir.name}/confusion_matrix_{m}.png' alt='Confusion matrix {m}'/></div>")
     conf_imgs = "\n".join(conf_parts) if conf_parts else "<p>No confusion matrices found.</p>"
 
     html = f"""<!doctype html>
@@ -778,7 +808,7 @@ def main():
         nargs="+",
         type=int,
         default=[1, 2],
-        help="One or more camera indices to evaluate on, e.g. --camera 1 or --camera 1 2 (default: 1 2).",
+        help="One or more camera indices to evaluate on; if multiple are given, outputs each camera split and a combined split.",
     )
     parser.add_argument("--test-subjects", type=str, default="1-1", help="Test subject range like '1-5'")
     parser.add_argument(
@@ -971,23 +1001,48 @@ def main():
 
     # Load test set using the SAME NPZ->windows pipeline
     OUTPUT_ROOT = Path(args.npz_root)
-    test_npzs: List[Path] = []
+    camera_to_test_npzs: Dict[int, List[Path]] = {}
     for camera_id in camera_ids:
-        test_npzs.extend(
-            Path(p)
-            for p in find_keypoints_npzs_subjects(
-                OUTPUT_ROOT,
-                camera=camera_id,
-                subjects=test_subjects,
-            )
+        cam_npzs = sorted(
+            set(
+                Path(p)
+                for p in find_keypoints_npzs_subjects(
+                    OUTPUT_ROOT,
+                    camera=camera_id,
+                    subjects=test_subjects,
+                )
+            ),
+            key=lambda p: p.as_posix(),
         )
-    test_npzs = sorted(set(test_npzs), key=lambda p: p.as_posix())
-    if not test_npzs:
+        if not cam_npzs:
+            raise RuntimeError(
+                f"No test NPZs found for camera={camera_id}. Check OUTPUT_ROOT and test subjects={test_subjects}."
+            )
+        camera_to_test_npzs[int(camera_id)] = cam_npzs
+
+    if len(camera_ids) > 1:
+        combined_test_npzs = sorted(
+            set(p for cam in camera_ids for p in camera_to_test_npzs[int(cam)]),
+            key=lambda p: p.as_posix(),
+        )
+        eval_splits: List[Tuple[str, List[int], List[Path]]] = [
+            (f"camera_{int(cam)}", [int(cam)], list(camera_to_test_npzs[int(cam)]))
+            for cam in camera_ids
+        ]
+        eval_splits.append(("combined", list(camera_ids), combined_test_npzs))
+    else:
+        only_cam = int(camera_ids[0])
+        combined_test_npzs = list(camera_to_test_npzs[only_cam])
+        eval_splits = [("combined", [only_cam], combined_test_npzs)]
+
+    if not combined_test_npzs:
         raise RuntimeError(f"No test NPZs found. Check OUTPUT_ROOT, camera(s)={camera_ids}, and test subjects.")
     print("Cameras:", camera_ids)
+    for split_name, split_camera_ids, split_npzs in eval_splits:
+        print(f"[split] {split_name}: cameras={split_camera_ids} npzs={len(split_npzs)}")
 
     # ---- Detect raw label convention once (1-11 vs 0-10), then keep it consistent ----
-    label_convention, label_stats = detect_label_convention_from_npzs(test_npzs)
+    label_convention, label_stats = detect_label_convention_from_npzs(combined_test_npzs)
     NEW_LABEL_NAMES = get_new_label_names(label_convention)
     labels_all = list(range(len(NEW_LABEL_NAMES))) #New ==========================================================
     FALL_MERGE_SET = fall_merge_set(label_convention)
@@ -1015,12 +1070,19 @@ def main():
     if frame_step > 1:
         npz_subsample_ctx = tempfile.TemporaryDirectory(prefix=f"eval_models_k{frame_step}_")
         npz_cache_dir = Path(npz_subsample_ctx.name)
-        test_npzs = _materialize_frame_step_npzs(
-            npz_paths=test_npzs,
-            frame_step=frame_step,
-            cache_dir=npz_cache_dir,
-            cache=npz_subsample_cache,
-        )
+        eval_splits = [
+            (
+                split_name,
+                split_camera_ids,
+                _materialize_frame_step_npzs(
+                    npz_paths=split_npzs,
+                    frame_step=frame_step,
+                    cache_dir=npz_cache_dir,
+                    cache=npz_subsample_cache,
+                ),
+            )
+            for split_name, split_camera_ids, split_npzs in eval_splits
+        ]
         print(f"[window] --frame-step={frame_step}: using subsampled NPZ cache at {npz_cache_dir.as_posix()}")
 
     summary_rows: List[Dict[str, object]] = []
@@ -1272,315 +1334,341 @@ def main():
             extra["fall_ids_0based"] = fall_class_ids_0based
             extra["fall_pct"] = fall_pct_ckpt
 
-        # Load windows using ckpt settings
-        X_test, y_test_tags, _T_used = load_windows_from_npzs(
-            test_npzs,
-            T=T_ckpt,
-            use_conf=use_conf_ckpt,
-            normalize=normalize_ckpt,
-            normalize_mode=normalize_mode_ckpt,
-            add_vel=add_vel_ckpt,
-            add_acc=add_acc_ckpt,
-            add_global=add_global_ckpt,
-            feature_mode=feature_mode_ckpt,
-            motion_xy_scale=motion_xy_scale_ckpt,
-            conf_thres=conf_thres_ckpt,
-            max_interp_gap=max_interp_gap_ckpt,
-            missing_mode=missing_mode_ckpt,
-            interp_mode=interp_mode_ckpt,
-            interp_group=interp_group_ckpt,
-            stride=stride_ckpt,
-            label_mode=label_mode_ckpt,
-            min_valid_frac=min_valid_frac_ckpt,
-            add_mask_channel=add_mask_channel_ckpt,
-            drop_ambig_share=drop_ambig_share_ckpt,
-            drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
-            rp_center_mode=rp_center_mode_ckpt,
-            rp_img_w=rp_img_w_ckpt,
-            rp_img_h=rp_img_h_ckpt,
-            **extra,
-            label_convention=label_convention,
-        )
-        T_used = int(_T_used)
-
-        print("Window length (T):", T_used)
-
-        y_test = y_test_tags.astype(np.int64, copy=False)
-
-        if is_rf:
-            num_classes_eval = int(NUM_CLASSES_MERGED)
-            probs_test = rf_predict_probs(
-                rf_model,
-                X_windows=X_test,
-                feature_mode=rf_feature_mode,
-                num_classes=num_classes_eval,
-                expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
-            )
-            y_true = y_test
-            fall_prob_test = None
-            y_pred = probs_test.argmax(axis=1).astype(int)
-        else:
-            # Finalise dims for no-metadata checkpoints
-            if "state_dict" not in ckpt:
-                num_classes = int(y_test.max() + 1)
-
-            test_ds = WindowTensorDataset(X_test, y_test)
-
-            sample_X0, _ = test_ds[0]
-            in_features_now = int(sample_X0.shape[-1])
-            if node_features_ckpt is None and (in_features_now % 17 == 0):
-                node_features_ckpt = in_features_now // 17
-
-            if "state_dict" in ckpt and in_features_now != in_features:
-                raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
-
-            in_features_final = in_features if "state_dict" in ckpt else in_features_now
-
-            test_loader = DataLoader(
-                test_ds,
-                batch_size=args.batch_size,
-                shuffle=False,
-                drop_last=False,
-                num_workers=args.num_workers,
-                pin_memory=True,
+        for split_name, split_camera_ids, split_test_npzs in eval_splits:
+            split_slug = slug_token(split_name)
+            print(
+                f"[{m}][{split_name}] evaluating cameras={split_camera_ids} "
+                f"on {len(split_test_npzs)} NPZ files"
             )
 
-            model = get_model(
-                m,
-                in_features=in_features_final,
-                num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
-                device=args.device,
-                T_used=T_used,
-                node_features=node_features_ckpt,
+            # Load windows using ckpt settings
+            X_test, y_test_tags, _T_used = load_windows_from_npzs(
+                split_test_npzs,
+                T=T_ckpt,
+                use_conf=use_conf_ckpt,
+                normalize=normalize_ckpt,
+                normalize_mode=normalize_mode_ckpt,
+                add_vel=add_vel_ckpt,
+                add_acc=add_acc_ckpt,
+                add_global=add_global_ckpt,
+                feature_mode=feature_mode_ckpt,
+                motion_xy_scale=motion_xy_scale_ckpt,
+                conf_thres=conf_thres_ckpt,
+                max_interp_gap=max_interp_gap_ckpt,
+                missing_mode=missing_mode_ckpt,
+                interp_mode=interp_mode_ckpt,
+                interp_group=interp_group_ckpt,
+                stride=stride_ckpt,
+                label_mode=label_mode_ckpt,
+                min_valid_frac=min_valid_frac_ckpt,
+                add_mask_channel=add_mask_channel_ckpt,
+                drop_ambig_share=drop_ambig_share_ckpt,
+                drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+                rp_center_mode=rp_center_mode_ckpt,
+                rp_img_w=rp_img_w_ckpt,
+                rp_img_h=rp_img_h_ckpt,
+                **extra,
+                label_convention=label_convention,
             )
+            T_used = int(_T_used)
+            print(f"[{m}][{split_name}] Window length (T):", T_used)
 
-            model.load_state_dict(state, strict=False)
-            model_params_m = float(count_params_m(model))
+            y_test = y_test_tags.astype(np.int64, copy=False)
 
-            # Multi-class predictions + optional fall head probability
-            y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
-            y_pred = probs_test.argmax(axis=1).astype(int)
-
-        # Confusion matrix
-        if not is_rf:
-            num_classes_eval = int(num_classes if "state_dict" in ckpt else NUM_CLASSES_MERGED)
-        labels_all = list(range(num_classes_eval))
-        cm_counts = confusion_matrix(y_true, y_pred, labels=labels_all).astype(np.float64)
-
-        # Normalized confusion matrix for CSV/plot
-        row_sums = cm_counts.sum(axis=1, keepdims=True) + 1e-9
-        cm = cm_counts / row_sums
-
-        if len(NEW_LABEL_NAMES) >= num_classes_eval:
-            cm_names = NEW_LABEL_NAMES[:num_classes_eval]
-        else:
-            cm_names = [str(i) for i in labels_all]
-
-        cm_csv = out_dir / f"confusion_matrix_{m}.csv"
-        pd.DataFrame(cm, index=cm_names, columns=cm_names).to_csv(cm_csv)
-        make_cm_plot(cm, cm_names, plots_dir / f"confusion_matrix_{m}.png", title=f"Confusion Matrix: {m}")
-
-        # Overall multi-class metrics (macro over classes present in this split)
-        eps = 1e-12
-        support = cm_counts.sum(axis=1)
-        valid = support > 0
-
-        tp = np.diag(cm_counts)
-        pred_support = cm_counts.sum(axis=0)
-        recall = tp / (support + eps)
-        precision = tp / (pred_support + eps)
-        f1 = 2.0 * precision * recall / (precision + recall + eps)
-        specificity = specificity_from_cm(cm_counts, eps=eps)
-
-        total = float(np.sum(cm_counts))
-        acc = float(np.sum(tp) / total) if total > 0 else 0.0
-        macro_recall = float(np.mean(recall[valid])) if np.any(valid) else 0.0
-        macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
-        macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
-        macro_f1 = float(np.mean(f1[valid])) if np.any(valid) else 0.0
-
-        for lab, f1v in zip(labels_all, f1):
-            name = cm_names[lab] if 0 <= lab < len(cm_names) else str(lab)
-            f1_rows.append({"model": m, "class_id": int(lab), "class_name": name, "f1": float(f1v)})
-
-        overall_rows.append({
-            "model": m,
-            "accuracy": float(acc) * 100.0,
-            "recall": float(macro_recall) * 100.0,
-            "specificity": float(macro_specificity) * 100.0,
-            "precision": float(macro_precision) * 100.0,
-            "f1_score": float(macro_f1) * 100.0,
-        })
-
-        y_true_bin = collapse_to_binary(y_true, fall_class_ids_0based)
-
-        # Binary fall score P(fall)
-        if fall_prob_test is not None:
-            p_fall_test = fall_prob_test.astype(np.float32)
-            p_fall_source = "fall_head"
-        else:
-            p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based).astype(np.float32)
-            p_fall_source = "rf_predict_proba" if is_rf else "activity_softmax"
-
-        tuned_thr = None
-        tuned_prec = None
-        tuned_rec = None
-        tuned_fbeta = None
-
-        if str(args.binary_mode).lower() == "argmax":
-            y_pred_bin = collapse_to_binary(y_pred, fall_class_ids_0based)
-            thr = None
-        else:
-            # Thresholded decision on P(fall)
-            if args.threshold is not None:
-                thr = float(args.threshold)
-            elif args.tune_subjects is not None:
-                tune_subjects = parse_range(args.tune_subjects)
-                tune_npzs: List[Path] = []
-                for camera_id in camera_ids:
-                    tune_npzs.extend(
-                        Path(p)
-                        for p in find_keypoints_npzs_subjects(
-                            OUTPUT_ROOT,
-                            camera=camera_id,
-                            subjects=tune_subjects,
-                        )
-                    )
-                tune_npzs = sorted(set(tune_npzs), key=lambda p: p.as_posix())
-                if not tune_npzs:
-                    raise RuntimeError(f"No tune NPZs found. Check OUTPUT_ROOT, camera(s)={camera_ids}, and tune subjects.")
-                if frame_step > 1:
-                    tune_npzs = _materialize_frame_step_npzs(
-                        npz_paths=tune_npzs,
-                        frame_step=frame_step,
-                        cache_dir=npz_cache_dir,
-                        cache=npz_subsample_cache,
-                    )
-
-                X_tune, y_tune_tags, _ = load_windows_from_npzs(
-                    tune_npzs,
-                    T=T_ckpt,
-                    use_conf=use_conf_ckpt,
-                    normalize=normalize_ckpt,
-                    normalize_mode=normalize_mode_ckpt,
-                    add_vel=add_vel_ckpt,
-                    add_acc=add_acc_ckpt,
-                    add_global=add_global_ckpt,
-                    feature_mode=feature_mode_ckpt,
-                    motion_xy_scale=motion_xy_scale_ckpt,
-                    conf_thres=conf_thres_ckpt,
-                    max_interp_gap=max_interp_gap_ckpt,
-                    missing_mode=missing_mode_ckpt,
-                    interp_mode=interp_mode_ckpt,
-                    interp_group=interp_group_ckpt,
-                    stride=stride_ckpt,
-                    label_mode=label_mode_ckpt,
-                    min_valid_frac=min_valid_frac_ckpt,
-                    add_mask_channel=add_mask_channel_ckpt,
-                    drop_ambig_share=drop_ambig_share_ckpt,
-                    drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
-                    rp_center_mode=rp_center_mode_ckpt,
-                    rp_img_w=rp_img_w_ckpt,
-                    rp_img_h=rp_img_h_ckpt,
-                    **extra,
-                    label_convention=label_convention,
+            if is_rf:
+                num_classes_eval = int(NUM_CLASSES_MERGED)
+                probs_test = rf_predict_probs(
+                    rf_model,
+                    X_windows=X_test,
+                    feature_mode=rf_feature_mode,
+                    num_classes=num_classes_eval,
+                    expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
                 )
-
-                y_tune = y_tune_tags.astype(np.int64, copy=False)
-                if is_rf:
-                    y_tune_true = y_tune
-                    probs_tune = rf_predict_probs(
-                        rf_model,
-                        X_windows=X_tune,
-                        feature_mode=rf_feature_mode,
-                        num_classes=num_classes_eval,
-                        expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
-                    )
-                    fall_prob_tune = None
-                else:
-                    tune_ds = WindowTensorDataset(X_tune, y_tune)
-                    tune_loader = DataLoader(
-                        tune_ds,
-                        batch_size=args.batch_size,
-                        shuffle=False,
-                        drop_last=False,
-                        num_workers=args.num_workers,
-                        pin_memory=True,
-                    )
-
-                    y_tune_true, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
-                y_tune_bin = collapse_to_binary(y_tune_true, fall_class_ids_0based)
-
-                if fall_prob_tune is not None:
-                    p_fall_tune = fall_prob_tune.astype(np.float32)
-                else:
-                    p_fall_tune = p_fall_from_probs(probs_tune, fall_class_ids_0based).astype(np.float32)
-
-                thr, tuned_prec, tuned_rec, tuned_fbeta = pick_threshold_fbeta(
-                    y_tune_bin, p_fall_tune, beta=float(args.beta)
-                )
-                tuned_thr = thr
+                y_true = y_test
+                fall_prob_test = None
+                y_pred = probs_test.argmax(axis=1).astype(int)
             else:
-                thr = 0.5
+                # Finalise dims for no-metadata checkpoints
+                if "state_dict" not in ckpt:
+                    num_classes = int(y_test.max() + 1)
 
-            y_pred_bin = (p_fall_test >= float(thr)).astype(int)
+                test_ds = WindowTensorDataset(X_test, y_test)
 
-        # Keep for reporting
-        chosen_thr = float(thr) if thr is not None else None
+                sample_X0, _ = test_ds[0]
+                in_features_now = int(sample_X0.shape[-1])
+                if node_features_ckpt is None and (in_features_now % 17 == 0):
+                    node_features_ckpt = in_features_now // 17
 
-        pr, rc, f1b, _ = precision_recall_fscore_support(
-            y_true_bin, y_pred_bin, labels=[0, 1], average=None, zero_division=0
-        )
+                if "state_dict" in ckpt and in_features_now != in_features:
+                    raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
 
-        summary_rows.append({
-            "model": m,
-            "n_samples": int(len(y_true)),
-            "params_m": float(model_params_m),
-            "macro_f1": float(macro_f1),
-            "binary_mode": str(args.binary_mode).lower(),
-            "p_fall_source": p_fall_source,  # NEW: records which score was used
-            "threshold": chosen_thr,
-            "beta": float(args.beta) if str(args.binary_mode).lower() == "threshold" else None,
-            "tune_subjects": str(args.tune_subjects) if args.tune_subjects is not None else None,
-            "tuned_threshold": tuned_thr,
-            "tuned_precision_fall": tuned_prec,
-            "tuned_recall_fall": tuned_rec,
-            "tuned_fbeta": tuned_fbeta,
-            "binary_precision_avg": float(np.mean(pr)),
-            "binary_sensitivity_avg": float(np.mean(rc)),
-            "binary_precision_fall": float(pr[1]),
-            "binary_sensitivity_fall": float(rc[1]),
-            "binary_precision_no_fall": float(pr[0]),
-            "binary_sensitivity_no_fall": float(rc[0]),
-            "binary_f1_avg": float(np.mean(f1b)),
-            "binary_f1_fall": float(f1b[1]),
-            "binary_f1_no_fall": float(f1b[0]),
-            "weights": ckpt_path.as_posix(),
-            "camera": ",".join(str(c) for c in camera_ids),
-            "subjects": ",".join(str(s) for s in test_subjects),
-            "frame_step": int(frame_step),
-            "window_T_raw": int(T_ckpt_raw),
-            "window_stride_raw": int(stride_ckpt_raw),
-            "window_T_sampled": int(T_ckpt),
-            "window_stride_sampled": int(stride_ckpt),
-            "normalize_mode": str(normalize_mode_ckpt),
-            "missing_mode": str(missing_mode_ckpt),
-            "interp_mode": str(interp_mode_ckpt),
-            "interp_group": int(interp_group_ckpt),
-            "rp_center_mode": str(rp_center_mode_ckpt),
-            "rp_img_w": rp_img_w_ckpt,
-            "rp_img_h": rp_img_h_ckpt,
-            "feature_mode": str(feature_mode_ckpt),
-            "motion_xy_scale": float(motion_xy_scale_ckpt),
-        })
+                in_features_final = in_features if "state_dict" in ckpt else in_features_now
+
+                test_loader = DataLoader(
+                    test_ds,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    drop_last=False,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                )
+
+                model = get_model(
+                    m,
+                    in_features=in_features_final,
+                    num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
+                    device=args.device,
+                    T_used=T_used,
+                    node_features=node_features_ckpt,
+                )
+
+                model.load_state_dict(state, strict=False)
+                model_params_m = float(count_params_m(model))
+
+                # Multi-class predictions + optional fall head probability
+                y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
+                y_pred = probs_test.argmax(axis=1).astype(int)
+
+            # Confusion matrix
+            if not is_rf:
+                num_classes_eval = int(num_classes if "state_dict" in ckpt else NUM_CLASSES_MERGED)
+            labels_all = list(range(num_classes_eval))
+            cm_counts = confusion_matrix(y_true, y_pred, labels=labels_all).astype(np.float64)
+
+            # Normalized confusion matrix for CSV/plot
+            row_sums = cm_counts.sum(axis=1, keepdims=True) + 1e-9
+            cm = cm_counts / row_sums
+
+            if len(NEW_LABEL_NAMES) >= num_classes_eval:
+                cm_names = NEW_LABEL_NAMES[:num_classes_eval]
+            else:
+                cm_names = [str(i) for i in labels_all]
+
+            cm_csv = out_dir / f"confusion_matrix_{m}_{split_slug}.csv"
+            pd.DataFrame(cm, index=cm_names, columns=cm_names).to_csv(cm_csv)
+            make_cm_plot(
+                cm,
+                cm_names,
+                plots_dir / f"confusion_matrix_{m}_{split_slug}.png",
+                title=f"Confusion Matrix: {m} [{split_name}]",
+            )
+
+            # Overall multi-class metrics (macro over classes present in this split)
+            eps = 1e-12
+            support = cm_counts.sum(axis=1)
+            valid = support > 0
+
+            tp = np.diag(cm_counts)
+            pred_support = cm_counts.sum(axis=0)
+            recall = tp / (support + eps)
+            precision = tp / (pred_support + eps)
+            f1 = 2.0 * precision * recall / (precision + recall + eps)
+            specificity = specificity_from_cm(cm_counts, eps=eps)
+
+            total = float(np.sum(cm_counts))
+            acc = float(np.sum(tp) / total) if total > 0 else 0.0
+            macro_recall = float(np.mean(recall[valid])) if np.any(valid) else 0.0
+            macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
+            macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
+            macro_f1 = float(np.mean(f1[valid])) if np.any(valid) else 0.0
+
+            for lab, f1v in zip(labels_all, f1):
+                name = cm_names[lab] if 0 <= lab < len(cm_names) else str(lab)
+                f1_rows.append({
+                    "model": m,
+                    "eval_split": split_name,
+                    "class_id": int(lab),
+                    "class_name": name,
+                    "f1": float(f1v),
+                })
+
+            overall_rows.append({
+                "model": m,
+                "eval_split": split_name,
+                "camera": ",".join(str(c) for c in split_camera_ids),
+                "n_samples": int(len(y_true)),
+                "accuracy": float(acc) * 100.0,
+                "recall": float(macro_recall) * 100.0,
+                "specificity": float(macro_specificity) * 100.0,
+                "precision": float(macro_precision) * 100.0,
+                "f1_score": float(macro_f1) * 100.0,
+            })
+
+            y_true_bin = collapse_to_binary(y_true, fall_class_ids_0based)
+
+            # Binary fall score P(fall)
+            if fall_prob_test is not None:
+                p_fall_test = fall_prob_test.astype(np.float32)
+                p_fall_source = "fall_head"
+            else:
+                p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based).astype(np.float32)
+                p_fall_source = "rf_predict_proba" if is_rf else "activity_softmax"
+
+            tuned_thr = None
+            tuned_prec = None
+            tuned_rec = None
+            tuned_fbeta = None
+
+            if str(args.binary_mode).lower() == "argmax":
+                y_pred_bin = collapse_to_binary(y_pred, fall_class_ids_0based)
+                thr = None
+            else:
+                # Thresholded decision on P(fall)
+                if args.threshold is not None:
+                    thr = float(args.threshold)
+                elif args.tune_subjects is not None:
+                    tune_subjects = parse_range(args.tune_subjects)
+                    tune_npzs: List[Path] = []
+                    for camera_id in split_camera_ids:
+                        tune_npzs.extend(
+                            Path(p)
+                            for p in find_keypoints_npzs_subjects(
+                                OUTPUT_ROOT,
+                                camera=camera_id,
+                                subjects=tune_subjects,
+                            )
+                        )
+                    tune_npzs = sorted(set(tune_npzs), key=lambda p: p.as_posix())
+                    if not tune_npzs:
+                        raise RuntimeError(
+                            f"No tune NPZs found for split={split_name}. "
+                            f"Check OUTPUT_ROOT, camera(s)={split_camera_ids}, and tune subjects."
+                        )
+                    if frame_step > 1:
+                        tune_npzs = _materialize_frame_step_npzs(
+                            npz_paths=tune_npzs,
+                            frame_step=frame_step,
+                            cache_dir=npz_cache_dir,
+                            cache=npz_subsample_cache,
+                        )
+
+                    X_tune, y_tune_tags, _ = load_windows_from_npzs(
+                        tune_npzs,
+                        T=T_ckpt,
+                        use_conf=use_conf_ckpt,
+                        normalize=normalize_ckpt,
+                        normalize_mode=normalize_mode_ckpt,
+                        add_vel=add_vel_ckpt,
+                        add_acc=add_acc_ckpt,
+                        add_global=add_global_ckpt,
+                        feature_mode=feature_mode_ckpt,
+                        motion_xy_scale=motion_xy_scale_ckpt,
+                        conf_thres=conf_thres_ckpt,
+                        max_interp_gap=max_interp_gap_ckpt,
+                        missing_mode=missing_mode_ckpt,
+                        interp_mode=interp_mode_ckpt,
+                        interp_group=interp_group_ckpt,
+                        stride=stride_ckpt,
+                        label_mode=label_mode_ckpt,
+                        min_valid_frac=min_valid_frac_ckpt,
+                        add_mask_channel=add_mask_channel_ckpt,
+                        drop_ambig_share=drop_ambig_share_ckpt,
+                        drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+                        rp_center_mode=rp_center_mode_ckpt,
+                        rp_img_w=rp_img_w_ckpt,
+                        rp_img_h=rp_img_h_ckpt,
+                        **extra,
+                        label_convention=label_convention,
+                    )
+
+                    y_tune = y_tune_tags.astype(np.int64, copy=False)
+                    if is_rf:
+                        y_tune_true = y_tune
+                        probs_tune = rf_predict_probs(
+                            rf_model,
+                            X_windows=X_tune,
+                            feature_mode=rf_feature_mode,
+                            num_classes=num_classes_eval,
+                            expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
+                        )
+                        fall_prob_tune = None
+                    else:
+                        tune_ds = WindowTensorDataset(X_tune, y_tune)
+                        tune_loader = DataLoader(
+                            tune_ds,
+                            batch_size=args.batch_size,
+                            shuffle=False,
+                            drop_last=False,
+                            num_workers=args.num_workers,
+                            pin_memory=True,
+                        )
+
+                        y_tune_true, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
+                    y_tune_bin = collapse_to_binary(y_tune_true, fall_class_ids_0based)
+
+                    if fall_prob_tune is not None:
+                        p_fall_tune = fall_prob_tune.astype(np.float32)
+                    else:
+                        p_fall_tune = p_fall_from_probs(probs_tune, fall_class_ids_0based).astype(np.float32)
+
+                    thr, tuned_prec, tuned_rec, tuned_fbeta = pick_threshold_fbeta(
+                        y_tune_bin, p_fall_tune, beta=float(args.beta)
+                    )
+                    tuned_thr = thr
+                else:
+                    thr = 0.5
+
+                y_pred_bin = (p_fall_test >= float(thr)).astype(int)
+
+            # Keep for reporting
+            chosen_thr = float(thr) if thr is not None else None
+
+            pr, rc, f1b, _ = precision_recall_fscore_support(
+                y_true_bin, y_pred_bin, labels=[0, 1], average=None, zero_division=0
+            )
+
+            summary_rows.append({
+                "model": m,
+                "eval_split": split_name,
+                "n_samples": int(len(y_true)),
+                "params_m": float(model_params_m),
+                "macro_f1": float(macro_f1),
+                "binary_mode": str(args.binary_mode).lower(),
+                "p_fall_source": p_fall_source,  # records which score was used
+                "threshold": chosen_thr,
+                "beta": float(args.beta) if str(args.binary_mode).lower() == "threshold" else None,
+                "tune_subjects": str(args.tune_subjects) if args.tune_subjects is not None else None,
+                "tuned_threshold": tuned_thr,
+                "tuned_precision_fall": tuned_prec,
+                "tuned_recall_fall": tuned_rec,
+                "tuned_fbeta": tuned_fbeta,
+                "binary_precision_avg": float(np.mean(pr)),
+                "binary_sensitivity_avg": float(np.mean(rc)),
+                "binary_precision_fall": float(pr[1]),
+                "binary_sensitivity_fall": float(rc[1]),
+                "binary_precision_no_fall": float(pr[0]),
+                "binary_sensitivity_no_fall": float(rc[0]),
+                "binary_f1_avg": float(np.mean(f1b)),
+                "binary_f1_fall": float(f1b[1]),
+                "binary_f1_no_fall": float(f1b[0]),
+                "weights": ckpt_path.as_posix(),
+                "camera": ",".join(str(c) for c in split_camera_ids),
+                "subjects": ",".join(str(s) for s in test_subjects),
+                "frame_step": int(frame_step),
+                "window_T_raw": int(T_ckpt_raw),
+                "window_stride_raw": int(stride_ckpt_raw),
+                "window_T_sampled": int(T_ckpt),
+                "window_stride_sampled": int(stride_ckpt),
+                "normalize_mode": str(normalize_mode_ckpt),
+                "missing_mode": str(missing_mode_ckpt),
+                "interp_mode": str(interp_mode_ckpt),
+                "interp_group": int(interp_group_ckpt),
+                "rp_center_mode": str(rp_center_mode_ckpt),
+                "rp_img_w": rp_img_w_ckpt,
+                "rp_img_h": rp_img_h_ckpt,
+                "feature_mode": str(feature_mode_ckpt),
+                "motion_xy_scale": float(motion_xy_scale_ckpt),
+            })
 
     if not summary_rows:
         raise RuntimeError("No models were evaluated. Check --models/--all and --frame-step compatibility.")
 
-    summary_df = pd.DataFrame(summary_rows).sort_values("macro_f1", ascending=False).reset_index(drop=True)
-    f1_long = pd.DataFrame(f1_rows).sort_values(["model", "class_id"]).reset_index(drop=True)
-
-    overall_df = summary_df[["model"]].merge(pd.DataFrame(overall_rows), on="model", how="left").round(3)
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        ["eval_split", "macro_f1"],
+        ascending=[True, False],
+    ).reset_index(drop=True)
+    f1_long = pd.DataFrame(f1_rows).sort_values(["eval_split", "model", "class_id"]).reset_index(drop=True)
+    overall_df = pd.DataFrame(overall_rows).sort_values(["eval_split", "model"]).reset_index(drop=True).round(3)
 
     summary_csv = out_dir / "metrics_summary.csv"
     f1_csv = out_dir / "f1_per_class.csv"
