@@ -793,7 +793,12 @@ def main() -> None:
     parser.set_defaults(use_class_weights=True)
 
     # Optional overrides
-    parser.add_argument("--data-pkl", type=str, default=None, help="Override dataset pkl path (default: data/action/<dataset>.pkl).")
+    parser.add_argument(
+        "--data-pkl",
+        type=str,
+        default=None,
+        help="Override dataset pkl path (default: data/action/upfall_test.pkl).",
+    )
     parser.add_argument("--split-base", type=str, default=None, help="Override base split name (default: config data_split, e.g. xsub).")
 
     args_cli = parser.parse_args()
@@ -847,11 +852,11 @@ def main() -> None:
 
     scale_range_test = getattr(cfg, "scale_range_test", None)
 
-    # Resolve original pkl path
+    # Resolve original pkl path (default is upfall_test.pkl unless overridden)
     if args_cli.data_pkl is not None:
         src_pkl = Path(args_cli.data_pkl).expanduser().resolve()
     else:
-        src_pkl = repo_root / "data" / "action" / f"{dataset_name}.pkl"
+        src_pkl = repo_root / "data" / "action" / "upfall_test.pkl"
     if not src_pkl.exists():
         raise FileNotFoundError(f"Dataset pkl not found: {src_pkl.as_posix()}")
 
