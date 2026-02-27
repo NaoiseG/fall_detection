@@ -20,12 +20,17 @@ CLASSIFICATION_MODELS = {
     "tcn": "tcn/tcn_best.pt",
     "cnn-lstm": "cnnlstm/cnnlstm_best.pt",
     "st-gcn": "stgcn/stgcn_best.pt",
+    "gru": "gru/gru_best.pt",
 }
 
 # TODO: Replace each value with the actual relative checkpoint path under
 # .\models\keypoint\... for your project.
 KEYPOINT_MODELS = {
-    "ultralytics-yolo11l": "ultralytics-yolo11l/yolo11l-pose.pt",
+    "ultralytics-yolo11n": "ultralytics/yolo11n-pose.pt",
+    "ultralytics-yolo11s": "ultralytics/yolo11s-pose.pt",
+    "ultralytics-yolo11m": "ultralytics/yolo11m-pose.pt",
+    "ultralytics-yolo11l": "ultralytics/yolo11l-pose.pt",
+    "ultralytics-yolo11x": "ultralytics/yolo11x-pose.pt",
 }
 
 

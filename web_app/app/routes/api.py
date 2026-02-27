@@ -68,6 +68,38 @@ def _windows_rel_path(base_prefix, relative_path):
     return f"{base_prefix}\\{cleaned}"
 
 
+def _keypoint_models_root() -> Path:
+    return (get_web_app_root() / "models" / "keypoint").resolve()
+
+
+def _ensure_keypoint_weights(relative_path: str) -> Path:
+    keypoint_root = _keypoint_models_root()
+    weights_rel_path = Path(relative_path)
+    if weights_rel_path.is_absolute():
+        raise ValueError("Keypoint model path must be relative.")
+
+    weights_path = (keypoint_root / weights_rel_path).resolve()
+    try:
+        weights_path.relative_to(keypoint_root)
+    except ValueError as error:
+        raise ValueError("Invalid keypoint model path.") from error
+
+    if weights_path.is_file():
+        return weights_path
+
+    weights_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use Ultralytics' official asset downloader when a known model file is missing.
+    from ultralytics.utils.downloads import attempt_download_asset
+
+    attempt_download_asset(str(weights_path))
+
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"Missing keypoint model weights: {weights_path}")
+
+    return weights_path
+
+
 @api_bp.get("/health")
 def health():
     return jsonify({"status": "ok"})
@@ -123,6 +155,12 @@ def run_inference():
         if not resolved_video_path.is_file():
             return _json_error("Selected video file does not exist.", 400)
 
+        keypoint_model_path = KEYPOINT_MODELS[keypoint_model]
+        try:
+            _ensure_keypoint_weights(keypoint_model_path)
+        except Exception as error:
+            return _json_error(f"Failed to prepare keypoint model weights: {error}", 500)
+
         command = [
             sys.executable,
             "-m",
@@ -130,7 +168,7 @@ def run_inference():
             "--video",
             f"..\\Datasets\\test_vids\\{video_name}",
             "--keypoint-model",
-            _windows_rel_path(".\\models\\keypoint", KEYPOINT_MODELS[keypoint_model]),
+            _windows_rel_path(".\\models\\keypoint", keypoint_model_path),
             "--model",
             _windows_rel_path(".\\models\\classification", CLASSIFICATION_MODELS[classification_model]),
             "--T",
