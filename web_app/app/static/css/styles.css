@@ -19,6 +19,16 @@ form,
   margin-top: 1rem;
 }
 
+.inference-controls {
+  display: grid;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.inference-controls select {
+  padding: 0.45rem;
+}
+
 button {
   margin-top: 0.5rem;
   padding: 0.45rem 0.75rem;
@@ -31,5 +41,26 @@ pre {
   padding: 0.8rem;
   border-radius: 6px;
   overflow-x: auto;
+  white-space: pre-wrap;
 }
 
+#run-status {
+  margin-top: 0.4rem;
+  font-weight: 600;
+}
+
+.status-success {
+  color: #0d6b2f;
+}
+
+.status-error {
+  color: #a31226;
+}
+
+.output-success {
+  border: 2px solid #0d6b2f;
+}
+
+.output-error {
+  border: 2px solid #a31226;
+}

@@ -2,19 +2,30 @@
 
 {% block content %}
 <h1>Fall Detection Web App</h1>
-<p>Upload a file to call the placeholder prediction API.</p>
+<p>Configure and run inference on a test video.</p>
 
-<form id="predict-form" action="/api/predict" method="post" enctype="multipart/form-data">
-  <label for="file">Select file</label>
-  <input id="file" name="file" type="file" required>
-  <button type="submit">Submit File</button>
-</form>
+<div class="inference-controls">
+  <label for="classification-model">Classification Model</label>
+  <select id="classification-model" name="classification-model">
+    <option value="tcn">tcn</option>
+    <option value="cnn-lstm">cnn-lstm</option>
+    <option value="st-gcn">st-gcn</option>
+  </select>
 
-<div class="actions">
-  <button id="send-json" type="button">Send Sample JSON</button>
+  <label for="keypoint-model">Keypoint Detection Model</label>
+  <select id="keypoint-model" name="keypoint-model">
+    <option value="ultralytics-yolo11l">ultralytics-yolo11l</option>
+  </select>
+
+  <label for="video-select">Video</label>
+  <select id="video-select" name="video-select">
+    <option value="">Loading videos...</option>
+  </select>
+
+  <button id="run-inference" type="button">Run</button>
 </div>
 
 <h2>API Response</h2>
-<pre id="response">Submit a file or send sample JSON.</pre>
+<p id="run-status">Ready.</p>
+<pre id="response">Choose models and a video, then click Run.</pre>
 {% endblock %}
-
