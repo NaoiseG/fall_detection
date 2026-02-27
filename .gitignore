@@ -12,3 +12,5 @@ get_one_npz.py
 models/prompts/
 fall_models/Prototype/models/MotionBert/**
 fall_models/Prototype/runs/**
+fall_models/Prototype/pose_models/AlphaPose/**
+fall_models/Prototype/pose_models/ViTPose/**
