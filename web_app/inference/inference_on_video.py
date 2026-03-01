@@ -2000,7 +2000,7 @@ def run_inference_stream_packets(
             pred, pconf, p_fall = window_preds.get(int(win_start), (-1, 0.0, None))
             label = class_names[pred] if 0 <= int(pred) < len(class_names) else "..."
 
-            frame_original = frames_buf[0].copy()
+            frame_original = frames_buf[0]
             xy = draw_xy_buf[0]
             cf = draw_cf_buf[0]
 
@@ -2082,28 +2082,30 @@ def run_inference_stream_packets(
                     packet["pred"]["fall_prob"] = float(p_fall)
                 on_packet(packet)
 
-            frame_to_render = draw_pose(frame_original.copy(), xy, cf, conf_thres=conf_thres)
-            frame_to_render = draw_hud(frame_to_render, hud_to_draw)
-            if on_frame is not None:
-                on_frame(frame_to_render)
-
-            if writer is not None:
-                frame_h, frame_w = frame_to_render.shape[:2]
-                frame_to_write = frame_to_render
-                if frame_h != base_h or frame_w != base_w:
-                    frame_to_write = cv2.resize(frame_to_render, (base_w, base_h), interpolation=cv2.INTER_LINEAR)
-                writer.write(frame_to_write)
-
             key = -1
-            if not no_display:
-                cv2.imshow(window_name, frame_to_render)
-                if bool(realtime):
-                    elapsed_s = time.perf_counter() - t_frame_start
-                    remaining_s = frame_period_s - elapsed_s
-                    wait_ms = int(max(1, remaining_s * 1000.0)) if remaining_s > 0 else 1
-                else:
-                    wait_ms = 1
-                key = cv2.waitKey(wait_ms) & 0xFF
+            needs_rendered_frame = (on_frame is not None) or (writer is not None) or (not no_display)
+            if needs_rendered_frame:
+                frame_to_render = draw_pose(frame_original.copy(), xy, cf, conf_thres=conf_thres)
+                frame_to_render = draw_hud(frame_to_render, hud_to_draw)
+                if on_frame is not None:
+                    on_frame(frame_to_render)
+
+                if writer is not None:
+                    frame_h, frame_w = frame_to_render.shape[:2]
+                    frame_to_write = frame_to_render
+                    if frame_h != base_h or frame_w != base_w:
+                        frame_to_write = cv2.resize(frame_to_render, (base_w, base_h), interpolation=cv2.INTER_LINEAR)
+                    writer.write(frame_to_write)
+
+                if not no_display:
+                    cv2.imshow(window_name, frame_to_render)
+                    if bool(realtime):
+                        elapsed_s = time.perf_counter() - t_frame_start
+                        remaining_s = frame_period_s - elapsed_s
+                        wait_ms = int(max(1, remaining_s * 1000.0)) if remaining_s > 0 else 1
+                    else:
+                        wait_ms = 1
+                    key = cv2.waitKey(wait_ms) & 0xFF
 
             total_ms = (time.perf_counter() - t_frame_start) * 1000.0
             inst_fps = 1000.0 / max(1e-6, total_ms)
