@@ -44,7 +44,8 @@ form,
   font-weight: 600;
 }
 
-.inference-controls select {
+.inference-controls select,
+.inference-controls input {
   padding: 0.45rem;
 }
 

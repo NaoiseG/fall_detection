@@ -1,6 +1,9 @@
 const classificationSelect = document.getElementById("classification-model");
 const keypointSelect = document.getElementById("keypoint-model");
 const videoSelect = document.getElementById("video-select");
+const windowSizeInput = document.getElementById("window-size");
+const strideOverlapInput = document.getElementById("stride-overlap");
+const samplingKInput = document.getElementById("sampling-k");
 const runButton = document.getElementById("run-inference");
 const responseBox = document.getElementById("response");
 const statusLabel = document.getElementById("run-status");
@@ -76,6 +79,36 @@ function renderError(message) {
     responseBox.textContent = String(message || "Unknown error.");
   }
   setOutputState(false);
+}
+
+function parseIntInput(inputElement, name, minValue, maxValue = null) {
+  const rawValue = String(inputElement?.value ?? "").trim();
+  if (!rawValue) {
+    throw new Error(`Missing ${name}.`);
+  }
+  const value = Number.parseInt(rawValue, 10);
+  if (!Number.isInteger(value) || value < minValue) {
+    throw new Error(`Invalid ${name}.`);
+  }
+  if (maxValue !== null && value > maxValue) {
+    throw new Error(`Invalid ${name}.`);
+  }
+  return value;
+}
+
+function readInferenceKnobs() {
+  if (!windowSizeInput || !strideOverlapInput || !samplingKInput) {
+    throw new Error("Inference knobs are not available.");
+  }
+
+  const windowSize = parseIntInput(windowSizeInput, "window size (T)", 1);
+  const overlapPercent = parseIntInput(strideOverlapInput, "overlap (%)", 0, 99);
+  const samplingK = parseIntInput(samplingKInput, "sampling frequency (k)", 1);
+  return {
+    T: windowSize,
+    overlapPercent,
+    k: samplingK,
+  };
 }
 
 async function decodeFrameImage(frameJpegB64) {
@@ -374,17 +407,41 @@ async function loadTestVideos() {
 }
 
 async function runInference() {
-  if (!classificationSelect || !keypointSelect || !videoSelect || !runButton || !responseBox || !statusLabel) {
+  if (
+    !classificationSelect ||
+    !keypointSelect ||
+    !videoSelect ||
+    !windowSizeInput ||
+    !strideOverlapInput ||
+    !samplingKInput ||
+    !runButton ||
+    !responseBox ||
+    !statusLabel
+  ) {
     return;
   }
 
   closeActiveStream();
   clearFrameQueue();
 
+  let knobs;
+  try {
+    knobs = readInferenceKnobs();
+  } catch (error) {
+    renderError(error.message || "Invalid inference settings.");
+    setLiveStatus("Error.");
+    setRunReady();
+    return;
+  }
+
   const payload = {
     classification_model: classificationSelect.value,
     keypoint_model: keypointSelect.value,
     video: videoSelect.value,
+    T: knobs.T,
+    stride: knobs.overlapPercent,
+    overlap_percent: knobs.overlapPercent,
+    k: knobs.k,
   };
 
   runButton.disabled = true;

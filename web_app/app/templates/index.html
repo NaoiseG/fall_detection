@@ -26,6 +26,15 @@
     <option value="">Loading videos...</option>
   </select>
 
+  <label for="window-size">Window Size (T)</label>
+  <input id="window-size" name="window-size" type="number" min="1" step="1" value="64">
+
+  <label for="stride-overlap">Overlap (%) [--stride]</label>
+  <input id="stride-overlap" name="stride-overlap" type="number" min="0" max="99" step="1" value="50">
+
+  <label for="sampling-k">Sampling Frequency (k)</label>
+  <input id="sampling-k" name="sampling-k" type="number" min="1" step="1" value="1">
+
   <button id="run-inference" type="button">Run</button>
 </div>
 

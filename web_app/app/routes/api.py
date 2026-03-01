@@ -118,6 +118,17 @@ def _validate_float(value: Any, *, name: str, min_value: float = 0.0) -> float:
     return out
 
 
+def _validate_int(value: Any, *, name: str, min_value: int = 0) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid {name}.") from error
+
+    if out < int(min_value):
+        raise ValueError(f"Invalid {name}.")
+    return out
+
+
 def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Invalid JSON body. Expected an object.")
@@ -158,12 +169,24 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
 
     realtime = bool(payload.get("realtime", True))
     display_fps = _validate_float(payload.get("display_fps", 0.0), name="display_fps", min_value=0.0)
+    window_size = _validate_int(payload.get("T", 64), name="T", min_value=1)
+    sampling_k = _validate_int(payload.get("k", 1), name="k", min_value=1)
+    overlap_percent = _validate_float(
+        payload.get("overlap_percent", payload.get("stride", 50.0)),
+        name="stride",
+        min_value=0.0,
+    )
+    if overlap_percent >= 100.0:
+        raise ValueError("Invalid stride. Overlap percent must be less than 100.")
+    stride_frames = max(1, int(round(float(window_size) * (1.0 - (float(overlap_percent) / 100.0)))))
+    stride_frames = min(int(window_size), int(stride_frames))
 
     inference_options = {
         "display_fps": float(display_fps),
         "realtime": bool(realtime),
-        "T": 64,
-        "stride": 32,
+        "T": int(window_size),
+        "stride": int(stride_frames),
+        "frame_step": int(sampling_k),
         "normalize_mode": "paper_rp",
         "rp_center_mode": "pixel",
         "rp_img_w": 640,
