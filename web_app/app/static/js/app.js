@@ -4,6 +4,14 @@ const videoSelect = document.getElementById("video-select");
 const runButton = document.getElementById("run-inference");
 const responseBox = document.getElementById("response");
 const statusLabel = document.getElementById("run-status");
+const liveStatus = document.getElementById("live-status");
+const liveCanvas = document.getElementById("live-canvas");
+
+const frameQueue = [];
+let queueProcessing = false;
+let activeEventSource = null;
+let streamTerminated = false;
+let activeStatusUrl = "";
 
 function setOutputState(ok) {
   if (!responseBox || !statusLabel) {
@@ -24,31 +32,302 @@ function setOutputState(ok) {
   }
 }
 
-function renderResult(data) {
+function setLiveStatus(text) {
+  if (liveStatus) {
+    liveStatus.textContent = text;
+  }
+}
+
+function setRunReady() {
+  if (!runButton || !videoSelect) {
+    return;
+  }
+  runButton.disabled = !videoSelect.value;
+  runButton.textContent = "Run";
+}
+
+function clearFrameQueue() {
+  frameQueue.length = 0;
+}
+
+function closeActiveStream() {
+  if (activeEventSource) {
+    activeEventSource.close();
+    activeEventSource = null;
+  }
+  streamTerminated = false;
+  activeStatusUrl = "";
+}
+
+function renderStartInfo(data) {
   if (!responseBox) {
     return;
   }
-
-  const command = data.command || "";
-  const stdout = data.stdout || "(empty)";
-  const stderr = data.stderr || "(empty)";
-  const returncode = Number.isInteger(data.returncode) ? data.returncode : "N/A";
-  const ok = Boolean(data.ok) && returncode === 0;
-
   responseBox.textContent = [
-    `Return Code: ${returncode}`,
-    "",
-    "Command:",
-    command,
-    "",
-    "STDOUT:",
-    stdout,
-    "",
-    "STDERR:",
-    stderr,
+    "Inference stream started.",
+    `job_id: ${data.job_id || "N/A"}`,
+    `stream_url: ${data.stream_url || "N/A"}`,
+    `status_url: ${data.status_url || "N/A"}`,
   ].join("\n");
+}
 
-  setOutputState(ok);
+function renderError(message) {
+  if (responseBox) {
+    responseBox.textContent = String(message || "Unknown error.");
+  }
+  setOutputState(false);
+}
+
+async function decodeFrameImage(frameJpegB64) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Failed to decode frame JPEG."));
+    image.src = `data:image/jpeg;base64,${frameJpegB64}`;
+  });
+}
+
+function drawHudOverlay(ctx, hudLines) {
+  if (!Array.isArray(hudLines) || hudLines.length === 0) {
+    return;
+  }
+
+  const x = 10;
+  const y = 10;
+  const pad = 8;
+  const lineGap = 6;
+
+  ctx.save();
+  ctx.font = "20px sans-serif";
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left";
+
+  const lineMetrics = hudLines.map((line) => {
+    const m = ctx.measureText(String(line));
+    const ascent = Number(m.actualBoundingBoxAscent) || 16;
+    const descent = Number(m.actualBoundingBoxDescent) || 4;
+    return {
+      text: String(line),
+      width: m.width,
+      height: ascent + descent,
+      ascent,
+    };
+  });
+
+  const maxWidth = Math.max(...lineMetrics.map((m) => m.width), 0);
+  const totalHeight =
+    lineMetrics.reduce((sum, m) => sum + m.height, 0) +
+    Math.max(0, lineMetrics.length - 1) * lineGap;
+
+  ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+  ctx.fillRect(x, y, maxWidth + pad * 2, totalHeight + pad * 2);
+
+  ctx.fillStyle = "rgb(255, 255, 255)";
+  let yCursor = y + pad;
+  for (const line of lineMetrics) {
+    yCursor += line.ascent;
+    ctx.fillText(line.text, x + pad, yCursor);
+    yCursor += line.height - line.ascent + lineGap;
+  }
+  ctx.restore();
+}
+
+function drawPoseOverlay(ctx, pose) {
+  if (!pose || !Array.isArray(pose.xy) || !Array.isArray(pose.conf)) {
+    return;
+  }
+
+  const xy = pose.xy;
+  const conf = pose.conf;
+  const threshold = Number(pose.conf_thres);
+  const confThreshold = Number.isFinite(threshold) ? threshold : 0.2;
+  const skeleton = Array.isArray(pose.skeleton) ? pose.skeleton : [];
+
+  ctx.save();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgb(255, 255, 0)";
+  for (const edge of skeleton) {
+    if (!Array.isArray(edge) || edge.length < 2) {
+      continue;
+    }
+    const a = Number(edge[0]);
+    const b = Number(edge[1]);
+    if (!Number.isInteger(a) || !Number.isInteger(b)) {
+      continue;
+    }
+    if (a < 0 || b < 0 || a >= conf.length || b >= conf.length) {
+      continue;
+    }
+    const confA = Number(conf[a]);
+    const confB = Number(conf[b]);
+    if (!(confA > confThreshold && confB > confThreshold)) {
+      continue;
+    }
+    const pointA = xy[a];
+    const pointB = xy[b];
+    if (!Array.isArray(pointA) || !Array.isArray(pointB) || pointA.length < 2 || pointB.length < 2) {
+      continue;
+    }
+    ctx.beginPath();
+    ctx.moveTo(Number(pointA[0]), Number(pointA[1]));
+    ctx.lineTo(Number(pointB[0]), Number(pointB[1]));
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "rgb(0, 255, 0)";
+  for (let i = 0; i < xy.length; i += 1) {
+    const point = xy[i];
+    if (!Array.isArray(point) || point.length < 2) {
+      continue;
+    }
+    const score = Number(conf[i]);
+    if (!(score > confThreshold)) {
+      continue;
+    }
+    ctx.beginPath();
+    ctx.arc(Number(point[0]), Number(point[1]), 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+async function drawPacket(packet) {
+  if (!liveCanvas || !packet || typeof packet.frame_jpeg_b64 !== "string") {
+    return;
+  }
+  const ctx = liveCanvas.getContext("2d");
+  if (!ctx) {
+    return;
+  }
+
+  const image = await decodeFrameImage(packet.frame_jpeg_b64);
+  const targetW = Number(packet?.size?.w) || image.width;
+  const targetH = Number(packet?.size?.h) || image.height;
+  if (targetW > 0 && targetH > 0 && (liveCanvas.width !== targetW || liveCanvas.height !== targetH)) {
+    liveCanvas.width = targetW;
+    liveCanvas.height = targetH;
+  }
+
+  ctx.drawImage(image, 0, 0, liveCanvas.width, liveCanvas.height);
+  drawPoseOverlay(ctx, packet.pose);
+  drawHudOverlay(ctx, packet.hud_lines);
+
+  const frameNumber = Number(packet.frame_number) || 0;
+  const frameCount = Number(packet.frame_count) || 0;
+  const fps = Number(packet.fps);
+  const fpsText = Number.isFinite(fps) ? fps.toFixed(1) : "NA";
+  if (frameCount > 0) {
+    setLiveStatus(`Running... frame ${frameNumber}/${frameCount} | fps ${fpsText}`);
+  } else {
+    setLiveStatus(`Running... frame ${frameNumber} | fps ${fpsText}`);
+  }
+}
+
+async function processFrameQueue() {
+  if (queueProcessing) {
+    return;
+  }
+  queueProcessing = true;
+  try {
+    while (frameQueue.length > 0) {
+      const packet = frameQueue.shift();
+      await drawPacket(packet);
+    }
+  } catch (error) {
+    renderError(error.message || "Failed while rendering streamed frames.");
+    setLiveStatus("Error.");
+    closeActiveStream();
+    setRunReady();
+  } finally {
+    queueProcessing = false;
+  }
+}
+
+async function fetchJobStatus() {
+  if (!activeStatusUrl) {
+    return null;
+  }
+  try {
+    const response = await fetch(activeStatusUrl);
+    if (!response.ok) {
+      return null;
+    }
+    return await response.json();
+  } catch (_error) {
+    return null;
+  }
+}
+
+function attachStreamHandlers(streamUrl, statusUrl) {
+  closeActiveStream();
+  clearFrameQueue();
+  streamTerminated = false;
+  activeStatusUrl = statusUrl || "";
+
+  activeEventSource = new EventSource(streamUrl);
+
+  activeEventSource.addEventListener("frame", (event) => {
+    try {
+      const packet = JSON.parse(event.data);
+      frameQueue.push(packet);
+      void processFrameQueue();
+    } catch (error) {
+      renderError(error.message || "Invalid frame packet.");
+      setLiveStatus("Error.");
+      closeActiveStream();
+      setRunReady();
+    }
+  });
+
+  activeEventSource.addEventListener("heartbeat", () => {
+    if (liveStatus && liveStatus.textContent === "Starting inference...") {
+      setLiveStatus("Running...");
+    }
+  });
+
+  activeEventSource.addEventListener("done", () => {
+    streamTerminated = true;
+    setOutputState(true);
+    setLiveStatus("Done.");
+    closeActiveStream();
+    setRunReady();
+  });
+
+  activeEventSource.addEventListener("error", (event) => {
+    const hasData = typeof event?.data === "string" && event.data.length > 0;
+    if (!hasData) {
+      return;
+    }
+    streamTerminated = true;
+    try {
+      const payload = JSON.parse(event.data);
+      renderError(payload.message || "Inference failed.");
+    } catch (_parseError) {
+      renderError("Inference failed.");
+    }
+    setLiveStatus("Error.");
+    closeActiveStream();
+    setRunReady();
+  });
+
+  activeEventSource.onerror = async () => {
+    if (streamTerminated) {
+      return;
+    }
+
+    const status = await fetchJobStatus();
+    if (status && status.status === "done") {
+      streamTerminated = true;
+      setOutputState(true);
+      setLiveStatus("Done.");
+    } else {
+      const message = status?.error || "Stream disconnected.";
+      renderError(message);
+      setLiveStatus("Error.");
+    }
+    closeActiveStream();
+    setRunReady();
+  };
 }
 
 async function loadTestVideos() {
@@ -73,10 +352,7 @@ async function loadTestVideos() {
         statusLabel.textContent = "Error";
         statusLabel.classList.add("status-error");
       }
-      if (responseBox) {
-        responseBox.textContent = "No videos found in Datasets\\test_vids.";
-        responseBox.classList.add("output-error");
-      }
+      renderError("No videos found in Datasets\\test_vids.");
       return;
     }
 
@@ -87,17 +363,13 @@ async function loadTestVideos() {
       option.textContent = videoName;
       videoSelect.appendChild(option);
     }
-
-    runButton.disabled = false;
+    setRunReady();
   } catch (error) {
     if (statusLabel) {
       statusLabel.textContent = "Error";
       statusLabel.classList.add("status-error");
     }
-    if (responseBox) {
-      responseBox.textContent = `Failed to load videos: ${error.message}`;
-      responseBox.classList.add("output-error");
-    }
+    renderError(`Failed to load videos: ${error.message}`);
   }
 }
 
@@ -106,22 +378,25 @@ async function runInference() {
     return;
   }
 
+  closeActiveStream();
+  clearFrameQueue();
+
   const payload = {
     classification_model: classificationSelect.value,
     keypoint_model: keypointSelect.value,
     video: videoSelect.value,
   };
 
-  const previousLabel = runButton.textContent;
   runButton.disabled = true;
   runButton.textContent = "Running...";
   statusLabel.textContent = "Running...";
   statusLabel.classList.remove("status-success", "status-error");
   responseBox.classList.remove("output-success", "output-error");
-  responseBox.textContent = "Running inference...";
+  responseBox.textContent = "Starting inference stream...";
+  setLiveStatus("Starting inference...");
 
   try {
-    const response = await fetch("/api/run_inference", {
+    const response = await fetch("/api/start_inference_stream", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -129,27 +404,34 @@ async function runInference() {
       body: JSON.stringify(payload),
     });
     const data = await response.json();
-    if (!response.ok && !data.ok) {
-      renderResult(data);
+    if (!response.ok || !data.ok) {
+      renderError(data.error || "Failed to start inference stream.");
+      setLiveStatus("Error.");
+      setRunReady();
       return;
     }
-    renderResult(data);
+
+    renderStartInfo(data);
+    attachStreamHandlers(data.stream_url, data.status_url);
   } catch (error) {
-    renderResult({
-      ok: false,
-      command: "",
-      returncode: "N/A",
-      stdout: "",
-      stderr: error.message || "Request failed.",
-    });
-  } finally {
-    runButton.disabled = !videoSelect.value;
-    runButton.textContent = previousLabel;
+    renderError(error.message || "Request failed.");
+    setLiveStatus("Error.");
+    setRunReady();
   }
 }
 
 if (runButton) {
-  runButton.addEventListener("click", runInference);
+  runButton.addEventListener("click", () => {
+    void runInference();
+  });
+}
+
+if (videoSelect) {
+  videoSelect.addEventListener("change", () => {
+    if (!activeEventSource) {
+      setRunReady();
+    }
+  });
 }
 
 loadTestVideos();

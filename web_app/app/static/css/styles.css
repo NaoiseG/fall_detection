@@ -25,6 +25,25 @@ form,
   margin-top: 1rem;
 }
 
+.live-view {
+  margin-top: 1.25rem;
+}
+
+#live-canvas {
+  width: 100%;
+  max-width: 100%;
+  display: block;
+  background: #000;
+  border-radius: 6px;
+  border: 1px solid #d0d0d0;
+}
+
+#live-status {
+  margin-top: 0.4rem;
+  margin-bottom: 0.6rem;
+  font-weight: 600;
+}
+
 .inference-controls select {
   padding: 0.45rem;
 }

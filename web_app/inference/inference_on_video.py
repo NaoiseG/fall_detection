@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import inspect
 import json
@@ -38,7 +39,7 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import pickle
 
 import cv2
@@ -1604,6 +1605,552 @@ def infer_one_window(
         p_fall = float(torch.sigmoid(fall_logit.view(-1))[0].item())
 
     return int(pred.item()), float(pconf.item()), p_fall
+
+
+def run_inference_stream_packets(
+    *,
+    video_path: Path,
+    classification_model_path: Path,
+    keypoint_model_path: Path,
+    on_packet: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_frame: Optional[Callable[[np.ndarray], None]] = None,
+    arch: Optional[str] = None,
+    labels_file: Optional[str] = None,
+    save_path: Optional[Path] = None,
+    no_display: bool = True,
+    realtime: bool = True,
+    display_fps: float = 0.0,
+    device: Optional[str] = None,
+    half: int = 0,
+    imgsz: int = 640,
+    yolo_conf: float = 0.25,
+    max_people: int = 10,
+    track_conf_min: float = 0.75,
+    track_max_jump_px: float = 0.0,
+    track_max_jump_diag_frac: float = 0.25,
+    track_max_lost: int = 10,
+    track_target_x_frac: float = 0.5,
+    track_target_y_frac: float = 0.5,
+    T: int = 0,
+    stride: int = 0,
+    frame_step: int = 1,
+    normalize_mode: Optional[str] = None,
+    missing_mode: Optional[str] = None,
+    interp_mode: Optional[str] = None,
+    interp_group: int = 0,
+    rp_center_mode: Optional[str] = None,
+    rp_img_w: int = 0,
+    rp_img_h: int = 0,
+    jpeg_quality: int = 80,
+    **_unused_options: Any,
+) -> int:
+    frame_step = int(frame_step)
+    if frame_step <= 0:
+        raise ValueError("--frame-step must be >= 1.")
+    if int(max_people) <= 0:
+        raise ValueError("--max-people must be >= 1.")
+    if not np.isfinite(float(track_conf_min)) or float(track_conf_min) < 0.0:
+        raise ValueError("--track-conf-min must be a finite float >= 0.")
+    if not np.isfinite(float(track_max_jump_px)):
+        raise ValueError("--track-max-jump-px must be finite.")
+    if not np.isfinite(float(track_max_jump_diag_frac)) or float(track_max_jump_diag_frac) <= 0.0:
+        raise ValueError("--track-max-jump-diag-frac must be a finite float > 0.")
+    if int(track_max_lost) < 0:
+        raise ValueError("--track-max-lost must be >= 0.")
+    if not np.isfinite(float(track_target_x_frac)) or not np.isfinite(float(track_target_y_frac)):
+        raise ValueError("--track-target-x-frac and --track-target-y-frac must be finite.")
+
+    resolved_video_path = Path(video_path).expanduser()
+    if not resolved_video_path.exists():
+        raise FileNotFoundError(f"--video not found: {resolved_video_path}")
+
+    resolved_save_path: Optional[Path] = None
+    if save_path is not None:
+        candidate = Path(save_path).expanduser()
+        if candidate.suffix == "":
+            candidate = candidate.with_suffix(".mp4")
+        resolved_save_path = candidate
+
+    run_device = pick_device(device)
+    use_half = bool(int(half)) and run_device.startswith("cuda")
+    print(
+        f"[runtime] device={run_device} "
+        f"(requested={device if device else 'auto'}, cuda_available={torch.cuda.is_available()}, half={int(use_half)})"
+    )
+    if int(max_people) <= 1:
+        print("[track][WARN] --max-people=1 limits disambiguation when multiple people are present.")
+
+    ckpt_path, resolved_arch = resolve_ckpt_and_arch(str(classification_model_path), arch)
+    print(f"[model] arch={resolved_arch} ckpt={ckpt_path.as_posix()}")
+
+    is_rf = str(resolved_arch).lower().strip() == "rf" or ckpt_path.suffix.lower() in {".pkl", ".pickle"}
+    if is_rf:
+        raise ValueError("RF checkpoints are not supported in run_inference_stream_packets.")
+
+    state, meta = load_checkpoint(ckpt_path)
+    state = clean_state_dict(state)
+
+    T_raw = int(T) if int(T) > 0 else int(meta.get("T", meta.get("T_used", 64)) or 64)
+    stride_raw = int(stride) if int(stride) > 0 else int(meta.get("stride", 16) or 16)
+    T_raw = max(1, int(T_raw))
+    stride_raw = max(1, int(stride_raw))
+
+    T_final = max(1, int((int(T_raw) + int(frame_step) - 1) // int(frame_step)))
+    stride_final = max(1, int((int(stride_raw) + int(frame_step) - 1) // int(frame_step)))
+    if int(frame_step) > 1 and ((int(T_raw) % int(frame_step)) != 0 or (int(stride_raw) % int(frame_step)) != 0):
+        print(
+            f"[window][WARN] raw T/stride ({int(T_raw)}/{int(stride_raw)}) are not divisible by frame_step={int(frame_step)}; "
+            "using ceil division for sampled windows."
+        )
+    print(
+        f"[window] raw T/stride={int(T_raw)}/{int(stride_raw)} "
+        f"-> sampled T/stride={int(T_final)}/{int(stride_final)} (frame_step={int(frame_step)})"
+    )
+
+    use_conf = bool(meta.get("use_conf", True))
+    normalize = bool(meta.get("normalize", True))
+    normalize_mode_final = str(normalize_mode) if normalize_mode else str(meta.get("normalize_mode") or "center_scale")
+    add_vel = bool(meta.get("add_vel", True))
+    add_acc = bool(meta.get("add_acc", True))
+    add_global = bool(meta.get("add_global", True))
+    add_mask = bool(meta.get("add_mask_channel", True))
+    conf_thres = float(meta.get("conf_thres", 0.2))
+    max_interp_gap = int(meta.get("max_interp_gap", 5))
+    missing_mode_final = str(missing_mode) if missing_mode else str(meta.get("missing_mode") or "conf_thres")
+    interp_mode_final = str(interp_mode) if interp_mode else str(meta.get("interp_mode") or "short_gap_hold")
+    interp_group_final = int(interp_group) if int(interp_group) > 0 else int(meta.get("interp_group", 100) or 100)
+    rp_center_mode_final = str(rp_center_mode) if rp_center_mode else str(meta.get("rp_center_mode") or "auto")
+    rp_img_w_final: Optional[int] = None
+    rp_img_h_final: Optional[int] = None
+    if int(rp_img_w) > 0:
+        rp_img_w_final = int(rp_img_w)
+    elif meta.get("rp_img_w", None) is not None:
+        rp_img_w_final = int(meta.get("rp_img_w"))  # type: ignore[arg-type]
+    if int(rp_img_h) > 0:
+        rp_img_h_final = int(rp_img_h)
+    elif meta.get("rp_img_h", None) is not None:
+        rp_img_h_final = int(meta.get("rp_img_h"))  # type: ignore[arg-type]
+    min_valid_frac = float(meta.get("min_valid_frac", 0.3))
+
+    num_classes = int(meta.get("num_classes", 0) or 0)
+    in_features_meta = int(meta.get("in_features", 0) or 0)
+    if num_classes <= 0:
+        raise ValueError("Checkpoint missing num_classes. Use a checkpoint from training/train_models.py.")
+
+    merge_fall_11_to_7 = int(num_classes) == 11
+    display_num_classes = 7 if merge_fall_11_to_7 else int(num_classes)
+    class_names = load_class_names(num_classes=display_num_classes, meta=meta, labels_file=labels_file)
+    standing_label = next((str(name) for name in class_names if "stand" in str(name).lower()), "standing")
+
+    in_features = expected_in_features(
+        use_conf=use_conf,
+        add_vel=add_vel,
+        add_acc=add_acc,
+        add_global=add_global,
+        add_mask=add_mask,
+    )
+    if in_features_meta > 0 and int(in_features) != int(in_features_meta):
+        raise ValueError(f"Feature mismatch: expected in_features={in_features}, ckpt expects {in_features_meta}")
+
+    node_features_meta = meta.get("node_features", None)
+    if node_features_meta is None:
+        nf = int(in_features // K)
+        node_features_meta = nf if nf * K == int(in_features) else None
+
+    model = build_temporal_model(
+        arch=resolved_arch,
+        in_features=int(in_features),
+        num_classes=int(num_classes),
+        device=run_device,
+        T_used=int(T_final),
+        node_features=int(node_features_meta) if node_features_meta is not None else None,
+    )
+    missing_keys, unexpected = model.load_state_dict(state, strict=False)
+    if missing_keys:
+        print("[WARN] missing keys:", missing_keys[:8], "..." if len(missing_keys) > 8 else "")
+    if unexpected:
+        print("[WARN] unexpected keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
+    model.eval()
+
+    pose_model = YOLO(str(Path(keypoint_model_path).expanduser()))
+
+    cap = cv2.VideoCapture(str(resolved_video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {resolved_video_path}")
+
+    writer: Optional[cv2.VideoWriter] = None
+    base_w = 0
+    base_h = 0
+    try:
+        src_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        if not np.isfinite(src_fps) or src_fps <= 1e-3:
+            src_fps = 30.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        print(
+            "[track] "
+            f"conf_min={float(track_conf_min):.2f} "
+            f"max_lost={int(track_max_lost)} "
+            f"target=({float(track_target_x_frac):.2f},{float(track_target_y_frac):.2f}) "
+            f"jump_px={'auto' if float(track_max_jump_px) <= 0.0 else f'{float(track_max_jump_px):.1f}'} "
+            f"jump_diag_frac={float(track_max_jump_diag_frac):.3f}"
+        )
+
+        fps_play = float(display_fps) if float(display_fps) > 1e-3 else float(src_fps)
+        frame_period_s = 1.0 / max(1e-6, float(fps_play))
+
+        frames_buf: deque[np.ndarray] = deque()
+        draw_xy_buf: deque[np.ndarray] = deque()
+        draw_cf_buf: deque[np.ndarray] = deque()
+        hud_delay_frames = 32
+        hud_delay_buf: deque[List[str]] = deque()
+
+        sample_xy_seq: List[np.ndarray] = []
+        sample_cf_seq: List[np.ndarray] = []
+
+        display_idx = 0
+        processed_total = 0
+        sampled_total = 0
+        cap_done = False
+        last_xy = np.zeros((K, 2), dtype=np.float32)
+        last_cf = np.zeros((K,), dtype=np.float32)
+        track_prev_center: Optional[np.ndarray] = None
+        track_target_center: Optional[np.ndarray] = None
+        track_max_jump_px_final: Optional[float] = None
+        track_lost_count = 0
+
+        window_preds: Dict[int, Tuple[int, float, Optional[float]]] = {}
+        next_win_start = 0
+        t_pose0 = time.perf_counter()
+
+        def process_next_frame() -> bool:
+            nonlocal processed_total, sampled_total, cap_done, last_xy, last_cf
+            nonlocal track_prev_center, track_target_center, track_max_jump_px_final, track_lost_count
+
+            ok, frame = cap.read()
+            if not ok:
+                cap_done = True
+                return False
+
+            raw_idx = int(processed_total)
+            do_pose = (int(raw_idx) % int(frame_step)) == 0
+            xy = last_xy
+            cf = last_cf
+            if do_pose:
+                if track_target_center is None or track_max_jump_px_final is None:
+                    h_img, w_img = frame.shape[:2]
+                    track_target_center = np.array(
+                        [float(w_img) * float(track_target_x_frac), float(h_img) * float(track_target_y_frac)],
+                        dtype=np.float32,
+                    )
+                    frame_diag = float(np.hypot(float(w_img), float(h_img)))
+                    if float(track_max_jump_px) > 0.0:
+                        track_max_jump_px_final = float(track_max_jump_px)
+                    else:
+                        track_max_jump_px_final = float(track_max_jump_diag_frac) * float(frame_diag)
+
+                xy, cf, new_center, found = pose_on_frame(
+                    pose_model=pose_model,
+                    frame_bgr=frame,
+                    imgsz=int(imgsz),
+                    yolo_conf=float(yolo_conf),
+                    device=run_device,
+                    max_people=int(max_people),
+                    use_half=use_half,
+                    prev_center=track_prev_center,
+                    target_center=track_target_center,
+                    conf_min=float(track_conf_min),
+                    max_jump_px=float(track_max_jump_px_final),
+                )
+                if found:
+                    track_prev_center = new_center
+                    track_lost_count = 0
+                else:
+                    track_lost_count += 1
+                    if int(track_lost_count) > int(track_max_lost):
+                        track_prev_center = None
+
+                sample_xy_seq.append(xy)
+                sample_cf_seq.append(cf)
+                sampled_total += 1
+                last_xy = xy
+                last_cf = cf
+
+            frames_buf.append(frame)
+            draw_xy_buf.append(xy)
+            draw_cf_buf.append(cf)
+            processed_total += 1
+
+            if processed_total % 200 == 0:
+                dt = time.perf_counter() - t_pose0
+                if frame_count > 0:
+                    pct = 100.0 * float(processed_total) / float(frame_count)
+                    print(f"[pose] raw={processed_total}/{frame_count} ({pct:.1f}%) sampled={sampled_total} | {dt:.1f}s")
+                else:
+                    print(f"[pose] raw={processed_total} sampled={sampled_total} | {dt:.1f}s")
+
+            return True
+
+        def compute_window_pred(start: int) -> Tuple[int, float, Optional[float]]:
+            if start in window_preds:
+                return window_preds[start]
+            if start >= sampled_total:
+                raise RuntimeError(f"Cannot compute window {start}: sampled frame not processed yet (sampled_total={sampled_total}).")
+
+            avail = int(sampled_total - start)
+            L = int(min(int(T_final), max(0, avail)))
+            if L <= 0:
+                raise RuntimeError(f"Window start {start} has no available sampled frames (sampled_total={sampled_total}).")
+
+            xy_seq = np.stack(sample_xy_seq[int(start): int(start) + int(L)], axis=0)
+            conf_seq = np.stack(sample_cf_seq[int(start): int(start) + int(L)], axis=0)
+            window_feat = make_window_features(
+                xy_seq=xy_seq,
+                conf_seq=conf_seq,
+                T=int(T_final),
+                use_conf=use_conf,
+                normalize=normalize,
+                normalize_mode=normalize_mode_final,
+                add_vel=add_vel,
+                add_acc=add_acc,
+                add_global=add_global,
+                add_mask=add_mask,
+                conf_thres=conf_thres,
+                max_interp_gap=max_interp_gap,
+                missing_mode=missing_mode_final,
+                interp_mode=interp_mode_final,
+                interp_group=int(interp_group_final),
+                rp_center_mode=rp_center_mode_final,
+                rp_img_w=rp_img_w_final,
+                rp_img_h=rp_img_h_final,
+                min_valid_frac=min_valid_frac,
+            )
+            pred, pconf, p_fall = infer_one_window(
+                model=model,
+                window_feat=window_feat,
+                device=run_device,
+                use_half=use_half,
+                merge_fall_11_to_7=merge_fall_11_to_7,
+            )
+            window_preds[start] = (pred, pconf, p_fall)
+            return window_preds[start]
+
+        def compute_ready_windows() -> None:
+            nonlocal next_win_start
+            while True:
+                if next_win_start in window_preds:
+                    next_win_start += int(stride_final)
+                    continue
+                if cap_done:
+                    if next_win_start >= sampled_total:
+                        break
+                    compute_window_pred(int(next_win_start))
+                    next_win_start += int(stride_final)
+                    continue
+                if sampled_total >= int(next_win_start) + int(T_final):
+                    compute_window_pred(int(next_win_start))
+                    next_win_start += int(stride_final)
+                    continue
+                break
+
+        while sampled_total < int(T_final) and not cap_done:
+            process_next_frame()
+        if processed_total <= 0:
+            raise RuntimeError("Video had 0 frames.")
+
+        if str(normalize_mode_final).lower().strip() == "paper_rp" and frames_buf:
+            h_img, w_img = frames_buf[0].shape[:2]
+            if rp_img_w_final is None:
+                rp_img_w_final = int(w_img)
+            if rp_img_h_final is None:
+                rp_img_h_final = int(h_img)
+
+        compute_window_pred(0)
+        next_win_start = int(stride_final)
+
+        if resolved_save_path is not None:
+            base_h, base_w = frames_buf[0].shape[:2]
+            writer = open_video_writer(save_path=resolved_save_path, fps=float(src_fps), frame_size=(base_w, base_h))
+
+        window_name = "inference_on_video"
+        fps_ema: Optional[float] = None
+        ema_alpha = 0.1
+        while True:
+            if not frames_buf and cap_done:
+                break
+
+            t_frame_start = time.perf_counter()
+            display_sample_idx = int(display_idx // max(1, int(frame_step)))
+
+            target_sampled = int(display_sample_idx) + int(T_final) + 1
+            while not cap_done and sampled_total < target_sampled:
+                process_next_frame()
+
+            compute_ready_windows()
+            if not frames_buf:
+                continue
+
+            win_start = (int(display_sample_idx) // int(stride_final)) * int(stride_final)
+            if win_start not in window_preds:
+                while not cap_done and sampled_total < int(win_start) + int(T_final):
+                    process_next_frame()
+                    compute_ready_windows()
+                if win_start not in window_preds:
+                    compute_window_pred(int(win_start))
+
+            pred, pconf, p_fall = window_preds.get(int(win_start), (-1, 0.0, None))
+            label = class_names[pred] if 0 <= int(pred) < len(class_names) else "..."
+
+            frame_original = frames_buf[0].copy()
+            xy = draw_xy_buf[0]
+            cf = draw_cf_buf[0]
+
+            frame_info = f"frame {int(display_idx) + 1}"
+            if frame_count > 0:
+                frame_info += f"/{frame_count}"
+
+            fps_for_hud = float(fps_ema) if fps_ema is not None else float(fps_play)
+            hud = [
+                frame_info,
+                f"fps: {float(fps_for_hud):.1f}",
+                f"pose: {label} ({float(pconf):.2f})" if int(pred) >= 0 else "pose: ...",
+                f"T={int(T_final)} stride={int(stride_final)} sampled (k={int(frame_step)})",
+            ]
+            if p_fall is not None:
+                hud.append(f"fall_prob: {float(p_fall):.2f}")
+            hud_delay_buf.append(list(hud))
+            if len(hud_delay_buf) <= int(hud_delay_frames):
+                hud_to_draw = list(hud)
+                if len(hud_to_draw) > 2:
+                    hud_to_draw[2] = f"pose: {standing_label} (1.00)"
+                for i, line in enumerate(hud_to_draw):
+                    if line.startswith("fall_prob:"):
+                        hud_to_draw[i] = "fall_prob: 0.00"
+            else:
+                hud_to_draw = hud_delay_buf.popleft()
+
+            if on_packet is not None:
+                ok_jpg, encoded = cv2.imencode(
+                    ".jpg",
+                    frame_original,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
+                )
+                if not ok_jpg:
+                    raise RuntimeError(f"Failed to encode frame {int(display_idx)} to JPEG.")
+                frame_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
+                packet: Dict[str, Any] = {
+                    "type": "frame",
+                    "frame_index": int(display_idx),
+                    "frame_number": int(display_idx) + 1,
+                    "frame_count": int(frame_count),
+                    "fps": float(fps_for_hud),
+                    "pred": {
+                        "label": str(label),
+                        "conf": float(pconf),
+                        "class_id": int(pred),
+                    },
+                    "params": {
+                        "T": int(T_final),
+                        "stride": int(stride_final),
+                        "k": int(frame_step),
+                    },
+                    "hud_lines": list(hud_to_draw),
+                    "pose": {
+                        "format": "coco17",
+                        "xy": np.asarray(xy, dtype=np.float32).tolist(),
+                        "conf": np.asarray(cf, dtype=np.float32).tolist(),
+                        "conf_thres": float(conf_thres),
+                        "skeleton": [[int(a), int(b)] for a, b in SKELETON],
+                    },
+                    "frame_jpeg_b64": frame_b64,
+                    "size": {"w": int(frame_original.shape[1]), "h": int(frame_original.shape[0])},
+                    "overlay": {
+                        "hud": {
+                            "x": 10,
+                            "y": 10,
+                            "pad": 8,
+                            "line_gap": 6,
+                            "bg_alpha": 0.6,
+                            "font_px": 20,
+                        },
+                        "pose": {
+                            "keypoint_radius": 3,
+                            "skeleton_width": 2,
+                        },
+                    },
+                }
+                if p_fall is not None:
+                    packet["pred"]["fall_prob"] = float(p_fall)
+                on_packet(packet)
+
+            frame_to_render = draw_pose(frame_original.copy(), xy, cf, conf_thres=conf_thres)
+            frame_to_render = draw_hud(frame_to_render, hud_to_draw)
+            if on_frame is not None:
+                on_frame(frame_to_render)
+
+            if writer is not None:
+                frame_h, frame_w = frame_to_render.shape[:2]
+                frame_to_write = frame_to_render
+                if frame_h != base_h or frame_w != base_w:
+                    frame_to_write = cv2.resize(frame_to_render, (base_w, base_h), interpolation=cv2.INTER_LINEAR)
+                writer.write(frame_to_write)
+
+            key = -1
+            if not no_display:
+                cv2.imshow(window_name, frame_to_render)
+                if bool(realtime):
+                    elapsed_s = time.perf_counter() - t_frame_start
+                    remaining_s = frame_period_s - elapsed_s
+                    wait_ms = int(max(1, remaining_s * 1000.0)) if remaining_s > 0 else 1
+                else:
+                    wait_ms = 1
+                key = cv2.waitKey(wait_ms) & 0xFF
+
+            total_ms = (time.perf_counter() - t_frame_start) * 1000.0
+            inst_fps = 1000.0 / max(1e-6, total_ms)
+            fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+
+            should_quit = (key in (ord("q"), 27))
+
+            frames_buf.popleft()
+            draw_xy_buf.popleft()
+            draw_cf_buf.popleft()
+            display_idx += 1
+            if should_quit:
+                break
+
+        return 0
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+        if not no_display:
+            cv2.destroyAllWindows()
+
+
+def run_inference_stream(
+    *,
+    video_path: Path,
+    classification_model_path: Path,
+    keypoint_model_path: Path,
+    on_frame: Optional[Callable[[np.ndarray], None]] = None,
+    save_path: Optional[Path] = None,
+    no_display: bool = True,
+    realtime: bool = True,
+    display_fps: float = 0.0,
+    **inference_options: Any,
+) -> int:
+    return run_inference_stream_packets(
+        video_path=video_path,
+        classification_model_path=classification_model_path,
+        keypoint_model_path=keypoint_model_path,
+        on_packet=None,
+        on_frame=on_frame,
+        save_path=save_path,
+        no_display=bool(no_display),
+        realtime=bool(realtime),
+        display_fps=float(display_fps),
+        **dict(inference_options),
+    )
 
 
 def main() -> int:

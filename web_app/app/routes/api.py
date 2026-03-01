@@ -1,8 +1,10 @@
-from pathlib import Path
-import subprocess
-import sys
+from __future__ import annotations
 
-from flask import Blueprint, current_app, jsonify, request
+import math
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
+from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from werkzeug.utils import secure_filename
 
 from app.config import (
@@ -13,30 +15,21 @@ from app.config import (
     get_web_app_root,
 )
 from app.services.inference_service import InferenceService
+from app.services.inference_stream_jobs import InferenceStreamJobManager
 from app.services.preprocessing import preprocess_file, preprocess_json
+
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 inference_service = InferenceService()
 inference_service.load()
+inference_stream_job_manager = InferenceStreamJobManager()
 
 
-def _json_error(message, status_code, command="", returncode=None, stdout="", stderr=""):
-    return (
-        jsonify(
-            {
-                "ok": False,
-                "command": command,
-                "returncode": returncode,
-                "stdout": stdout,
-                "stderr": stderr or message,
-                "error": message,
-            }
-        ),
-        status_code,
-    )
+def _json_error(message: str, status_code: int):
+    return jsonify({"ok": False, "error": message}), status_code
 
 
-def _list_available_test_videos():
+def _list_available_test_videos() -> Tuple[Path, list[str]]:
     test_videos_dir = get_test_videos_dir()
     if not test_videos_dir.exists() or not test_videos_dir.is_dir():
         raise FileNotFoundError(f"Test video directory does not exist: {test_videos_dir}")
@@ -49,27 +42,41 @@ def _list_available_test_videos():
     return test_videos_dir, videos
 
 
-def _is_safe_video_filename(video_name):
+def _is_safe_video_filename(video_name: Any) -> bool:
     if not isinstance(video_name, str):
         return False
 
     candidate = video_name.strip()
     if not candidate:
         return False
-
     if "/" in candidate or "\\" in candidate or ".." in candidate:
         return False
-
     return Path(candidate).name == candidate
 
 
-def _windows_rel_path(base_prefix, relative_path):
-    cleaned = str(relative_path).replace("/", "\\")
-    return f"{base_prefix}\\{cleaned}"
+def _classification_models_root() -> Path:
+    return (get_web_app_root() / "models" / "classification").resolve()
 
 
 def _keypoint_models_root() -> Path:
     return (get_web_app_root() / "models" / "keypoint").resolve()
+
+
+def _resolve_relative_model_path(root: Path, relative_path: str, model_kind: str) -> Path:
+    rel_path = Path(relative_path)
+    if rel_path.is_absolute():
+        raise ValueError(f"{model_kind} path must be relative.")
+
+    resolved = (root / rel_path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"Invalid {model_kind} model path.") from error
+
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Missing {model_kind} model weights: {resolved}")
+
+    return resolved
 
 
 def _ensure_keypoint_weights(relative_path: str) -> Path:
@@ -100,6 +107,104 @@ def _ensure_keypoint_weights(relative_path: str) -> Path:
     return weights_path
 
 
+def _validate_float(value: Any, *, name: str, min_value: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid {name}.") from error
+
+    if not math.isfinite(out) or out < float(min_value):
+        raise ValueError(f"Invalid {name}.")
+    return out
+
+
+def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid JSON body. Expected an object.")
+
+    classification_model = payload.get("classification_model")
+    keypoint_model = payload.get("keypoint_model")
+    video_name = payload.get("video")
+    if video_name is None:
+        video_name = payload.get("video_name")
+
+    if classification_model not in CLASSIFICATION_MODELS:
+        raise ValueError("Invalid classification model selection.")
+    if keypoint_model not in KEYPOINT_MODELS:
+        raise ValueError("Invalid keypoint model selection.")
+    if not _is_safe_video_filename(video_name):
+        raise ValueError("Invalid video value. Expected a filename without path separators.")
+
+    selected_video = str(video_name).strip()
+    test_videos_dir, available_videos = _list_available_test_videos()
+    if selected_video not in available_videos:
+        raise ValueError("Selected video is not available in the test video directory.")
+
+    resolved_video_path = (test_videos_dir / selected_video).resolve()
+    try:
+        resolved_video_path.relative_to(test_videos_dir)
+    except ValueError as error:
+        raise ValueError("Invalid video path resolution.") from error
+    if not resolved_video_path.is_file():
+        raise ValueError("Selected video file does not exist.")
+
+    classification_rel = CLASSIFICATION_MODELS[classification_model]
+    classification_weights_path = _resolve_relative_model_path(
+        _classification_models_root(),
+        classification_rel,
+        "classification",
+    )
+    keypoint_weights_path = _ensure_keypoint_weights(KEYPOINT_MODELS[keypoint_model])
+
+    realtime = bool(payload.get("realtime", True))
+    display_fps = _validate_float(payload.get("display_fps", 0.0), name="display_fps", min_value=0.0)
+
+    inference_options = {
+        "display_fps": float(display_fps),
+        "realtime": bool(realtime),
+        "T": 64,
+        "stride": 32,
+        "normalize_mode": "paper_rp",
+        "rp_center_mode": "pixel",
+        "rp_img_w": 640,
+        "rp_img_h": 480,
+        "missing_mode": "zeros_only",
+        "interp_mode": "paper_group_linear",
+        "interp_group": 100,
+    }
+
+    return {
+        "video_name": selected_video,
+        "video_path": resolved_video_path,
+        "classification_model": classification_model,
+        "keypoint_model": keypoint_model,
+        "classification_model_path": classification_weights_path,
+        "keypoint_model_path": keypoint_weights_path,
+        "inference_options": inference_options,
+    }
+
+
+def _start_stream_job_from_payload(payload: Any):
+    prepared = _prepare_stream_request(payload)
+    job = inference_stream_job_manager.start_job(
+        video_path=prepared["video_path"],
+        classification_model_path=prepared["classification_model_path"],
+        keypoint_model_path=prepared["keypoint_model_path"],
+        inference_options=prepared["inference_options"],
+    )
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "job_id": job.job_id,
+                "stream_url": f"/api/stream/{job.job_id}",
+                "status_url": f"/api/job_status/{job.job_id}",
+            }
+        ),
+        202,
+    )
+
+
 @api_bp.get("/health")
 def health():
     return jsonify({"status": "ok"})
@@ -117,118 +222,46 @@ def list_test_videos():
     return jsonify({"videos": videos})
 
 
-@api_bp.post("/run_inference")
-def run_inference():
-    command_string = ""
-
+@api_bp.post("/start_inference_stream")
+def start_inference_stream():
     try:
         payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            return _json_error("Invalid JSON body. Expected an object.", 400)
-
-        classification_model = payload.get("classification_model")
-        keypoint_model = payload.get("keypoint_model")
-        video_name = payload.get("video")
-
-        if classification_model not in CLASSIFICATION_MODELS:
-            return _json_error("Invalid classification model selection.", 400)
-        if keypoint_model not in KEYPOINT_MODELS:
-            return _json_error("Invalid keypoint model selection.", 400)
-        if not _is_safe_video_filename(video_name):
-            return _json_error("Invalid video value. Expected a filename without path separators.", 400)
-
-        video_name = video_name.strip()
-
-        try:
-            test_videos_dir, available_videos = _list_available_test_videos()
-        except (FileNotFoundError, OSError) as error:
-            return _json_error(str(error), 500)
-
-        if video_name not in available_videos:
-            return _json_error("Selected video is not available in the test video directory.", 400)
-
-        resolved_video_path = (test_videos_dir / video_name).resolve()
-        try:
-            resolved_video_path.relative_to(test_videos_dir)
-        except ValueError:
-            return _json_error("Invalid video path resolution.", 400)
-        if not resolved_video_path.is_file():
-            return _json_error("Selected video file does not exist.", 400)
-
-        keypoint_model_path = KEYPOINT_MODELS[keypoint_model]
-        try:
-            _ensure_keypoint_weights(keypoint_model_path)
-        except Exception as error:
-            return _json_error(f"Failed to prepare keypoint model weights: {error}", 500)
-
-        command = [
-            sys.executable,
-            "-m",
-            "inference.inference_on_video",
-            "--video",
-            f"..\\Datasets\\test_vids\\{video_name}",
-            "--keypoint-model",
-            _windows_rel_path(".\\models\\keypoint", keypoint_model_path),
-            "--model",
-            _windows_rel_path(".\\models\\classification", CLASSIFICATION_MODELS[classification_model]),
-            "--T",
-            "64",
-            "--stride",
-            "32",
-            "--normalize-mode",
-            "paper_rp",
-            "--rp-center-mode",
-            "pixel",
-            "--rp-img-w",
-            "640",
-            "--rp-img-h",
-            "480",
-            "--missing-mode",
-            "zeros_only",
-            "--interp-mode",
-            "paper_group_linear",
-            "--interp-group",
-            "100",
-        ]
-        command_string = subprocess.list2cmdline(command)
-
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                cwd=get_web_app_root(),
-                timeout=600,
-            )
-        except subprocess.TimeoutExpired as error:
-            timeout_message = "Inference command timed out after 600 seconds."
-            stderr = timeout_message if not error.stderr else f"{timeout_message}\n{error.stderr}"
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "command": command_string,
-                        "returncode": -1,
-                        "stdout": error.stdout or "",
-                        "stderr": stderr,
-                    }
-                ),
-                500,
-            )
-        except OSError as error:
-            return _json_error(f"Failed to execute inference command: {error}", 500, command=command_string)
-
-        return jsonify(
-            {
-                "ok": completed.returncode == 0,
-                "command": command_string,
-                "returncode": completed.returncode,
-                "stdout": completed.stdout,
-                "stderr": completed.stderr,
-            }
-        )
+        return _start_stream_job_from_payload(payload)
+    except ValueError as error:
+        return _json_error(str(error), 400)
+    except FileNotFoundError as error:
+        return _json_error(str(error), 500)
+    except OSError as error:
+        return _json_error(f"Failed to start inference stream: {error}", 500)
     except Exception as error:
-        return _json_error(f"Unexpected inference error: {error}", 500, command=command_string)
+        return _json_error(f"Unexpected inference error: {error}", 500)
+
+
+@api_bp.post("/run_inference")
+def run_inference():
+    # Backward-compatible alias.
+    return start_inference_stream()
+
+
+@api_bp.get("/stream/<job_id>")
+def stream_inference(job_id: str):
+    generator = inference_stream_job_manager.stream_generator(job_id)
+    if generator is None:
+        return jsonify({"error": "Job not found."}), 404
+
+    response = Response(stream_with_context(generator), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    response.headers["Connection"] = "keep-alive"
+    return response
+
+
+@api_bp.get("/job_status/<job_id>")
+def job_status(job_id: str):
+    status = inference_stream_job_manager.get_status(job_id)
+    if status is None:
+        return jsonify({"error": "Job not found."}), 404
+    return jsonify(status)
 
 
 @api_bp.post("/predict")
