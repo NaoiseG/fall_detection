@@ -32,6 +32,7 @@ KEYPOINT_MODELS = {
     "ultralytics-yolo11m": "ultralytics/yolo11m-pose.pt",
     "ultralytics-yolo11l": "ultralytics/yolo11l-pose.pt",
     "ultralytics-yolo11x": "ultralytics/yolo11x-pose.pt",
+    "alphapose-fastpose": "AlphaPose",
 }
 
 

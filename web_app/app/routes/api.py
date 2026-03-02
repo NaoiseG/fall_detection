@@ -79,7 +79,23 @@ def _resolve_relative_model_path(root: Path, relative_path: str, model_kind: str
     return resolved
 
 
-def _ensure_keypoint_weights(relative_path: str) -> Path:
+def _validate_alphapose_bundle(root: Path) -> None:
+    required = (
+        "alphapose/__init__.py",
+        "configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml",
+        "pretrained_models/fast_res50_256x192.pth",
+        "detector/yolo/cfg/yolov3-spp.cfg",
+        "detector/yolo/data/yolov3-spp.weights",
+    )
+    missing = [item for item in required if not (root / item).exists()]
+    if missing:
+        missing_str = ", ".join(missing)
+        raise FileNotFoundError(
+            f"Incomplete AlphaPose bundle under {root}. Missing: {missing_str}"
+        )
+
+
+def _ensure_keypoint_asset(relative_path: str) -> Path:
     keypoint_root = _keypoint_models_root()
     weights_rel_path = Path(relative_path)
     if weights_rel_path.is_absolute():
@@ -91,18 +107,23 @@ def _ensure_keypoint_weights(relative_path: str) -> Path:
     except ValueError as error:
         raise ValueError("Invalid keypoint model path.") from error
 
+    if weights_path.is_dir():
+        _validate_alphapose_bundle(weights_path)
+        return weights_path
+
     if weights_path.is_file():
         return weights_path
 
     weights_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use Ultralytics' official asset downloader when a known model file is missing.
-    from ultralytics.utils.downloads import attempt_download_asset
+    # Use Ultralytics' official asset downloader for missing checkpoint files.
+    if weights_path.suffix.lower() in {".pt", ".onnx", ".engine"}:
+        from ultralytics.utils.downloads import attempt_download_asset
 
-    attempt_download_asset(str(weights_path))
+        attempt_download_asset(str(weights_path))
 
     if not weights_path.is_file():
-        raise FileNotFoundError(f"Missing keypoint model weights: {weights_path}")
+        raise FileNotFoundError(f"Missing keypoint model asset: {weights_path}")
 
     return weights_path
 
@@ -165,7 +186,7 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         classification_rel,
         "classification",
     )
-    keypoint_weights_path = _ensure_keypoint_weights(KEYPOINT_MODELS[keypoint_model])
+    keypoint_weights_path = _ensure_keypoint_asset(KEYPOINT_MODELS[keypoint_model])
 
     realtime = bool(payload.get("realtime", True))
     display_fps = _validate_float(payload.get("display_fps", 0.0), name="display_fps", min_value=0.0)
@@ -184,6 +205,8 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     inference_options = {
         "display_fps": float(display_fps),
         "realtime": bool(realtime),
+        "keypoint_backend": "alphapose" if keypoint_weights_path.is_dir() else "yolo",
+        "max_people": 1,
         "T": int(window_size),
         "stride": int(stride_frames),
         "frame_step": int(sampling_k),

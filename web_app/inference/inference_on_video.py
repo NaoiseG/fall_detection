@@ -46,7 +46,6 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from ultralytics import YOLO
 
 # Allow running as a script from any working directory (mirrors `python -m ...`).
 _THIS_FILE = Path(__file__).resolve()
@@ -56,6 +55,7 @@ if _repo_root_str not in sys.path:
     sys.path.insert(0, _repo_root_str)
 
 import inference.helpers.dataset as ds
+from inference.helpers.keypoint_runtime import KeypointRuntime
 
 from models.classification.tcn.simple_tcn import TCNBaseline
 from models.classification.gru.simple_gru import GRUBaseline
@@ -1258,52 +1258,6 @@ def feature_layout(use_conf: bool, add_vel: bool, add_acc: bool) -> Dict[str, Op
     return {"conf_idx": conf_idx, "vel_slice": vel_slice, "acc_slice": acc_slice}
 
 
-def _to_numpy_or_none(x: Any) -> Optional[np.ndarray]:
-    if x is None:
-        return None
-    if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
-    if isinstance(x, np.ndarray):
-        return x
-    return np.asarray(x)
-
-
-def _extract_box_centers_conf(r: Any) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """
-    Safely extract:
-      - box centers: (P, 2)
-      - box conf: (P,) or None
-    """
-    if r is None or getattr(r, "boxes", None) is None:
-        return np.empty((0, 2), dtype=np.float32), None
-
-    boxes_xyxy = _to_numpy_or_none(getattr(r.boxes, "xyxy", None))
-    if boxes_xyxy is None:
-        return np.empty((0, 2), dtype=np.float32), None
-    boxes_xyxy = np.asarray(boxes_xyxy, dtype=np.float32)
-    if boxes_xyxy.ndim != 2 or boxes_xyxy.shape[0] == 0 or boxes_xyxy.shape[1] < 4:
-        return np.empty((0, 2), dtype=np.float32), None
-
-    boxes_xyxy = boxes_xyxy[:, :4]
-    centers = np.column_stack(
-        (
-            0.5 * (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]),
-            0.5 * (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]),
-        )
-    ).astype(np.float32, copy=False)
-
-    box_conf = _to_numpy_or_none(getattr(r.boxes, "conf", None))
-    if box_conf is not None:
-        box_conf = np.asarray(box_conf, dtype=np.float32).reshape(-1)
-        if box_conf.shape[0] < centers.shape[0]:
-            pad = centers.shape[0] - box_conf.shape[0]
-            box_conf = np.pad(box_conf, (0, pad), mode="constant", constant_values=np.nan)
-        elif box_conf.shape[0] > centers.shape[0]:
-            box_conf = box_conf[: centers.shape[0]]
-
-    return centers, box_conf
-
-
 def select_person_idx(
     box_centers: np.ndarray,
     box_conf: Optional[np.ndarray],
@@ -1371,11 +1325,10 @@ def expected_in_features(
 
 
 def pose_on_frame(
-    pose_model: YOLO,
+    keypoint_runtime: KeypointRuntime,
     frame_bgr: np.ndarray,
     imgsz: int,
     yolo_conf: float,
-    device: str,
     max_people: int,
     use_half: bool,
     prev_center: Optional[np.ndarray],
@@ -1386,26 +1339,21 @@ def pose_on_frame(
     xy_zeros = np.zeros((K, 2), dtype=np.float32)
     cf_zeros = np.zeros((K,), dtype=np.float32)
 
-    results = pose_model.predict(
-        source=frame_bgr,
+    detections = keypoint_runtime.predict(
+        frame_bgr=frame_bgr,
         imgsz=int(imgsz),
         conf=float(yolo_conf),
-        verbose=False,
-        device=device,
-        half=bool(use_half),
-        max_det=max(1, int(max_people)),
+        max_people=max(1, int(max_people)),
+        use_half=bool(use_half),
     )
-    if not results or len(results) == 0 or results[0].keypoints is None:
+    if detections.xy.ndim != 3 or detections.xy.shape[0] == 0:
         return xy_zeros, cf_zeros, prev_center, False
 
-    r = results[0]
-    kpts = r.keypoints
-    xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
-    cf_all = kpts.conf.cpu().numpy() if (hasattr(kpts, "conf") and hasattr(kpts.conf, "cpu")) else None
-    box_centers, box_conf = _extract_box_centers_conf(r)
+    xy_all = detections.xy
+    cf_all = detections.conf
+    box_centers = detections.box_centers
+    box_conf = detections.box_conf
 
-    if xy_all.ndim != 3 or xy_all.shape[0] == 0:
-        return xy_zeros, cf_zeros, prev_center, False
     if xy_all.shape[1] != K:
         raise ValueError(f"Expected {K} keypoints, got {xy_all.shape[1]}")
 
@@ -1621,6 +1569,7 @@ def run_inference_stream_packets(
     realtime: bool = True,
     display_fps: float = 0.0,
     device: Optional[str] = None,
+    keypoint_backend: Optional[str] = None,
     half: int = 0,
     imgsz: int = 640,
     yolo_conf: float = 0.25,
@@ -1772,7 +1721,15 @@ def run_inference_stream_packets(
         print("[WARN] unexpected keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
     model.eval()
 
-    pose_model = YOLO(str(Path(keypoint_model_path).expanduser()))
+    keypoint_runtime = KeypointRuntime(
+        model_path=Path(keypoint_model_path).expanduser(),
+        device=run_device,
+        backend=keypoint_backend,
+    )
+    print(
+        f"[pose] backend={keypoint_runtime.backend} "
+        f"model={Path(keypoint_model_path).expanduser()}"
+    )
 
     cap = cv2.VideoCapture(str(resolved_video_path))
     if not cap.isOpened():
@@ -1849,11 +1806,10 @@ def run_inference_stream_packets(
                         track_max_jump_px_final = float(track_max_jump_diag_frac) * float(frame_diag)
 
                 xy, cf, new_center, found = pose_on_frame(
-                    pose_model=pose_model,
+                    keypoint_runtime=keypoint_runtime,
                     frame_bgr=frame,
                     imgsz=int(imgsz),
                     yolo_conf=float(yolo_conf),
-                    device=run_device,
                     max_people=int(max_people),
                     use_half=use_half,
                     prev_center=track_prev_center,
@@ -2160,7 +2116,14 @@ def main() -> int:
     ap.add_argument("--video", type=str, required=True, help="Path to input .mp4")
     ap.add_argument("--model", type=str, required=True, help="Checkpoint *.pt/*.pkl OR model folder OR model .py")
     ap.add_argument("--arch", type=str, default=None, choices=KNOWN_ARCHES, help="Override model architecture if needed")
-    ap.add_argument("--keypoint-model", type=str, default="models/keypoint/yolo11l-pose.pt")
+    ap.add_argument("--keypoint-model", type=str, default="models/keypoint/ultralytics/yolo11l-pose.pt")
+    ap.add_argument(
+        "--keypoint-backend",
+        type=str,
+        default=None,
+        choices=["yolo", "alphapose"],
+        help="Override keypoint backend (auto-detected from --keypoint-model when omitted).",
+    )
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--yolo-conf", type=float, default=0.25)
     ap.add_argument(
@@ -2423,7 +2386,12 @@ def main() -> int:
             print("[WARN] unexpected keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
         model.eval()
 
-    pose_model = YOLO(str(Path(args.keypoint_model).expanduser()))
+    keypoint_runtime = KeypointRuntime(
+        model_path=Path(args.keypoint_model).expanduser(),
+        device=device,
+        backend=args.keypoint_backend,
+    )
+    print(f"[pose] backend={keypoint_runtime.backend} model={Path(args.keypoint_model).expanduser()}")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -2536,11 +2504,10 @@ def main() -> int:
                     _maybe_cuda_sync(sync_cuda_timing)
                     t_yolo0 = time.perf_counter()
                 xy, cf, new_center, found = pose_on_frame(
-                    pose_model=pose_model,
+                    keypoint_runtime=keypoint_runtime,
                     frame_bgr=frame,
                     imgsz=int(args.imgsz),
                     yolo_conf=float(args.yolo_conf),
-                    device=device,
                     max_people=int(args.max_people),
                     use_half=use_half,
                     prev_center=track_prev_center,

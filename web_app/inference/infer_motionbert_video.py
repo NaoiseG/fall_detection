@@ -38,7 +38,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from ultralytics import YOLO
+from inference.helpers.keypoint_runtime import KeypointRuntime
 
 # -----------------------------------------------------------------------------
 # MotionBERT imports: add MotionBERT root (contains `lib/`) to sys.path
@@ -582,7 +582,7 @@ def stream_infer_and_display(
     ckpt_path: Path,
     video_path: Path,
     cfg,
-    yolo_path: Path,
+    keypoint_model_path: Path,
     device: str,
     clip_len: int,
     win_step: int,
@@ -605,7 +605,12 @@ def stream_infer_and_display(
     pad_tail = bool(args.pad_tail)
 
     # Models
-    pose_model = YOLO(str(yolo_path))
+    keypoint_runtime = KeypointRuntime(
+        model_path=Path(keypoint_model_path).expanduser(),
+        device=device,
+        backend=getattr(args, "keypoint_backend", None),
+    )
+    print(f"[pose] backend={keypoint_runtime.backend} model={Path(keypoint_model_path).expanduser()}")
 
     model_backbone = load_backbone(cfg)
     model = ActionNet(
@@ -748,30 +753,27 @@ def stream_infer_and_display(
     last_cf = np.zeros((17,), dtype=np.float32)
 
     def pose_on_frame(frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        results = pose_model.predict(
-            source=frame_bgr,
+        detections = keypoint_runtime.predict(
+            frame_bgr=frame_bgr,
             imgsz=int(args.imgsz),
             conf=float(args.conf_thres),
-            verbose=False,
-            device=device,
+            max_people=1,
+            use_half=False,
         )
 
         kpts_xy = np.zeros((17, 2), dtype=np.float32)
         kpts_conf = np.zeros((17,), dtype=np.float32)
 
-        if results and len(results) > 0 and results[0].keypoints is not None:
-            kpts = results[0].keypoints
-            xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
-            cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
-
-            if xy_all.ndim == 3 and xy_all.shape[0] > 0:
-                scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
-                best = int(np.argmax(scores)) if scores is not None else 0
-                kpts_xy = xy_all[best].astype(np.float32)
-                if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
-                    kpts_conf = cf_all[best].astype(np.float32)
-                else:
-                    kpts_conf = np.ones((17,), dtype=np.float32)
+        xy_all = detections.xy
+        cf_all = detections.conf
+        if xy_all.ndim == 3 and xy_all.shape[0] > 0:
+            scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
+            best = int(np.argmax(scores)) if scores is not None else 0
+            kpts_xy = xy_all[best].astype(np.float32)
+            if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
+                kpts_conf = cf_all[best].astype(np.float32)
+            else:
+                kpts_conf = np.ones((17,), dtype=np.float32)
 
         return kpts_xy, kpts_conf
 
@@ -1113,6 +1115,7 @@ def run_inference_stream_packets(
     realtime: bool = True,
     display_fps: float = 0.0,
     device: Optional[str] = None,
+    keypoint_backend: Optional[str] = None,
     half: int = 0,
     imgsz: int = 640,
     yolo_conf: float = 0.25,
@@ -1138,7 +1141,7 @@ def run_inference_stream_packets(
         raise FileNotFoundError(f"--video not found: {resolved_video_path}")
 
     resolved_ckpt_path = resolve_checkpoint_path(str(classification_model_path))
-    resolved_yolo_path = resolve_path(str(keypoint_model_path), desc="YOLO weights")
+    resolved_keypoint_path = resolve_path(str(keypoint_model_path), desc="Keypoint model path")
 
     config_to_use = str(config_path).strip() if config_path else pick_default_config_relpath()
     resolved_cfg_path = resolve_path(config_to_use, desc="Config")
@@ -1169,7 +1172,12 @@ def run_inference_stream_packets(
         f"-> sampled clip_len/win_step={int(clip_len)}/{int(win_step)} (k={int(frame_step)})"
     )
 
-    pose_model = YOLO(str(resolved_yolo_path))
+    keypoint_runtime = KeypointRuntime(
+        model_path=resolved_keypoint_path,
+        device=run_device,
+        backend=keypoint_backend,
+    )
+    print(f"[pose] backend={keypoint_runtime.backend} model={resolved_keypoint_path}")
 
     checkpoint = torch.load(str(resolved_ckpt_path), map_location="cpu")
     raw_state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
@@ -1292,31 +1300,27 @@ def run_inference_stream_packets(
     conf_thres_final = float(display_conf_thres)
 
     def pose_on_frame(frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        results = pose_model.predict(
-            source=frame_bgr,
+        detections = keypoint_runtime.predict(
+            frame_bgr=frame_bgr,
             imgsz=int(imgsz),
             conf=float(yolo_conf),
-            verbose=False,
-            device=run_device,
-            half=bool(use_half),
+            max_people=1,
+            use_half=bool(use_half),
         )
 
         kpts_xy = np.zeros((17, 2), dtype=np.float32)
         kpts_conf = np.zeros((17,), dtype=np.float32)
 
-        if results and len(results) > 0 and results[0].keypoints is not None:
-            kpts = results[0].keypoints
-            xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
-            cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
-
-            if xy_all.ndim == 3 and xy_all.shape[0] > 0:
-                scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
-                best = int(np.argmax(scores)) if scores is not None else 0
-                kpts_xy = xy_all[best].astype(np.float32)
-                if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
-                    kpts_conf = cf_all[best].astype(np.float32)
-                else:
-                    kpts_conf = np.ones((17,), dtype=np.float32)
+        xy_all = detections.xy
+        cf_all = detections.conf
+        if xy_all.ndim == 3 and xy_all.shape[0] > 0:
+            scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
+            best = int(np.argmax(scores)) if scores is not None else 0
+            kpts_xy = xy_all[best].astype(np.float32)
+            if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
+                kpts_conf = cf_all[best].astype(np.float32)
+            else:
+                kpts_conf = np.ones((17,), dtype=np.float32)
 
         return kpts_xy, kpts_conf
 
@@ -1714,7 +1718,21 @@ def main() -> int:
         help="MotionBERT config yaml (can be relative to models/MotionBERT/)",
     )
     ap.add_argument("--video", type=str, required=True, help="Path to input mp4")
-    ap.add_argument("--yolo-weights", type=str, default="pose_models/ultralytics/yolo11l-pose.pt")
+    ap.add_argument(
+        "--keypoint-model",
+        "--yolo-weights",
+        dest="keypoint_model",
+        type=str,
+        default="models/keypoint/ultralytics/yolo11l-pose.pt",
+        help="Keypoint model path (YOLO weights file or AlphaPose bundle directory).",
+    )
+    ap.add_argument(
+        "--keypoint-backend",
+        type=str,
+        default=None,
+        choices=["yolo", "alphapose"],
+        help="Override keypoint backend (auto-detected from --keypoint-model when omitted).",
+    )
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--conf-thres", type=float, default=0.25)
@@ -1764,7 +1782,7 @@ def main() -> int:
     ckpt_path = resolve_checkpoint_path(args.model)
     video_path = resolve_path(args.video, desc="Video")
     cfg_path = resolve_path(args.config, desc="Config")
-    yolo_path = resolve_path(args.yolo_weights, desc="YOLO weights")
+    keypoint_model_path = resolve_path(args.keypoint_model, desc="Keypoint model path")
 
     cfg = get_config(str(cfg_path))
     clip_len_raw = int(args.win_len) if args.win_len is not None else int(getattr(cfg, "clip_len", 64))
@@ -1807,7 +1825,7 @@ def main() -> int:
             ckpt_path=ckpt_path,
             video_path=video_path,
             cfg=cfg,
-            yolo_path=yolo_path,
+            keypoint_model_path=keypoint_model_path,
             device=device,
             clip_len=clip_len,
             win_step=win_step,
@@ -1819,9 +1837,14 @@ def main() -> int:
         )
 
     # ------------------------------------------------------------------
-    # 1) YOLOv11 pose extraction
+    # 1) Keypoint extraction
     # ------------------------------------------------------------------
-    pose_model = YOLO(str(yolo_path))
+    keypoint_runtime = KeypointRuntime(
+        model_path=keypoint_model_path,
+        device=device,
+        backend=args.keypoint_backend,
+    )
+    print(f"[pose] backend={keypoint_runtime.backend} model={keypoint_model_path}")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1844,30 +1867,27 @@ def main() -> int:
 
         do_pose = (int(frame_idx) % int(frame_step)) == 0
         if do_pose:
-            results = pose_model.predict(
-                source=frame,
+            detections = keypoint_runtime.predict(
+                frame_bgr=frame,
                 imgsz=int(args.imgsz),
                 conf=float(args.conf_thres),
-                verbose=False,
-                device=device,
+                max_people=1,
+                use_half=False,
             )
 
             kpts_xy = np.zeros((17, 2), dtype=np.float32)
             kpts_conf = np.zeros((17,), dtype=np.float32)
 
-            if results and len(results) > 0 and results[0].keypoints is not None:
-                kpts = results[0].keypoints
-                xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
-                cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
-
-                if xy_all.ndim == 3 and xy_all.shape[0] > 0:
-                    scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
-                    best = int(np.argmax(scores)) if scores is not None else 0
-                    kpts_xy = xy_all[best].astype(np.float32)
-                    if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
-                        kpts_conf = cf_all[best].astype(np.float32)
-                    else:
-                        kpts_conf = np.ones((17,), dtype=np.float32)
+            xy_all = detections.xy
+            cf_all = detections.conf
+            if xy_all.ndim == 3 and xy_all.shape[0] > 0:
+                scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
+                best = int(np.argmax(scores)) if scores is not None else 0
+                kpts_xy = xy_all[best].astype(np.float32)
+                if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
+                    kpts_conf = cf_all[best].astype(np.float32)
+                else:
+                    kpts_conf = np.ones((17,), dtype=np.float32)
 
             frames_xy.append(kpts_xy)
             frames_cf.append(kpts_conf)
