@@ -21,6 +21,7 @@ CLASSIFICATION_MODELS = {
     "cnn-lstm": "cnnlstm/cnnlstm_best.pt",
     "st-gcn": "stgcn/stgcn_best.pt",
     "gru": "gru/gru_best.pt",
+    "motionbert": "MotionBERT/checkpoint/action/FT_MB_release_MB_ft_UPFall_xsub/best_epoch.bin",
 }
 
 # TODO: Replace each value with the actual relative checkpoint path under

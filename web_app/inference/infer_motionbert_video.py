@@ -25,13 +25,14 @@ Notes
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import pickle
 import sys
 import time
 from collections import deque
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -45,18 +46,29 @@ from ultralytics import YOLO
 _THIS_FILE = Path(__file__).resolve()
 _REPO_ROOT = _THIS_FILE.parents[1]  # fall_models/Prototype
 
-_MB_ROOT = _REPO_ROOT / "models" / "MotionBERT"
-if not _MB_ROOT.exists():
-    # Fallback: walk upwards until we find models/MotionBERT (helps if this file is moved).
-    for parent in _THIS_FILE.parents:
-        cand = parent / "models" / "MotionBERT"
-        if cand.exists():
-            _REPO_ROOT = parent
-            _MB_ROOT = cand
-            break
+def _find_motionbert_root(start_file: Path) -> Tuple[Path, Path]:
+    initial_repo_root = start_file.parents[1]
+    candidates = [
+        initial_repo_root / "models" / "classification" / "MotionBERT",
+        initial_repo_root / "models" / "MotionBERT",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return initial_repo_root, candidate
 
-if not _MB_ROOT.exists():
-    raise FileNotFoundError(f"MotionBERT root not found at: {_MB_ROOT.as_posix()}")
+    for parent in start_file.parents:
+        for suffix in (
+            Path("models") / "classification" / "MotionBERT",
+            Path("models") / "MotionBERT",
+        ):
+            candidate = parent / suffix
+            if candidate.exists():
+                return parent, candidate
+
+    raise FileNotFoundError("MotionBERT root not found under expected models directories.")
+
+
+_REPO_ROOT, _MB_ROOT = _find_motionbert_root(_THIS_FILE)
 
 mb_root_str = str(_MB_ROOT)
 if mb_root_str not in sys.path:
@@ -97,6 +109,17 @@ CLASS_NAMES_MERGED_DEFAULT = [
 ]
 
 FALL_CLASS_IDS_DEFAULT = [0, 1, 2, 3, 4]
+DEFAULT_CONFIG_CANDIDATES = [
+    "configs/action/MB_ft_UPFall_xsub_LITE.yaml",
+    "configs/action/MB_ft_UPFall_xsub.yaml",
+]
+
+
+def pick_default_config_relpath() -> str:
+    for rel_path in DEFAULT_CONFIG_CANDIDATES:
+        if (_MB_ROOT / rel_path).exists():
+            return rel_path
+    return DEFAULT_CONFIG_CANDIDATES[0]
 
 # COCO keypoint order for Ultralytics pose models (17 joints)
 K = 17
@@ -326,6 +349,25 @@ def _clean_state_dict_for_model(state: dict, model: nn.Module) -> dict:
     if (not has_module_prefix) and model_is_dp:
         return {("module." + k): v for k, v in state.items()}
     return state
+
+
+def _infer_action_classes_from_state_dict(state: dict) -> Optional[int]:
+    if not isinstance(state, dict):
+        return None
+    candidate_keys = (
+        "head.fc2.weight",
+        "module.head.fc2.weight",
+        "head.fc2.bias",
+        "module.head.fc2.bias",
+    )
+    for key in candidate_keys:
+        value = state.get(key)
+        if value is None:
+            continue
+        shape = tuple(getattr(value, "shape", ()))
+        if len(shape) >= 1 and int(shape[0]) > 0:
+            return int(shape[0])
+    return None
 
 
 def build_windows(
@@ -1059,6 +1101,604 @@ def stream_infer_and_display(
     return 0
 
 
+def run_inference_stream_packets(
+    *,
+    video_path: Path,
+    classification_model_path: Path,
+    keypoint_model_path: Path,
+    on_packet: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_frame: Optional[Callable[[np.ndarray], None]] = None,
+    save_path: Optional[Path] = None,
+    no_display: bool = True,
+    realtime: bool = True,
+    display_fps: float = 0.0,
+    device: Optional[str] = None,
+    half: int = 0,
+    imgsz: int = 640,
+    yolo_conf: float = 0.25,
+    T: int = 0,
+    stride: int = 0,
+    frame_step: int = 1,
+    config_path: Optional[str] = None,
+    labels_file: Optional[str] = None,
+    pad_tail: bool = False,
+    missing_conf_thres: float = 0.0,
+    keep_empty_windows: bool = False,
+    display_conf_thres: float = 0.2,
+    no_merge_fall: bool = False,
+    jpeg_quality: int = 80,
+    **_unused_options: Any,
+) -> int:
+    frame_step = int(frame_step)
+    if frame_step <= 0:
+        raise ValueError("--frame-step/--k must be >= 1.")
+
+    resolved_video_path = Path(video_path).expanduser()
+    if not resolved_video_path.exists():
+        raise FileNotFoundError(f"--video not found: {resolved_video_path}")
+
+    resolved_ckpt_path = resolve_checkpoint_path(str(classification_model_path))
+    resolved_yolo_path = resolve_path(str(keypoint_model_path), desc="YOLO weights")
+
+    config_to_use = str(config_path).strip() if config_path else pick_default_config_relpath()
+    resolved_cfg_path = resolve_path(config_to_use, desc="Config")
+
+    run_device = pick_device(device)
+    use_half = bool(int(half)) and run_device.startswith("cuda")
+
+    cfg = get_config(str(resolved_cfg_path))
+
+    clip_len_raw = int(T) if int(T) > 0 else int(getattr(cfg, "clip_len", 64))
+    win_step_raw = int(stride) if int(stride) > 0 else 16
+    if int(clip_len_raw) <= 0:
+        raise ValueError(f"Invalid window length: {clip_len_raw}.")
+    if int(win_step_raw) <= 0:
+        raise ValueError(f"Invalid window stride: {win_step_raw}.")
+
+    clip_len = max(1, int(ceil_div_pos(int(clip_len_raw), int(frame_step))))
+    win_step = max(1, int(ceil_div_pos(int(win_step_raw), int(frame_step))))
+    if int(frame_step) > 1 and (
+        (int(clip_len_raw) % int(frame_step)) != 0 or (int(win_step_raw) % int(frame_step)) != 0
+    ):
+        print(
+            f"[window][WARN] raw clip_len/win_step ({int(clip_len_raw)}/{int(win_step_raw)}) "
+            f"are not divisible by frame_step={int(frame_step)}; using ceil division for sampled windows."
+        )
+    print(
+        f"[window] raw clip_len/win_step={int(clip_len_raw)}/{int(win_step_raw)} "
+        f"-> sampled clip_len/win_step={int(clip_len)}/{int(win_step)} (k={int(frame_step)})"
+    )
+
+    pose_model = YOLO(str(resolved_yolo_path))
+
+    checkpoint = torch.load(str(resolved_ckpt_path), map_location="cpu")
+    raw_state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    cfg_num_classes = int(getattr(cfg, "action_classes", 11))
+    ckpt_num_classes = _infer_action_classes_from_state_dict(raw_state)
+    num_classes = int(ckpt_num_classes) if ckpt_num_classes is not None else int(cfg_num_classes)
+    if ckpt_num_classes is not None and int(ckpt_num_classes) != int(cfg_num_classes):
+        print(
+            f"[model][WARN] Config action_classes={int(cfg_num_classes)} but checkpoint head expects "
+            f"{int(ckpt_num_classes)} classes; using checkpoint value."
+        )
+
+    model_backbone = load_backbone(cfg)
+    model = ActionNet(
+        backbone=model_backbone,
+        dim_rep=getattr(cfg, "dim_rep", 512),
+        num_classes=int(num_classes),
+        dropout_ratio=getattr(cfg, "dropout_ratio", 0.0),
+        version=getattr(cfg, "model_version", "class"),
+        hidden_dim=getattr(cfg, "hidden_dim", 2048),
+        num_joints=getattr(cfg, "num_joints", 17),
+    )
+
+    use_dp = run_device.startswith("cuda") and torch.cuda.device_count() > 1
+    if use_dp:
+        model = nn.DataParallel(model)
+    model = model.to(run_device)
+
+    state = _clean_state_dict_for_model(raw_state, model)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    scale_range = getattr(cfg, "scale_range_test", None)
+
+    labels_file_names = load_labels_file(labels_file)
+
+    unmerged_len_expected = len(CLASS_NAMES_DEFAULT)
+    merged_len_expected = len(CLASS_NAMES_MERGED_DEFAULT)
+    merge_fall = (not bool(no_merge_fall)) and (num_classes == unmerged_len_expected)
+
+    if labels_file_names is not None:
+        if merge_fall and len(labels_file_names) == merged_len_expected:
+            class_names_out = list(labels_file_names)
+        else:
+            base_names = pad_or_trim(list(labels_file_names), num_classes)
+            if merge_fall:
+                class_names_out = ["Fall"] + [
+                    base_names[i] for i in range(unmerged_len_expected) if i not in FALL_CLASS_IDS_DEFAULT
+                ]
+            else:
+                class_names_out = base_names
+    else:
+        if num_classes == merged_len_expected:
+            class_names_out = list(CLASS_NAMES_MERGED_DEFAULT)
+        else:
+            base_names = pad_or_trim(list(CLASS_NAMES_DEFAULT), num_classes)
+            if merge_fall:
+                class_names_out = ["Fall"] + [
+                    base_names[i] for i in range(unmerged_len_expected) if i not in FALL_CLASS_IDS_DEFAULT
+                ]
+            else:
+                class_names_out = base_names
+
+    fall_idx = infer_fall_indices(class_names_out)
+    standing_label = next((str(name) for name in class_names_out if "stand" in str(name).lower()), "standing")
+
+    predict_kwargs = dict(
+        model=model,
+        device=run_device,
+        clip_len=int(clip_len),
+        scale_range=scale_range,
+        merge_fall=merge_fall,
+        fall_idx=fall_idx,
+        class_names_out=class_names_out,
+        unmerged_len_expected=unmerged_len_expected,
+        merged_len_expected=merged_len_expected,
+        frame_step=frame_step,
+    )
+
+    cap = cv2.VideoCapture(str(resolved_video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {resolved_video_path.as_posix()}")
+
+    src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if not np.isfinite(src_fps) or src_fps <= 1e-3:
+        src_fps = 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    fps_play = float(display_fps) if float(display_fps) > 1e-3 else float(src_fps)
+    frame_period_s = 1.0 / max(1e-6, float(fps_play))
+
+    window_name = "MotionBERT Inference"
+    if not bool(no_display):
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    writer: Optional[cv2.VideoWriter] = None
+    base_w = 0
+    base_h = 0
+
+    frames_buf: "deque[np.ndarray]" = deque()
+    xy_buf: "deque[np.ndarray]" = deque()
+    cf_buf: "deque[np.ndarray]" = deque()
+
+    all_xy: List[np.ndarray] = []
+    all_cf: List[np.ndarray] = []
+
+    img_shape: Optional[Tuple[int, int]] = None
+    processed_total = 0
+    sampled_total = 0
+    display_idx = 0
+    cap_done = False
+
+    window_preds: Dict[int, dict] = {}
+    skipped_windows: set[int] = set()
+    next_win_start = 0
+    last_xy = np.zeros((17, 2), dtype=np.float32)
+    last_cf = np.zeros((17,), dtype=np.float32)
+
+    drop_empty_windows = not bool(keep_empty_windows)
+    conf_thres_final = float(display_conf_thres)
+
+    def pose_on_frame(frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        results = pose_model.predict(
+            source=frame_bgr,
+            imgsz=int(imgsz),
+            conf=float(yolo_conf),
+            verbose=False,
+            device=run_device,
+            half=bool(use_half),
+        )
+
+        kpts_xy = np.zeros((17, 2), dtype=np.float32)
+        kpts_conf = np.zeros((17,), dtype=np.float32)
+
+        if results and len(results) > 0 and results[0].keypoints is not None:
+            kpts = results[0].keypoints
+            xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.array(kpts.xy)
+            cf_all = kpts.conf.cpu().numpy() if hasattr(kpts.conf, "cpu") else np.array(kpts.conf)
+
+            if xy_all.ndim == 3 and xy_all.shape[0] > 0:
+                scores = cf_all.sum(axis=1) if (cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]) else None
+                best = int(np.argmax(scores)) if scores is not None else 0
+                kpts_xy = xy_all[best].astype(np.float32)
+                if cf_all.ndim == 2 and cf_all.shape[0] == xy_all.shape[0]:
+                    kpts_conf = cf_all[best].astype(np.float32)
+                else:
+                    kpts_conf = np.ones((17,), dtype=np.float32)
+
+        return kpts_xy, kpts_conf
+
+    def process_next_frame() -> bool:
+        nonlocal processed_total, sampled_total, cap_done, img_shape, last_xy, last_cf
+
+        if cap_done:
+            return False
+
+        ok, frame = cap.read()
+        if not ok:
+            cap_done = True
+            return False
+
+        if img_shape is None:
+            h, w = frame.shape[:2]
+            img_shape = (int(h), int(w))
+
+        raw_idx = int(processed_total)
+        do_pose = (int(raw_idx) % int(frame_step)) == 0
+
+        if do_pose:
+            xy, cf = pose_on_frame(frame)
+            all_xy.append(xy)
+            all_cf.append(cf)
+            sampled_total += 1
+            last_xy = xy
+            last_cf = cf
+        else:
+            xy = last_xy
+            cf = last_cf
+
+        frames_buf.append(frame)
+        xy_buf.append(xy)
+        cf_buf.append(cf)
+        processed_total += 1
+        return True
+
+    def make_window_annotation(start: int) -> Optional[Tuple[str, dict]]:
+        if img_shape is None:
+            return None
+
+        end = int(start) + int(clip_len)
+        if end <= int(sampled_total):
+            raw_kxy = np.stack(all_xy[start:end], axis=0).astype(np.float32)
+            raw_ksc = np.stack(all_cf[start:end], axis=0).astype(np.float32)
+        else:
+            if not cap_done or (not bool(pad_tail)):
+                return None
+            if start >= int(sampled_total):
+                return None
+            pad_n = int(end - int(sampled_total))
+            if pad_n >= int(clip_len):
+                return None
+            raw_kxy = np.stack(all_xy[start:sampled_total], axis=0).astype(np.float32)
+            raw_ksc = np.stack(all_cf[start:sampled_total], axis=0).astype(np.float32)
+            last_xy_local = raw_kxy[-1:, :, :]
+            last_sc_local = raw_ksc[-1:, :]
+            raw_kxy = np.concatenate([raw_kxy, np.repeat(last_xy_local, pad_n, axis=0)], axis=0)
+            raw_ksc = np.concatenate([raw_ksc, np.repeat(last_sc_local, pad_n, axis=0)], axis=0)
+
+        if raw_kxy.shape != (int(clip_len), 17, 2) or raw_ksc.shape != (int(clip_len), 17):
+            return None
+
+        kxy = raw_kxy.copy()
+        ksc = raw_ksc.copy()
+
+        nonfinite_xy = ~np.isfinite(kxy)
+        nonfinite_sc = ~np.isfinite(ksc)
+        if nonfinite_xy.any() or nonfinite_sc.any():
+            kxy[nonfinite_xy] = 0.0
+            ksc[nonfinite_sc] = 0.0
+            nonfinite_joint = nonfinite_xy.any(axis=2) | nonfinite_sc
+            ksc[nonfinite_joint] = 0.0
+
+        if (ksc < 0).any() or (ksc > 1).any():
+            ksc = np.clip(ksc, 0.0, 1.0)
+
+        interpolate_missing_joints_inplace(kxy, ksc, missing_conf_thres=float(missing_conf_thres))
+
+        if drop_empty_windows:
+            if np.all(ksc <= float(missing_conf_thres)):
+                return None
+            if (np.ptp(kxy[..., 0]) < 1e-6) and (np.ptp(kxy[..., 1]) < 1e-6):
+                return None
+
+        frame_dir = f"{resolved_video_path.stem}_s{start}_len{clip_len}"
+        ann = {
+            "frame_dir": frame_dir,
+            "total_frames": int(clip_len),
+            "img_shape": (int(img_shape[0]), int(img_shape[1])),
+            "keypoint": kxy[None, ...].astype(np.float32),
+            "keypoint_score": ksc[None, ...].astype(np.float32),
+            "label": 0,
+        }
+        return frame_dir, ann
+
+    def compute_window_pred(start: int) -> Optional[dict]:
+        if int(start) in window_preds:
+            return window_preds[int(start)]
+        if int(start) in skipped_windows:
+            return None
+
+        window = make_window_annotation(int(start))
+        if window is None:
+            if cap_done and (not bool(pad_tail)) and int(sampled_total) < int(start) + int(clip_len):
+                skipped_windows.add(int(start))
+            if drop_empty_windows and int(sampled_total) >= int(start) + int(clip_len):
+                skipped_windows.add(int(start))
+            return None
+
+        frame_dir, ann = window
+        pred = predict_one_window(ann=ann, frame_dir=frame_dir, **predict_kwargs)
+        window_preds[int(start)] = pred
+        return pred
+
+    def compute_ready_windows() -> None:
+        nonlocal next_win_start
+
+        while True:
+            if int(next_win_start) in window_preds or int(next_win_start) in skipped_windows:
+                next_win_start = int(next_win_start) + int(win_step)
+                continue
+
+            if not cap_done:
+                if int(sampled_total) >= int(next_win_start) + int(clip_len):
+                    compute_window_pred(int(next_win_start))
+                    next_win_start = int(next_win_start) + int(win_step)
+                    continue
+                break
+
+            if int(sampled_total) >= int(next_win_start) + int(clip_len):
+                compute_window_pred(int(next_win_start))
+                next_win_start = int(next_win_start) + int(win_step)
+                continue
+            if bool(pad_tail) and int(next_win_start) < int(sampled_total):
+                compute_window_pred(int(next_win_start))
+                next_win_start = int(next_win_start) + int(win_step)
+                continue
+            break
+
+    def get_pred_for_frame(frame_idx: int) -> Optional[dict]:
+        if frame_idx < 0:
+            return None
+        sample_idx = int(frame_idx) // int(frame_step)
+        win_start = (int(sample_idx) // int(win_step)) * int(win_step)
+        pred = window_preds.get(int(win_start))
+        if pred is not None:
+            return pred
+
+        start = int(win_start) - int(win_step)
+        while start >= 0:
+            candidate = window_preds.get(int(start))
+            if candidate is not None and int(frame_idx) <= int(candidate["end_frame"]):
+                return candidate
+            start -= int(win_step)
+        return None
+
+    hud_delay_frames = 32
+    hud_delay_buf: "deque[List[str]]" = deque()
+
+    try:
+        while int(sampled_total) < int(clip_len) and not cap_done:
+            process_next_frame()
+        if int(processed_total) <= 0:
+            raise RuntimeError("Video had 0 frames.")
+
+        compute_window_pred(0)
+        next_win_start = int(win_step)
+
+        if save_path is not None and frames_buf:
+            save_path_resolved = Path(save_path).expanduser()
+            if save_path_resolved.suffix == "":
+                save_path_resolved = save_path_resolved.with_suffix(".mp4")
+            base_h, base_w = frames_buf[0].shape[:2]
+            writer = open_video_writer(
+                save_path=save_path_resolved,
+                fps=float(src_fps),
+                frame_size=(int(base_w), int(base_h)),
+            )
+
+        fps_ema: Optional[float] = None
+        ema_alpha = 0.1
+
+        while True:
+            if not frames_buf and cap_done:
+                break
+
+            t_frame_start = time.perf_counter()
+
+            display_sample_idx = int(display_idx) // int(frame_step)
+            target_sampled = int(display_sample_idx) + int(clip_len) + 1
+            while (not cap_done) and int(sampled_total) < int(target_sampled):
+                process_next_frame()
+
+            compute_ready_windows()
+
+            if not frames_buf:
+                continue
+
+            win_start = (int(display_sample_idx) // int(win_step)) * int(win_step)
+            if win_start not in window_preds and win_start not in skipped_windows:
+                while (not cap_done) and int(sampled_total) < int(win_start) + int(clip_len):
+                    process_next_frame()
+                    compute_ready_windows()
+                compute_window_pred(int(win_start))
+
+            pred = get_pred_for_frame(int(display_idx))
+            if pred is None:
+                pred_id = -1
+                pred_label = "..."
+                pred_conf = 0.0
+                p_fall: Optional[float] = None
+            else:
+                pred_id = int(pred["pred_id"])
+                pred_label = str(pred["pred_name"])
+                pred_conf = float(pred["pred_conf"])
+                p_fall = float(pred["p_fall"])
+
+            frame_original = frames_buf[0]
+            xy = xy_buf[0]
+            cf = cf_buf[0]
+
+            frame_info = f"frame {int(display_idx) + 1}"
+            if int(frame_count) > 0:
+                frame_info += f"/{int(frame_count)}"
+
+            fps_for_hud = float(fps_ema) if fps_ema is not None else float(fps_play)
+            hud = [
+                frame_info,
+                f"fps: {float(fps_for_hud):.1f}",
+                f"pose: {pred_label} ({float(pred_conf):.2f})" if int(pred_id) >= 0 else "pose: ...",
+                f"T={int(clip_len)} stride={int(win_step)} sampled (k={int(frame_step)})",
+            ]
+            if p_fall is not None:
+                hud.append(f"fall_prob: {float(p_fall):.2f}")
+
+            hud_delay_buf.append(list(hud))
+            if len(hud_delay_buf) <= int(hud_delay_frames):
+                hud_to_draw = list(hud)
+                if len(hud_to_draw) > 2:
+                    hud_to_draw[2] = f"pose: {standing_label} (1.00)"
+                for i, line in enumerate(hud_to_draw):
+                    if line.startswith("fall_prob:"):
+                        hud_to_draw[i] = "fall_prob: 0.00"
+            else:
+                hud_to_draw = hud_delay_buf.popleft()
+
+            if on_packet is not None:
+                ok_jpg, encoded = cv2.imencode(
+                    ".jpg",
+                    frame_original,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
+                )
+                if not ok_jpg:
+                    raise RuntimeError(f"Failed to encode frame {int(display_idx)} to JPEG.")
+                frame_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
+                packet: Dict[str, Any] = {
+                    "type": "frame",
+                    "frame_index": int(display_idx),
+                    "frame_number": int(display_idx) + 1,
+                    "frame_count": int(frame_count),
+                    "fps": float(fps_for_hud),
+                    "pred": {
+                        "label": str(pred_label),
+                        "conf": float(pred_conf),
+                        "class_id": int(pred_id),
+                    },
+                    "params": {
+                        "T": int(clip_len),
+                        "stride": int(win_step),
+                        "k": int(frame_step),
+                    },
+                    "hud_lines": list(hud_to_draw),
+                    "pose": {
+                        "format": "coco17",
+                        "xy": np.asarray(xy, dtype=np.float32).tolist(),
+                        "conf": np.asarray(cf, dtype=np.float32).tolist(),
+                        "conf_thres": float(conf_thres_final),
+                        "skeleton": [[int(a), int(b)] for a, b in SKELETON],
+                    },
+                    "frame_jpeg_b64": frame_b64,
+                    "size": {"w": int(frame_original.shape[1]), "h": int(frame_original.shape[0])},
+                    "overlay": {
+                        "hud": {
+                            "x": 10,
+                            "y": 10,
+                            "pad": 8,
+                            "line_gap": 6,
+                            "bg_alpha": 0.6,
+                            "font_px": 20,
+                        },
+                        "pose": {
+                            "keypoint_radius": 3,
+                            "skeleton_width": 2,
+                        },
+                    },
+                }
+                if p_fall is not None:
+                    packet["pred"]["fall_prob"] = float(p_fall)
+                on_packet(packet)
+
+            key = -1
+            needs_rendered_frame = (on_frame is not None) or (writer is not None) or (not bool(no_display))
+            if needs_rendered_frame:
+                frame_to_render = draw_pose(
+                    frame_original.copy(),
+                    xy,
+                    cf,
+                    conf_thres=float(conf_thres_final),
+                    draw_skeleton=True,
+                )
+                frame_to_render = draw_hud(frame_to_render, hud_to_draw)
+
+                if on_frame is not None:
+                    on_frame(frame_to_render)
+
+                if writer is not None:
+                    frame_h, frame_w = frame_to_render.shape[:2]
+                    frame_to_write = frame_to_render
+                    if frame_h != int(base_h) or frame_w != int(base_w):
+                        frame_to_write = cv2.resize(frame_to_render, (int(base_w), int(base_h)), interpolation=cv2.INTER_LINEAR)
+                    writer.write(frame_to_write)
+
+                if not bool(no_display):
+                    cv2.imshow(window_name, frame_to_render)
+                    if bool(realtime):
+                        elapsed_s = time.perf_counter() - t_frame_start
+                        remaining_s = frame_period_s - elapsed_s
+                        wait_ms = int(max(1, remaining_s * 1000.0)) if remaining_s > 0 else 1
+                    else:
+                        wait_ms = 1
+                    key = cv2.waitKey(int(wait_ms)) & 0xFF
+
+            total_ms = (time.perf_counter() - t_frame_start) * 1000.0
+            inst_fps = 1000.0 / max(1e-6, total_ms)
+            fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+
+            should_quit = key in (ord("q"), 27)
+
+            frames_buf.popleft()
+            xy_buf.popleft()
+            cf_buf.popleft()
+            display_idx += 1
+            if should_quit:
+                break
+
+        return 0
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+        if not bool(no_display):
+            cv2.destroyAllWindows()
+
+
+def run_inference_stream(
+    *,
+    video_path: Path,
+    classification_model_path: Path,
+    keypoint_model_path: Path,
+    on_frame: Optional[Callable[[np.ndarray], None]] = None,
+    save_path: Optional[Path] = None,
+    no_display: bool = True,
+    realtime: bool = True,
+    display_fps: float = 0.0,
+    **inference_options: Any,
+) -> int:
+    return run_inference_stream_packets(
+        video_path=video_path,
+        classification_model_path=classification_model_path,
+        keypoint_model_path=keypoint_model_path,
+        on_packet=None,
+        on_frame=on_frame,
+        save_path=save_path,
+        no_display=bool(no_display),
+        realtime=bool(realtime),
+        display_fps=float(display_fps),
+        **dict(inference_options),
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -1070,7 +1710,7 @@ def main() -> int:
     ap.add_argument(
         "--config",
         type=str,
-        default="configs/action/MB_ft_UPFall_xsub_LITE.yaml",
+        default=pick_default_config_relpath(),
         help="MotionBERT config yaml (can be relative to models/MotionBERT/)",
     )
     ap.add_argument("--video", type=str, required=True, help="Path to input mp4")

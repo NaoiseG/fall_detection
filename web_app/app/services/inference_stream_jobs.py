@@ -75,6 +75,7 @@ class InferenceStreamJobManager:
         self,
         *,
         video_path: Path,
+        classification_model: str,
         classification_model_path: Path,
         keypoint_model_path: Path,
         inference_options: Optional[Dict[str, Any]] = None,
@@ -88,6 +89,7 @@ class InferenceStreamJobManager:
             kwargs={
                 "job": job,
                 "video_path": video_path.resolve(),
+                "classification_model": str(classification_model),
                 "classification_model_path": classification_model_path.resolve(),
                 "keypoint_model_path": keypoint_model_path.resolve(),
                 "inference_options": dict(inference_options or {}),
@@ -148,12 +150,17 @@ class InferenceStreamJobManager:
         *,
         job: InferenceStreamJob,
         video_path: Path,
+        classification_model: str,
         classification_model_path: Path,
         keypoint_model_path: Path,
         inference_options: Dict[str, Any],
     ) -> None:
         try:
-            from inference.inference_on_video import run_inference_stream_packets
+            model_key = str(classification_model).strip().lower()
+            if model_key == "motionbert":
+                from inference.infer_motionbert_video import run_inference_stream_packets
+            else:
+                from inference.inference_on_video import run_inference_stream_packets
 
             return_code = run_inference_stream_packets(
                 video_path=video_path,

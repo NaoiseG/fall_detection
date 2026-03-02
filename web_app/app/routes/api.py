@@ -211,6 +211,7 @@ def _start_stream_job_from_payload(payload: Any):
     prepared = _prepare_stream_request(payload)
     job = inference_stream_job_manager.start_job(
         video_path=prepared["video_path"],
+        classification_model=prepared["classification_model"],
         classification_model_path=prepared["classification_model_path"],
         keypoint_model_path=prepared["keypoint_model_path"],
         inference_options=prepared["inference_options"],
