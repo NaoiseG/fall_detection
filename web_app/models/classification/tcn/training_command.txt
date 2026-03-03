@@ -1,0 +1,3 @@
+!python -m training.train_models --model stgcn --train-subjects 1-12 --val-subjects 13-15 --npz-root ~/scratch/keypoints/UPFall_keypoints/outputs_npz --camera 1 2 --label-mode center --drop-ambig-share 0 --T 64 --stride 32 --epochs 200 --normalize 1 --normalize-mode paper_rp \
+--rp-center-mode pixel --rp-img-w 640 --rp-img-h 480 --missing-mode zeros_only --interp-mode paper_group_linear --interp-group 100 --selection-metric composite_fall_fbeta_macro_f1 --selection-w 0.7 \
+--selection-beta 2.0 --rare-class-boost 1.5 --weighted-sampler 1

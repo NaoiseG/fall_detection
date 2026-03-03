@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1>Fall Detection Web App</h1>
+<p>Configure and run inference on a test video.</p>
+
+<div class="inference-controls">
+  <label for="classification-model">Classification Model</label>
+  <select id="classification-model" name="classification-model">
+    <option value="tcn">tcn</option>
+    <option value="cnn-lstm">cnn-lstm</option>
+    <option value="st-gcn">st-gcn</option>
+    <option value="motionbert">motionbert</option>
+  </select>
+
+  <label for="keypoint-model">Keypoint Detection Model</label>
+  <select id="keypoint-model" name="keypoint-model">
+    <option value="ultralytics-yolo11n">ultralytics-yolo11n</option>
+    <option value="ultralytics-yolo11s">ultralytics-yolo11s</option>
+    <option value="ultralytics-yolo11m">ultralytics-yolo11m</option>
+    <option value="ultralytics-yolo11l">ultralytics-yolo11l</option>
+    <option value="ultralytics-yolo11x">ultralytics-yolo11x</option>
+    <option value="vitpose-base">vitpose-base</option>
+    <option value="alphapose-fastpose">alphapose-fastpose</option>
+  </select>
+
+  <label for="video-select">Video</label>
+  <select id="video-select" name="video-select">
+    <option value="">Loading videos...</option>
+  </select>
+
+  <label for="window-size">Window Size (T)</label>
+  <input id="window-size" name="window-size" type="number" min="1" step="1" value="64">
+
+  <label for="stride-overlap">Overlap (%) [--stride]</label>
+  <input id="stride-overlap" name="stride-overlap" type="number" min="0" max="99" step="1" value="50">
+
+  <label for="sampling-k">Sampling Frequency (k)</label>
+  <input id="sampling-k" name="sampling-k" type="number" min="1" step="1" value="1">
+
+  <button id="run-inference" type="button">Run</button>
+</div>
+
+<section class="live-view">
+  <h2>Live View</h2>
+  <p id="live-status">Idle.</p>
+  <canvas id="live-canvas" width="640" height="360"></canvas>
+</section>
+
+<h2>API Response</h2>
+<p id="run-status">Ready.</p>
+<pre id="response">Choose models and a video, then click Run.</pre>
+{% endblock %}
