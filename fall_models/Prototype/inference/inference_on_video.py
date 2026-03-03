@@ -28,6 +28,7 @@ import argparse
 import csv
 import inspect
 import json
+import os
 import platform
 import re
 import shutil
@@ -167,6 +168,39 @@ def _json_safe_number(v: Any) -> Optional[float]:
     if np.isfinite(fv):
         return float(fv)
     return None
+
+
+def assert_benchmark_device_ok(benchmark: bool, device: str) -> None:
+    """
+    Runtime guard for benchmark mode.
+    Kept as a standalone helper so it is easy to unit-test on CPU-only machines.
+    """
+    if not bool(benchmark):
+        return
+    device_str = str(device).strip()
+    if not device_str.lower().startswith("cuda"):
+        raise ValueError(
+            f"--benchmark requires CUDA, but resolved runtime device is '{device_str}'. "
+            "Use --device cuda on a CUDA-capable machine, or disable --benchmark."
+        )
+
+
+def get_benchmark_duration_s(default_s: float = 600.0) -> float:
+    """
+    Internal dev override for quicker benchmark smoke runs:
+      BENCHMARK_DURATION_S=<seconds>
+    Public CLI remains unchanged.
+    """
+    raw = os.getenv("BENCHMARK_DURATION_S")
+    if raw is None or str(raw).strip() == "":
+        return float(default_s)
+    try:
+        out = float(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid BENCHMARK_DURATION_S='{raw}'. Expected a positive number of seconds.") from e
+    if not np.isfinite(out) or out <= 0.0:
+        raise ValueError(f"BENCHMARK_DURATION_S must be a finite number > 0, got '{raw}'.")
+    return float(out)
 
 
 def _fmt_live_metric(v: Any, unit: str = "", digits: int = 1) -> str:
@@ -905,6 +939,8 @@ def _save_profile_artifacts(
     ram_vals = [_safe_float(r.get("ram_used_pct", np.nan)) for r in hw_rows]
     cpu_vals = [_safe_float(r.get("cpu_pct", np.nan)) for r in hw_rows]
     gpu_vals = [_safe_float(r.get("gpu_pct", np.nan)) for r in hw_rows]
+    cpu_temp_vals = [_safe_float(r.get("cpu_temp_c", np.nan)) for r in hw_rows]
+    gpu_temp_vals = [_safe_float(r.get("gpu_temp_c", np.nan)) for r in hw_rows]
     power_vals = [_safe_float(r.get("power_w", np.nan)) for r in hw_rows]
 
     duration_s = float("nan")
@@ -936,6 +972,11 @@ def _save_profile_artifacts(
             "median": _json_safe_number(_median_valid(vis_vals)),
             "p95": _json_safe_number(_p95_valid(vis_vals)),
         },
+        "avg_ram_pct": _json_safe_number(_avg_valid(ram_vals)),
+        "avg_cpu_pct": _json_safe_number(_avg_valid(cpu_vals)),
+        "avg_gpu_pct": _json_safe_number(_avg_valid(gpu_vals)),
+        "avg_cpu_temp_c": _json_safe_number(_avg_valid(cpu_temp_vals)),
+        "avg_gpu_temp_c": _json_safe_number(_avg_valid(gpu_temp_vals)),
         "max_ram_pct": _json_safe_number(_max_valid(ram_vals)),
         "max_cpu_pct": _json_safe_number(_max_valid(cpu_vals)),
         "max_gpu_pct": _json_safe_number(_max_valid(gpu_vals)),
@@ -1787,6 +1828,7 @@ def main() -> int:
         help="Base directory for profiling outputs. A unique per-run subdirectory is created (timestamp + model).",
     )
     ap.add_argument("--profile-duration-s", type=float, default=0.0, help="0 => full run, else stop after N seconds.")
+    ap.add_argument("--benchmark", type=int, default=0, help="Loop inference on the same video for benchmark duration (0/1). Requires CUDA.")
     ap.add_argument("--hw-sample-hz", type=float, default=1.0, help="Hardware metrics sample rate (Hz).")
     ap.add_argument("--no-display", type=int, default=0, help="Run headless: skip imshow/waitKey (0/1).")
     args = ap.parse_args()
@@ -1827,19 +1869,35 @@ def main() -> int:
         if save_path.suffix == "":
             save_path = save_path.with_suffix(".mp4")
 
-    profile_enabled = bool(int(args.profile))
+    benchmark_enabled = bool(int(args.benchmark))
+    profile_enabled = bool(int(args.profile)) or benchmark_enabled
     no_display = bool(int(args.no_display))
-    profile_duration_s = max(0.0, float(args.profile_duration_s))
+    if benchmark_enabled:
+        try:
+            profile_duration_s = get_benchmark_duration_s(default_s=600.0)
+        except ValueError as e:
+            print(f"[benchmark][ERROR] {e}", file=sys.stderr)
+            return 2
+    else:
+        profile_duration_s = max(0.0, float(args.profile_duration_s))
     hw_sample_hz = max(0.1, float(args.hw_sample_hz))
     profile_out_dir: Optional[Path] = None
 
     device = pick_device(args.device)
+    try:
+        assert_benchmark_device_ok(benchmark=benchmark_enabled, device=device)
+    except ValueError as e:
+        print(f"[benchmark][ERROR] {e}", file=sys.stderr)
+        return 2
     use_half = bool(int(args.half)) and device.startswith("cuda")
     sync_cuda_timing = bool(device.startswith("cuda") and torch.cuda.is_available())
     print(
         f"[runtime] device={device} "
         f"(requested={args.device if args.device else 'auto'}, cuda_available={torch.cuda.is_available()}, half={int(use_half)})"
     )
+    if benchmark_enabled:
+        duration_src = "BENCHMARK_DURATION_S" if os.getenv("BENCHMARK_DURATION_S") else "default"
+        print(f"[benchmark] enabled: duration_s={float(profile_duration_s):.3f} (source={duration_src}), profile=1")
     if int(args.max_people) <= 1:
         print("[track][WARN] --max-people=1 limits disambiguation when multiple people are present.")
 
@@ -1981,6 +2039,7 @@ def main() -> int:
     metrics_cutoff_frame_idx: Optional[int] = None
     last_hw_print_t = 0.0
     hw_print_interval_s = max(0.5, 1.0 / max(hw_sample_hz, 1e-3))
+    benchmark_loop_count = 0
 
     try:
         if profile_enabled and profile_out_dir is not None:
@@ -2041,17 +2100,56 @@ def main() -> int:
                 return False
             return (time.perf_counter() - profile_run_t0) >= profile_duration_s
 
+        def reset_tracking_state_for_new_video_loop() -> None:
+            nonlocal last_xy, last_cf
+            nonlocal track_prev_center, track_target_center, track_max_jump_px, track_lost_count
+            last_xy = np.zeros((K, 2), dtype=np.float32)
+            last_cf = np.zeros((K,), dtype=np.float32)
+            track_prev_center = None
+            track_target_center = None
+            track_max_jump_px = None
+            track_lost_count = 0
+
+        def rewind_or_reopen_capture_for_benchmark(force_reopen: bool = False) -> bool:
+            nonlocal cap, benchmark_loop_count
+
+            used_seek = False
+            if not force_reopen:
+                used_seek = bool(cap.set(cv2.CAP_PROP_POS_FRAMES, 0))
+            if not used_seek:
+                cap.release()
+                cap = cv2.VideoCapture(str(video_path))
+                if not cap.isOpened():
+                    return False
+
+            benchmark_loop_count += 1
+            reset_tracking_state_for_new_video_loop()
+            method = "seek" if used_seek else "reopen"
+            print(f"[benchmark] restarted video loop #{int(benchmark_loop_count)} via {method}")
+            return True
+
         def process_next_frame() -> bool:
             nonlocal processed_total, sampled_total, cap_done, last_xy, last_cf
             nonlocal track_prev_center, track_target_center, track_max_jump_px, track_lost_count
 
-            cap_read_ms = 0.0
-            if profile_enabled:
-                t_cap0 = time.perf_counter()
-            ok, frame = cap.read()
-            if profile_enabled:
-                cap_read_ms = (time.perf_counter() - t_cap0) * 1000.0
-            if not ok:
+            eof_recovery_attempts = 0
+            while True:
+                cap_read_ms = 0.0
+                if profile_enabled:
+                    t_cap0 = time.perf_counter()
+                ok, frame = cap.read()
+                if profile_enabled:
+                    cap_read_ms = (time.perf_counter() - t_cap0) * 1000.0
+                if ok:
+                    break
+
+                if benchmark_enabled and not stop_due_profile_duration() and eof_recovery_attempts < 2:
+                    force_reopen = eof_recovery_attempts > 0
+                    if rewind_or_reopen_capture_for_benchmark(force_reopen=force_reopen):
+                        eof_recovery_attempts += 1
+                        continue
+                    print("[benchmark][WARN] Could not rewind/reopen video stream; stopping benchmark.")
+
                 cap_done = True
                 return False
 

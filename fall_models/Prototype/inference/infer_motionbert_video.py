@@ -26,12 +26,21 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
+import json
+import os
+import platform
 import pickle
+import re
+import shutil
+import subprocess
 import sys
+import threading
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -124,6 +133,802 @@ def pick_device(device: Optional[str]) -> str:
     if d.startswith("cuda") and not torch.cuda.is_available():
         return "cpu"
     return device
+
+
+def _safe_float(v: Any, default: float = float("nan")) -> float:
+    try:
+        out = float(v)
+    except (TypeError, ValueError):
+        return float(default)
+    return out
+
+
+def _parse_first_number(v: Any) -> float:
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        m = re.search(r"[+-]?\d+(?:\.\d+)?", v)
+        if m:
+            return _safe_float(m.group(0))
+    return float("nan")
+
+
+def _is_finite(v: Any) -> bool:
+    try:
+        return bool(np.isfinite(float(v)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _avg_valid(vals: List[float]) -> float:
+    good = [float(x) for x in vals if _is_finite(x)]
+    if not good:
+        return float("nan")
+    return float(np.mean(good))
+
+
+def _max_valid(vals: List[float]) -> float:
+    good = [float(x) for x in vals if _is_finite(x)]
+    if not good:
+        return float("nan")
+    return float(np.max(good))
+
+
+def _median_valid(vals: List[float]) -> float:
+    good = [float(x) for x in vals if _is_finite(x)]
+    if not good:
+        return float("nan")
+    return float(np.median(good))
+
+
+def _p95_valid(vals: List[float]) -> float:
+    good = [float(x) for x in vals if _is_finite(x)]
+    if not good:
+        return float("nan")
+    return float(np.percentile(good, 95))
+
+
+def _to_csv_cell(v: Any) -> Any:
+    if v is None:
+        return ""
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        return float(v) if np.isfinite(v) else ""
+    return v
+
+
+def _json_safe_number(v: Any) -> Optional[float]:
+    fv = _safe_float(v)
+    if np.isfinite(fv):
+        return float(fv)
+    return None
+
+
+def _fmt_live_metric(v: Any, unit: str = "", digits: int = 1) -> str:
+    fv = _safe_float(v)
+    if np.isfinite(fv):
+        return f"{fv:.{digits}f}{unit}"
+    return "NA"
+
+
+def _write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            out = {k: _to_csv_cell(row.get(k, "")) for k in fieldnames}
+            writer.writerow(out)
+
+
+def _slugify_name(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name).strip())
+    s = re.sub(r"-{2,}", "-", s).strip("-._")
+    return s or "model"
+
+
+def _pick_profile_out_dir(
+    profile_out_arg: Optional[str],
+    save_path: Optional[Path],
+    ckpt_path: Path,
+    run_tag: str = "motionbert",
+) -> Path:
+    base_root = Path(profile_out_arg).expanduser() if profile_out_arg else (save_path.parent if save_path is not None else Path("runs") / "profiling")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    model_tag = _slugify_name(Path(ckpt_path).stem)
+    tag = _slugify_name(str(run_tag))
+    run_name = f"{stamp}_{tag}_{model_tag}"
+    out_dir = base_root / run_name
+
+    # Keep unique even under very fast relaunches.
+    suffix = 1
+    while out_dir.exists():
+        out_dir = base_root / f"{run_name}_{suffix:02d}"
+        suffix += 1
+    return out_dir
+
+
+def assert_benchmark_device_ok(benchmark: bool, device: str) -> None:
+    """
+    Runtime guard for benchmark mode.
+    Kept as a standalone helper so it is easy to test on CPU-only machines.
+    """
+    if not bool(benchmark):
+        return
+    device_str = str(device).strip()
+    if not device_str.lower().startswith("cuda"):
+        raise ValueError(
+            f"--benchmark requires CUDA, but resolved runtime device is '{device_str}'. "
+            "Use --device cuda on a CUDA-capable machine, or disable --benchmark."
+        )
+
+
+def get_benchmark_duration_s(default_s: float = 600.0) -> float:
+    """
+    Internal dev override for quick smoke benchmarks without changing CLI:
+      BENCHMARK_DURATION_S=<seconds>
+    """
+    raw = os.getenv("BENCHMARK_DURATION_S")
+    if raw is None or str(raw).strip() == "":
+        return float(default_s)
+    try:
+        out = float(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid BENCHMARK_DURATION_S='{raw}'. Expected a positive number of seconds.") from e
+    if not np.isfinite(out) or out <= 0.0:
+        raise ValueError(f"BENCHMARK_DURATION_S must be a finite number > 0, got '{raw}'.")
+    return float(out)
+
+
+def _parse_tegrastats_line(line: str) -> Dict[str, float]:
+    sample = {
+        "ram_used_pct": float("nan"),
+        "cpu_pct": float("nan"),
+        "gpu_pct": float("nan"),
+        "cpu_temp_c": float("nan"),
+        "gpu_temp_c": float("nan"),
+        "power_w": float("nan"),
+    }
+
+    m_ram = re.search(r"\bRAM\s+(\d+)/(\d+)MB\b", line, flags=re.IGNORECASE)
+    if m_ram:
+        used = _safe_float(m_ram.group(1))
+        total = _safe_float(m_ram.group(2))
+        if total > 0:
+            sample["ram_used_pct"] = 100.0 * used / total
+
+    m_cpu = re.search(r"\bCPU\s+\[([^\]]+)\]", line, flags=re.IGNORECASE)
+    if m_cpu:
+        loads: List[float] = []
+        for tok in m_cpu.group(1).split(","):
+            m_pct = re.search(r"([+-]?\d+(?:\.\d+)?)%", tok)
+            if m_pct:
+                loads.append(_safe_float(m_pct.group(1)))
+        sample["cpu_pct"] = _avg_valid(loads)
+
+    m_gpu = re.search(r"\bGR3D(?:_FREQ)?[:=]?\s*([+-]?\d+(?:\.\d+)?)%", line, flags=re.IGNORECASE)
+    if m_gpu:
+        sample["gpu_pct"] = _safe_float(m_gpu.group(1))
+
+    m_cpu_t = re.search(r"\bCPU@([+-]?\d+(?:\.\d+)?)C\b", line, flags=re.IGNORECASE)
+    if m_cpu_t:
+        sample["cpu_temp_c"] = _safe_float(m_cpu_t.group(1))
+
+    m_gpu_t = re.search(r"\bGPU@([+-]?\d+(?:\.\d+)?)C\b", line, flags=re.IGNORECASE)
+    if m_gpu_t:
+        sample["gpu_temp_c"] = _safe_float(m_gpu_t.group(1))
+
+    power_patterns = [
+        r"\bPOM_5V_IN\s+([+-]?\d+(?:\.\d+)?)(m?W)?(?:/([+-]?\d+(?:\.\d+)?)(m?W)?)?",
+        r"\bVDD_IN\s+([+-]?\d+(?:\.\d+)?)(m?W)?(?:/([+-]?\d+(?:\.\d+)?)(m?W)?)?",
+        r"\bPWR\s+([+-]?\d+(?:\.\d+)?)(m?W)?(?:/([+-]?\d+(?:\.\d+)?)(m?W)?)?",
+    ]
+    for pat in power_patterns:
+        m = re.search(pat, line, flags=re.IGNORECASE)
+        if not m:
+            continue
+        now_val = _safe_float(m.group(1))
+        now_unit = (m.group(2) or "").lower()
+        if now_unit == "mw":
+            now_val /= 1000.0
+        sample["power_w"] = now_val
+        break
+
+    return sample
+
+
+def _extract_numeric_from_obj(v: Any) -> float:
+    if isinstance(v, (int, float, np.number)):
+        return _safe_float(v)
+    if isinstance(v, str):
+        return _parse_first_number(v)
+    return float("nan")
+
+
+def _collect_keyed_numeric(obj: Any, prefix: str = "") -> List[Tuple[str, float]]:
+    out: List[Tuple[str, float]] = []
+
+    def _rec(cur: Any, path: List[str]) -> None:
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                key = str(k).lower()
+                next_path = path + [key]
+                if isinstance(v, (dict, list, tuple)):
+                    _rec(v, next_path)
+                else:
+                    out.append(("_".join(next_path), _extract_numeric_from_obj(v)))
+        elif hasattr(cur, "__dict__"):
+            _rec(vars(cur), path)
+        elif isinstance(cur, (list, tuple)):
+            for i, v in enumerate(cur):
+                next_path = path + [str(i)]
+                if isinstance(v, (dict, list, tuple)):
+                    _rec(v, next_path)
+                else:
+                    out.append(("_".join(next_path), _extract_numeric_from_obj(v)))
+
+    start = [str(prefix).lower()] if prefix else []
+    _rec(obj, start)
+    return out
+
+
+def _pick_pct_from_keyed(values: List[Tuple[str, float]], tokens_any: Tuple[str, ...]) -> float:
+    cand: List[float] = []
+    for key, val in values:
+        if not np.isfinite(val):
+            continue
+        key_l = str(key).lower()
+        if any(tok in key_l for tok in tokens_any) and 0.0 <= float(val) <= 100.0:
+            cand.append(float(val))
+    return _avg_valid(cand)
+
+
+class HardwareSampler:
+    def __init__(self, sample_hz: float) -> None:
+        self.sample_hz = max(1e-3, float(sample_hz))
+        self.interval_s = 1.0 / self.sample_hz
+        self.backend = "none"
+        self.samples: List[Dict[str, Any]] = []
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start_t = 0.0
+
+        self._jtop_obj = None
+        self._tegrastats_proc: Optional[subprocess.Popen[str]] = None
+        self._psutil_mod = None
+
+    def start(self) -> str:
+        self._start_t = time.perf_counter()
+        self._stop_event.clear()
+
+        # Preferred backend: jtop (jetson-stats)
+        try:
+            from jtop import jtop  # type: ignore
+            from jtop.core import hardware as jtop_hardware  # type: ignore
+
+            # Some old jetson-stats builds call platform.linux_distribution(), removed in Python 3.8+.
+            try:
+                src = inspect.getsource(jtop_hardware.get_platform_variables)  # type: ignore[name-defined]
+                if ("linux_distribution" in src) and (not hasattr(platform, "linux_distribution")):
+                    raise RuntimeError(
+                        "Installed jetson-stats/jtop is incompatible with this Python version; falling back."
+                    )
+            except OSError:
+                # Source may be unavailable in some installations; continue and try runtime start.
+                pass
+
+            self._jtop_obj = jtop()
+            self._jtop_obj.start()
+            self.backend = "jtop"
+            self._thread = threading.Thread(target=self._run_jtop, name="hw-jtop", daemon=True)
+            self._thread.start()
+            return self.backend
+        except Exception as e:
+            self._jtop_obj = None
+            print(f"[profile][WARN] jtop unavailable/incompatible: {e}")
+
+        # Fallback backend: tegrastats
+        if shutil.which("tegrastats") is not None:
+            try:
+                interval_ms = max(100, int(round(self.interval_s * 1000.0)))
+                self._tegrastats_proc = subprocess.Popen(
+                    ["tegrastats", "--interval", str(interval_ms)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+                self.backend = "tegrastats"
+                self._thread = threading.Thread(target=self._run_tegrastats, name="hw-tegrastats", daemon=True)
+                self._thread.start()
+                return self.backend
+            except Exception:
+                self._tegrastats_proc = None
+
+        # Final fallback: psutil (RAM+CPU, best-effort temperatures).
+        try:
+            import psutil  # type: ignore
+
+            self._psutil_mod = psutil
+            self._psutil_mod.cpu_percent(interval=None)
+            self.backend = "psutil"
+            self._thread = threading.Thread(target=self._run_psutil, name="hw-psutil", daemon=True)
+            self._thread.start()
+            return self.backend
+        except Exception:
+            self._psutil_mod = None
+            self.backend = "none"
+            return self.backend
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+        if self._tegrastats_proc is not None:
+            try:
+                self._tegrastats_proc.terminate()
+            except Exception:
+                pass
+
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+        if self._tegrastats_proc is not None:
+            try:
+                if self._tegrastats_proc.poll() is None:
+                    self._tegrastats_proc.kill()
+            except Exception:
+                pass
+            self._tegrastats_proc = None
+
+        if self._jtop_obj is not None:
+            try:
+                self._jtop_obj.close()
+            except Exception:
+                pass
+            self._jtop_obj = None
+
+    def get_samples(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(x) for x in self.samples]
+
+    def get_latest_sample(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if not self.samples:
+                return None
+            return dict(self.samples[-1])
+
+    def _append_sample(self, sample: Dict[str, Any]) -> None:
+        ram_pct = _safe_float(sample.get("ram_used_pct", float("nan")))
+        cpu_pct = _safe_float(sample.get("cpu_pct", float("nan")))
+        gpu_pct = _safe_float(sample.get("gpu_pct", float("nan")))
+        cpu_temp = _safe_float(sample.get("cpu_temp_c", float("nan")))
+        gpu_temp = _safe_float(sample.get("gpu_temp_c", float("nan")))
+        power_w = _safe_float(sample.get("power_w", float("nan")))
+
+        if not (0.0 <= ram_pct <= 100.0):
+            ram_pct = float("nan")
+        if not (0.0 <= cpu_pct <= 100.0):
+            cpu_pct = float("nan")
+        if not (0.0 <= gpu_pct <= 100.0):
+            gpu_pct = float("nan")
+        if not (-20.0 <= cpu_temp <= 150.0):
+            cpu_temp = float("nan")
+        if not (-20.0 <= gpu_temp <= 150.0):
+            gpu_temp = float("nan")
+        if not (0.0 <= power_w <= 200.0):
+            power_w = float("nan")
+
+        row = {
+            "t_s": float(time.perf_counter() - self._start_t),
+            "ram_used_pct": ram_pct,
+            "cpu_pct": cpu_pct,
+            "gpu_pct": gpu_pct,
+            "cpu_temp_c": cpu_temp,
+            "gpu_temp_c": gpu_temp,
+            "power_w": power_w,
+            "backend": self.backend,
+        }
+        with self._lock:
+            self.samples.append(row)
+
+    def _run_jtop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                if self._jtop_obj is None:
+                    break
+                if hasattr(self._jtop_obj, "ok") and not self._jtop_obj.ok():
+                    break
+                stats = dict(getattr(self._jtop_obj, "stats", {}))
+                gpu_obj = getattr(self._jtop_obj, "gpu", None)
+                temp_obj = getattr(self._jtop_obj, "temperature", None)
+                power_obj = getattr(self._jtop_obj, "power", None)
+                memory_obj = getattr(self._jtop_obj, "memory", None)
+                cpu_obj = getattr(self._jtop_obj, "cpu", None)
+            except Exception:
+                stats = {}
+                gpu_obj = None
+                temp_obj = None
+                power_obj = None
+                memory_obj = None
+                cpu_obj = None
+
+            sample = self._sample_from_jtop_stats(
+                stats=stats,
+                gpu_obj=gpu_obj,
+                temp_obj=temp_obj,
+                power_obj=power_obj,
+                memory_obj=memory_obj,
+                cpu_obj=cpu_obj,
+            )
+            self._append_sample(sample)
+
+            if self._stop_event.wait(self.interval_s):
+                break
+
+    def _run_tegrastats(self) -> None:
+        proc = self._tegrastats_proc
+        if proc is None or proc.stdout is None:
+            return
+        while not self._stop_event.is_set():
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.01)
+                continue
+            sample = _parse_tegrastats_line(line)
+            self._append_sample(sample)
+
+    def _run_psutil(self) -> None:
+        psutil = self._psutil_mod
+        if psutil is None:
+            return
+        while not self._stop_event.is_set():
+            ram_pct = float("nan")
+            cpu_pct = float("nan")
+            cpu_temp = float("nan")
+
+            try:
+                ram_pct = float(psutil.virtual_memory().percent)
+            except Exception:
+                pass
+            try:
+                cpu_pct = float(psutil.cpu_percent(interval=None))
+            except Exception:
+                pass
+            try:
+                temps = psutil.sensors_temperatures(fahrenheit=False)
+                cpu_candidates: List[float] = []
+                for name, entries in (temps or {}).items():
+                    name_l = str(name).lower()
+                    for ent in entries:
+                        cur = _safe_float(getattr(ent, "current", float("nan")))
+                        lbl = str(getattr(ent, "label", "")).lower()
+                        if not np.isfinite(cur):
+                            continue
+                        if any(tok in name_l for tok in ("cpu", "core", "package", "soc")) or any(
+                            tok in lbl for tok in ("cpu", "core", "package", "soc")
+                        ):
+                            cpu_candidates.append(cur)
+                cpu_temp = _avg_valid(cpu_candidates)
+            except Exception:
+                pass
+
+            self._append_sample(
+                {
+                    "ram_used_pct": ram_pct,
+                    "cpu_pct": cpu_pct,
+                    "gpu_pct": float("nan"),
+                    "cpu_temp_c": cpu_temp,
+                    "gpu_temp_c": float("nan"),
+                    "power_w": float("nan"),
+                }
+            )
+
+            if self._stop_event.wait(self.interval_s):
+                break
+
+    def _sample_from_jtop_stats(
+        self,
+        *,
+        stats: Dict[str, Any],
+        gpu_obj: Any,
+        temp_obj: Any,
+        power_obj: Any,
+        memory_obj: Any,
+        cpu_obj: Any,
+    ) -> Dict[str, float]:
+        keyed = _collect_keyed_numeric(stats, prefix="stats")
+
+        ram_pct = _pick_pct_from_keyed(keyed, ("ram", "mem"))
+        cpu_pct = _pick_pct_from_keyed(keyed, ("cpu", "core"))
+        gpu_pct = _pick_pct_from_keyed(keyed, ("gpu", "gr3d"))
+
+        cpu_temp = float("nan")
+        gpu_temp = float("nan")
+        power_w = float("nan")
+
+        for key, val in keyed:
+            key_l = key.lower()
+            if np.isfinite(val):
+                if ("temp" in key_l or key_l.endswith("_c")) and ("cpu" in key_l or "soc" in key_l):
+                    cpu_temp = val if not np.isfinite(cpu_temp) else _avg_valid([cpu_temp, val])
+                if ("temp" in key_l or key_l.endswith("_c")) and ("gpu" in key_l or "gr3d" in key_l):
+                    gpu_temp = val if not np.isfinite(gpu_temp) else _avg_valid([gpu_temp, val])
+                if "power" in key_l and ("in" in key_l or "tot" in key_l or "sum" in key_l):
+                    power_w = val if not np.isfinite(power_w) else _avg_valid([power_w, val])
+
+        if np.isfinite(power_w) and power_w > 1000.0:
+            power_w /= 1000.0
+
+        # Fall back to object trees when stats doesn't expose enough.
+        if memory_obj is not None:
+            mem_keyed = _collect_keyed_numeric(memory_obj, prefix="memory")
+            mem_pct = _pick_pct_from_keyed(mem_keyed, ("ram", "used", "percent", "util"))
+            if np.isfinite(mem_pct):
+                ram_pct = mem_pct
+        if cpu_obj is not None:
+            cpu_keyed = _collect_keyed_numeric(cpu_obj, prefix="cpu")
+            cpu_pct2 = _pick_pct_from_keyed(cpu_keyed, ("util", "load", "percent"))
+            if np.isfinite(cpu_pct2):
+                cpu_pct = cpu_pct2
+        if gpu_obj is not None:
+            gpu_keyed = _collect_keyed_numeric(gpu_obj, prefix="gpu")
+            gpu_pct2 = _pick_pct_from_keyed(gpu_keyed, ("util", "load", "percent"))
+            if np.isfinite(gpu_pct2):
+                gpu_pct = gpu_pct2
+        if temp_obj is not None:
+            temp_keyed = _collect_keyed_numeric(temp_obj, prefix="temp")
+            cpu_t = _pick_pct_from_keyed(temp_keyed, ("cpu", "soc", "temp"))
+            gpu_t = _pick_pct_from_keyed(temp_keyed, ("gpu", "gr3d", "temp"))
+            if np.isfinite(cpu_t):
+                cpu_temp = cpu_t
+            if np.isfinite(gpu_t):
+                gpu_temp = gpu_t
+        if power_obj is not None:
+            pwr_keyed = _collect_keyed_numeric(power_obj, prefix="power")
+            pwr_vals = [v for k, v in pwr_keyed if np.isfinite(v) and any(tok in k for tok in ("tot", "in", "sum", "pwr", "watt"))]
+            if pwr_vals:
+                power_w = _avg_valid(pwr_vals)
+                if np.isfinite(power_w) and power_w > 1000.0:
+                    power_w /= 1000.0
+
+        return {
+            "ram_used_pct": ram_pct,
+            "cpu_pct": cpu_pct,
+            "gpu_pct": gpu_pct,
+            "cpu_temp_c": cpu_temp,
+            "gpu_temp_c": gpu_temp,
+            "power_w": power_w,
+        }
+
+
+def _save_time_plots(
+    profile_out: Path,
+    time_rows: List[Dict[str, Any]],
+) -> None:
+    import matplotlib.pyplot as plt
+
+    frame_idx = np.asarray([_safe_float(r.get("frame_idx", np.nan)) for r in time_rows], dtype=np.float64)
+    fps = np.asarray([_safe_float(r.get("fps", np.nan)) for r in time_rows], dtype=np.float64)
+    prep = np.asarray([_safe_float(r.get("preprocess_ms", np.nan)) for r in time_rows], dtype=np.float64)
+    infer = np.asarray([_safe_float(r.get("inference_ms", np.nan)) for r in time_rows], dtype=np.float64)
+    post = np.asarray([_safe_float(r.get("postprocess_ms", np.nan)) for r in time_rows], dtype=np.float64)
+    vis = np.asarray([_safe_float(r.get("visualisation_ms", np.nan)) for r in time_rows], dtype=np.float64)
+
+    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+    if frame_idx.size > 0:
+        ax0.plot(frame_idx, fps, color="tab:blue", linewidth=1.3, label="Total FPS")
+        ax0.set_ylabel("FPS")
+        ax0.legend(loc="upper right")
+        ax0.grid(True, linestyle="--", alpha=0.35)
+        fps_top = max(1.0, float(np.nanpercentile(fps, 99)) * 1.2) if np.isfinite(fps).any() else 1.0
+        ax0.set_ylim(0.0, fps_top)
+
+        ax1.plot(frame_idx, prep, label="Preprocess", linewidth=1.0)
+        ax1.plot(frame_idx, infer, label="Inference", linewidth=1.0)
+        ax1.plot(frame_idx, post, label="Postprocess", linewidth=1.0)
+        ax1.plot(frame_idx, vis, label="Visualisation", linewidth=1.0)
+        ax1.set_xlabel("Displayed Frame Index")
+        ax1.set_ylabel("Time (ms)")
+        ax1.legend(loc="upper right")
+        ax1.grid(True, linestyle="--", alpha=0.35)
+    else:
+        ax0.text(0.5, 0.5, "No timing data", ha="center", va="center", transform=ax0.transAxes)
+        ax1.text(0.5, 0.5, "No timing data", ha="center", va="center", transform=ax1.transAxes)
+        ax0.set_ylabel("FPS")
+        ax1.set_xlabel("Displayed Frame Index")
+        ax1.set_ylabel("Time (ms)")
+
+    fig.tight_layout()
+    fig.savefig(profile_out / "fig_time_efficiency.png", dpi=180)
+    plt.close(fig)
+
+
+def _save_hw_plots(
+    profile_out: Path,
+    hw_rows: List[Dict[str, Any]],
+) -> None:
+    import matplotlib.pyplot as plt
+
+    t_s = np.asarray([_safe_float(r.get("t_s", np.nan)) for r in hw_rows], dtype=np.float64)
+    ram = np.asarray([_safe_float(r.get("ram_used_pct", np.nan)) for r in hw_rows], dtype=np.float64)
+    cpu = np.asarray([_safe_float(r.get("cpu_pct", np.nan)) for r in hw_rows], dtype=np.float64)
+    gpu = np.asarray([_safe_float(r.get("gpu_pct", np.nan)) for r in hw_rows], dtype=np.float64)
+    cpu_t = np.asarray([_safe_float(r.get("cpu_temp_c", np.nan)) for r in hw_rows], dtype=np.float64)
+    gpu_t = np.asarray([_safe_float(r.get("gpu_temp_c", np.nan)) for r in hw_rows], dtype=np.float64)
+    pwr = np.asarray([_safe_float(r.get("power_w", np.nan)) for r in hw_rows], dtype=np.float64)
+
+    fig1, (ax0, ax1) = plt.subplots(1, 2, figsize=(14, 5))
+    if t_s.size > 0:
+        ax0.plot(t_s, ram, label="RAM", linewidth=1.2)
+        ax0.plot(t_s, cpu, label="CPU", linewidth=1.2)
+        ax0.plot(t_s, gpu, label="GPU", linewidth=1.2)
+        ax0.set_xlabel("Time (s)")
+        ax0.set_ylabel("Utilisation (%)")
+        ax0.set_ylim(0.0, 100.0)
+        ax0.legend(loc="best")
+
+        ax1.plot(t_s, ram, label="RAM", linewidth=1.2)
+        ax1.plot(t_s, cpu, label="CPU", linewidth=1.2)
+        ax1.plot(t_s, gpu, label="GPU", linewidth=1.2)
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Utilisation (%)")
+        ax1.set_ylim(0.0, 100.0)
+        ax1.legend(loc="best")
+        if np.isfinite(t_s).any():
+            x0 = float(np.nanmax(t_s))
+            x1 = max(1.0, x0 * 0.05)
+            ax1.set_xlim(max(0.0, x0 - x1), x0)
+    else:
+        ax0.text(0.5, 0.5, "No hardware data", ha="center", va="center", transform=ax0.transAxes)
+        ax1.text(0.5, 0.5, "No hardware data", ha="center", va="center", transform=ax1.transAxes)
+        ax0.set_xlabel("Time (s)")
+        ax0.set_ylabel("Utilisation (%)")
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Utilisation (%)")
+    fig1.tight_layout()
+    fig1.savefig(profile_out / "fig_hw_usage.png", dpi=180)
+    plt.close(fig1)
+
+    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
+    bx0, bx1 = axes2
+    if t_s.size > 0:
+        bx0.plot(t_s, cpu_t, label="CPU temp", linewidth=1.2)
+        bx0.plot(t_s, gpu_t, label="GPU temp", linewidth=1.2)
+        bx0.set_xlabel("Time (s)")
+        bx0.set_ylabel("Temperature (C)")
+        bx0.legend(loc="best")
+
+        bx1.plot(t_s, pwr, label="Power draw", color="tab:red", linewidth=1.2)
+        bx1.set_xlabel("Time (s)")
+        bx1.set_ylabel("Power draw (W)")
+        bx1.legend(loc="best")
+    else:
+        bx0.text(0.5, 0.5, "No hardware data", ha="center", va="center", transform=bx0.transAxes)
+        bx1.text(0.5, 0.5, "No hardware data", ha="center", va="center", transform=bx1.transAxes)
+        bx0.set_xlabel("Time (s)")
+        bx0.set_ylabel("Temperature (C)")
+        bx1.set_xlabel("Time (s)")
+        bx1.set_ylabel("Power draw (W)")
+    fig2.tight_layout()
+    fig2.savefig(profile_out / "fig_temp_power.png", dpi=180)
+    plt.close(fig2)
+
+
+def _save_profile_artifacts(
+    profile_out: Path,
+    time_rows: List[Dict[str, Any]],
+    hw_rows: List[Dict[str, Any]],
+    extra_summary: Optional[Dict[str, Any]] = None,
+) -> None:
+    profile_out.mkdir(parents=True, exist_ok=True)
+
+    time_fields = [
+        "frame_idx",
+        "t_s",
+        "fps",
+        "fps_ema",
+        "preprocess_ms",
+        "inference_ms",
+        "postprocess_ms",
+        "visualisation_ms",
+        "total_ms",
+        "cap_read_ms",
+        "yolo_infer_ms",
+        "window_feature_ms",
+        "temporal_infer_ms",
+        "label_select_ms",
+        "draw_ms",
+        "writer_ms",
+        "display_wait_ms",
+    ]
+    _write_csv(profile_out / "time_metrics.csv", time_rows, time_fields)
+
+    hw_fields = [
+        "t_s",
+        "ram_used_pct",
+        "cpu_pct",
+        "gpu_pct",
+        "cpu_temp_c",
+        "gpu_temp_c",
+        "power_w",
+    ]
+    _write_csv(profile_out / "hw_metrics.csv", hw_rows, hw_fields)
+
+    try:
+        _save_time_plots(profile_out=profile_out, time_rows=time_rows)
+    except Exception as e:
+        print(f"[WARN] Could not save fig_time_efficiency.png: {e}")
+
+    try:
+        _save_hw_plots(profile_out=profile_out, hw_rows=hw_rows)
+    except Exception as e:
+        print(f"[WARN] Could not save hardware figures: {e}")
+
+    fps_vals = [_safe_float(r.get("fps", np.nan)) for r in time_rows]
+    preprocess_vals = [_safe_float(r.get("preprocess_ms", np.nan)) for r in time_rows]
+    infer_vals = [_safe_float(r.get("inference_ms", np.nan)) for r in time_rows]
+    post_vals = [_safe_float(r.get("postprocess_ms", np.nan)) for r in time_rows]
+    vis_vals = [_safe_float(r.get("visualisation_ms", np.nan)) for r in time_rows]
+    t_vals = [_safe_float(r.get("t_s", np.nan)) for r in time_rows]
+
+    ram_vals = [_safe_float(r.get("ram_used_pct", np.nan)) for r in hw_rows]
+    cpu_vals = [_safe_float(r.get("cpu_pct", np.nan)) for r in hw_rows]
+    gpu_vals = [_safe_float(r.get("gpu_pct", np.nan)) for r in hw_rows]
+    cpu_temp_vals = [_safe_float(r.get("cpu_temp_c", np.nan)) for r in hw_rows]
+    gpu_temp_vals = [_safe_float(r.get("gpu_temp_c", np.nan)) for r in hw_rows]
+    power_vals = [_safe_float(r.get("power_w", np.nan)) for r in hw_rows]
+
+    duration_s = float("nan")
+    if t_vals:
+        finite_t = [x for x in t_vals if _is_finite(x)]
+        if finite_t:
+            duration_s = float(max(finite_t))
+
+    summary: Dict[str, Any] = {
+        "avg_fps": _json_safe_number(_avg_valid(fps_vals)),
+        "median_fps": _json_safe_number(_median_valid(fps_vals)),
+        "preprocess_ms": {
+            "mean": _json_safe_number(_avg_valid(preprocess_vals)),
+            "median": _json_safe_number(_median_valid(preprocess_vals)),
+            "p95": _json_safe_number(_p95_valid(preprocess_vals)),
+        },
+        "inference_ms": {
+            "mean": _json_safe_number(_avg_valid(infer_vals)),
+            "median": _json_safe_number(_median_valid(infer_vals)),
+            "p95": _json_safe_number(_p95_valid(infer_vals)),
+        },
+        "postprocess_ms": {
+            "mean": _json_safe_number(_avg_valid(post_vals)),
+            "median": _json_safe_number(_median_valid(post_vals)),
+            "p95": _json_safe_number(_p95_valid(post_vals)),
+        },
+        "visualisation_ms": {
+            "mean": _json_safe_number(_avg_valid(vis_vals)),
+            "median": _json_safe_number(_median_valid(vis_vals)),
+            "p95": _json_safe_number(_p95_valid(vis_vals)),
+        },
+        "avg_ram_pct": _json_safe_number(_avg_valid(ram_vals)),
+        "avg_cpu_pct": _json_safe_number(_avg_valid(cpu_vals)),
+        "avg_gpu_pct": _json_safe_number(_avg_valid(gpu_vals)),
+        "avg_cpu_temp_c": _json_safe_number(_avg_valid(cpu_temp_vals)),
+        "avg_gpu_temp_c": _json_safe_number(_avg_valid(gpu_temp_vals)),
+        "max_ram_pct": _json_safe_number(_max_valid(ram_vals)),
+        "max_cpu_pct": _json_safe_number(_max_valid(cpu_vals)),
+        "max_gpu_pct": _json_safe_number(_max_valid(gpu_vals)),
+        "avg_power_w": _json_safe_number(_avg_valid(power_vals)),
+        "total_frames_processed": int(len(time_rows)),
+        "duration_s": _json_safe_number(duration_s),
+    }
+    if extra_summary:
+        summary.update(dict(extra_summary))
+
+    with (profile_out / "summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
 
 
 def ceil_div_pos(a: int, b: int) -> int:
@@ -548,12 +1353,19 @@ def stream_infer_and_display(
     clip_len_raw: int,
     win_step_raw: int,
     save_path: Optional[Path],
+    profile_enabled: bool,
+    profile_out_dir: Optional[Path],
+    profile_duration_s: float,
+    hw_sample_hz: float,
+    benchmark_enabled: bool,
+    no_display: bool,
     args: argparse.Namespace,
 ) -> int:
     """
     One-pass streaming: read frames -> YOLO pose -> window inference -> imshow.
 
     Playback targets the source FPS (or --display-fps). If processing can't keep up, the display slows down.
+    In benchmark mode, EOF rewinds/reopens the same video until duration expires.
     """
 
     win_step = max(1, int(win_step))
@@ -561,6 +1373,11 @@ def stream_infer_and_display(
     missing_conf_thres = float(args.missing_conf_thres)
     drop_empty_windows = not bool(args.keep_empty_windows)
     pad_tail = bool(args.pad_tail)
+    profile_enabled = bool(profile_enabled)
+    benchmark_enabled = bool(benchmark_enabled)
+    no_display = bool(no_display)
+    profile_duration_s = max(0.0, float(profile_duration_s))
+    hw_sample_hz = max(0.1, float(hw_sample_hz))
 
     # Models
     pose_model = YOLO(str(yolo_path))
@@ -679,8 +1496,11 @@ def stream_infer_and_display(
     frame_period_s = 1.0 / float(fps_target)
 
     window_name = "MotionBERT Inference"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    print(f"[Display] Target FPS={fps_target:.2f} (source={src_fps:.2f}). Press 'q' or Esc to quit.", flush=True)
+    if not no_display:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        print(f"[Display] Target FPS={fps_target:.2f} (source={src_fps:.2f}). Press 'q' or Esc to quit.", flush=True)
+    else:
+        print(f"[Display] Headless mode enabled. Target FPS={fps_target:.2f} (source={src_fps:.2f}).", flush=True)
 
     video_writer: Optional[cv2.VideoWriter] = None
     out_w: Optional[int] = None
@@ -689,6 +1509,8 @@ def stream_infer_and_display(
     frames_buf: "deque[np.ndarray]" = deque()
     xy_buf: "deque[np.ndarray]" = deque()
     cf_buf: "deque[np.ndarray]" = deque()
+    prep_ms_buf: "deque[float]" = deque()
+    yolo_ms_buf: "deque[float]" = deque()
 
     all_xy: List[np.ndarray] = []
     all_cf: List[np.ndarray] = []
@@ -700,10 +1522,19 @@ def stream_infer_and_display(
     cap_done = False
 
     window_preds: dict[int, dict] = {}
+    window_stage_ms: dict[int, Tuple[float, float]] = {}
     skipped_windows: set[int] = set()
     next_win_start = 0
     last_xy = np.zeros((17, 2), dtype=np.float32)
     last_cf = np.zeros((17,), dtype=np.float32)
+    benchmark_loop_count = 0
+
+    time_rows: List[Dict[str, Any]] = []
+    hw_rows: List[Dict[str, Any]] = []
+    hw_sampler: Optional[HardwareSampler] = None
+    profile_run_t0 = time.perf_counter()
+    last_hw_print_t = 0.0
+    hw_print_interval_s = max(0.5, 1.0 / max(hw_sample_hz, 1e-3))
 
     def pose_on_frame(frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         results = pose_model.predict(
@@ -733,14 +1564,58 @@ def stream_infer_and_display(
 
         return kpts_xy, kpts_conf
 
+    def stop_due_profile_duration() -> bool:
+        if not profile_enabled:
+            return False
+        if profile_duration_s <= 0.0:
+            return False
+        return (time.perf_counter() - profile_run_t0) >= profile_duration_s
+
+    def reset_tracking_state_for_new_video_loop() -> None:
+        nonlocal last_xy, last_cf
+        last_xy = np.zeros((17, 2), dtype=np.float32)
+        last_cf = np.zeros((17,), dtype=np.float32)
+
+    def rewind_or_reopen_capture_for_benchmark(force_reopen: bool = False) -> bool:
+        nonlocal cap, benchmark_loop_count
+
+        used_seek = False
+        if not force_reopen:
+            used_seek = bool(cap.set(cv2.CAP_PROP_POS_FRAMES, 0))
+        if not used_seek:
+            cap.release()
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                return False
+
+        benchmark_loop_count += 1
+        reset_tracking_state_for_new_video_loop()
+        method = "seek" if used_seek else "reopen"
+        print(f"[benchmark] restarted video loop #{int(benchmark_loop_count)} via {method}")
+        return True
+
     def process_next_frame() -> bool:
         nonlocal processed_total, sampled_total, cap_done, img_shape, last_xy, last_cf
 
         if cap_done:
             return False
 
-        ok, frame = cap.read()
-        if not ok:
+        eof_recovery_attempts = 0
+        while True:
+            cap_read_ms = 0.0
+            if profile_enabled:
+                t_cap0 = time.perf_counter()
+            ok, frame = cap.read()
+            if profile_enabled:
+                cap_read_ms = (time.perf_counter() - t_cap0) * 1000.0
+            if ok:
+                break
+            if benchmark_enabled and (not stop_due_profile_duration()) and eof_recovery_attempts < 2:
+                force_reopen = eof_recovery_attempts > 0
+                if rewind_or_reopen_capture_for_benchmark(force_reopen=force_reopen):
+                    eof_recovery_attempts += 1
+                    continue
+                print("[benchmark][WARN] Could not rewind/reopen video stream; stopping benchmark.")
             cap_done = True
             return False
 
@@ -752,22 +1627,31 @@ def stream_infer_and_display(
         do_pose = (int(raw_idx) % int(frame_step)) == 0
 
         if do_pose:
+            yolo_infer_ms = 0.0
+            if profile_enabled:
+                t_yolo0 = time.perf_counter()
             xy, cf = pose_on_frame(frame)
+            if profile_enabled:
+                yolo_infer_ms = (time.perf_counter() - t_yolo0) * 1000.0
             all_xy.append(xy)
             all_cf.append(cf)
             sampled_total += 1
             last_xy = xy
             last_cf = cf
         else:
+            yolo_infer_ms = 0.0
             xy = last_xy
             cf = last_cf
 
         frames_buf.append(frame)
         xy_buf.append(xy)
         cf_buf.append(cf)
+        if profile_enabled:
+            prep_ms_buf.append(float(cap_read_ms))
+            yolo_ms_buf.append(float(yolo_infer_ms))
         processed_total += 1
 
-        if args.limit_frames is not None and processed_total >= int(args.limit_frames):
+        if (not benchmark_enabled) and args.limit_frames is not None and processed_total >= int(args.limit_frames):
             cap_done = True
 
         return True
@@ -847,8 +1731,16 @@ def stream_infer_and_display(
             return None
 
         frame_dir, ann = window
+        temporal_infer_ms = 0.0
+        if profile_enabled:
+            t_pred0 = time.perf_counter()
         pred = predict_one_window(ann=ann, frame_dir=frame_dir, **predict_kwargs)
+        if profile_enabled:
+            temporal_infer_ms = (time.perf_counter() - t_pred0) * 1000.0
         window_preds[int(start)] = pred
+        if profile_enabled:
+            # MotionBERT window building + model inference are bundled inside predict_one_window.
+            window_stage_ms[int(start)] = (0.0, float(temporal_infer_ms))
         write_pred_row(writer, pred)
         return pred
 
@@ -897,12 +1789,21 @@ def stream_infer_and_display(
         return None
 
     try:
+        if profile_enabled:
+            if profile_out_dir is None:
+                raise RuntimeError("Profile mode enabled but profile output directory is unset.")
+            profile_out_dir.mkdir(parents=True, exist_ok=True)
+            hw_sampler = HardwareSampler(sample_hz=hw_sample_hz)
+            hw_backend = hw_sampler.start()
+            print(f"[profile] enabled -> {profile_out_dir.as_posix()}")
+            print(f"[profile] hw backend: {hw_backend}")
+
         with out_csv.open("w", newline="", encoding="utf-8") as f_csv:
             writer = csv.writer(f_csv)
             write_header(writer)
 
-            # Warm up: read enough frames to make the FIRST window prediction (if possible), then start display.
-            while int(sampled_total) < int(clip_len) and not cap_done:
+            # Warm up: read enough frames to make the first window prediction.
+            while int(sampled_total) < int(clip_len) and not cap_done and not stop_due_profile_duration():
                 process_next_frame()
             if int(processed_total) <= 0:
                 raise RuntimeError("Video had 0 frames.")
@@ -920,28 +1821,56 @@ def stream_infer_and_display(
 
             fps_ema: Optional[float] = None
             ema_alpha = 0.1
-            t_prev = time.perf_counter()
             user_exit = False
 
             while True:
+                if stop_due_profile_duration():
+                    break
                 if not frames_buf and cap_done:
                     break
 
                 t_frame0 = time.perf_counter()
-
                 display_sample_idx = int(display_idx) // int(frame_step)
+
                 target_sampled = int(display_sample_idx) + int(clip_len) + 1
-                while (not cap_done) and int(sampled_total) < int(target_sampled):
+                while (not cap_done) and int(sampled_total) < int(target_sampled) and (not stop_due_profile_duration()):
                     process_next_frame()
 
                 compute_ready_windows(writer=writer)
 
+                if profile_enabled and hw_sampler is not None:
+                    now_t = time.perf_counter()
+                    if (now_t - last_hw_print_t) >= hw_print_interval_s:
+                        latest = hw_sampler.get_latest_sample()
+                        if latest is not None:
+                            print(
+                                "[hw] "
+                                f"t={_fmt_live_metric(latest.get('t_s', np.nan), 's')} "
+                                f"gpu={_fmt_live_metric(latest.get('gpu_pct', np.nan), '%')} "
+                                f"cpu={_fmt_live_metric(latest.get('cpu_pct', np.nan), '%')} "
+                                f"ram={_fmt_live_metric(latest.get('ram_used_pct', np.nan), '%')} "
+                                f"cpu_t={_fmt_live_metric(latest.get('cpu_temp_c', np.nan), 'C')} "
+                                f"gpu_t={_fmt_live_metric(latest.get('gpu_temp_c', np.nan), 'C')} "
+                                f"pwr={_fmt_live_metric(latest.get('power_w', np.nan), 'W')}"
+                            )
+                        else:
+                            print("[hw] waiting for first hardware sample...")
+                        last_hw_print_t = now_t
+
                 if not frames_buf:
                     continue
 
+                post_extra_ms = 0.0
+                if profile_enabled:
+                    t_post_extra0 = time.perf_counter()
+
                 win_start = (int(display_sample_idx) // int(win_step)) * int(win_step)
                 if win_start not in window_preds and win_start not in skipped_windows:
-                    while (not cap_done) and int(sampled_total) < int(win_start) + int(clip_len):
+                    while (
+                        (not cap_done)
+                        and int(sampled_total) < int(win_start) + int(clip_len)
+                        and (not stop_due_profile_duration())
+                    ):
                         process_next_frame()
                         compute_ready_windows(writer=writer)
                     compute_window_pred(int(win_start), writer=writer)
@@ -951,6 +1880,20 @@ def stream_infer_and_display(
                 frame = frames_buf[0].copy()
                 xy = xy_buf[0]
                 cf = cf_buf[0]
+
+                preprocess_ms = float(prep_ms_buf[0]) if profile_enabled and prep_ms_buf else 0.0
+                yolo_infer_ms = float(yolo_ms_buf[0]) if profile_enabled and yolo_ms_buf else 0.0
+                win_feature_ms, temporal_infer_ms = window_stage_ms.get(int(win_start), (0.0, 0.0))
+
+                if profile_enabled:
+                    post_extra_ms = (time.perf_counter() - t_post_extra0) * 1000.0
+
+                draw_ms = 0.0
+                writer_ms = 0.0
+                display_wait_ms = 0.0
+
+                t_vis0 = time.perf_counter()
+                t_draw0 = time.perf_counter()
                 frame = draw_pose(
                     frame,
                     xy,
@@ -983,37 +1926,75 @@ def stream_infer_and_display(
                 )
 
                 frame = draw_hud(frame, hud)
+                draw_ms = (time.perf_counter() - t_draw0) * 1000.0
 
                 if video_writer is not None and out_w is not None and out_h is not None:
+                    t_writer0 = time.perf_counter()
                     frame_h, frame_w = frame.shape[:2]
                     frame_to_write = frame
                     if frame_h != int(out_h) or frame_w != int(out_w):
                         frame_to_write = cv2.resize(frame, (int(out_w), int(out_h)), interpolation=cv2.INTER_LINEAR)
                     video_writer.write(frame_to_write)
+                    writer_ms = (time.perf_counter() - t_writer0) * 1000.0
 
-                cv2.imshow(window_name, frame)
+                key = -1
+                if not no_display:
+                    t_display0 = time.perf_counter()
+                    cv2.imshow(window_name, frame)
 
-                elapsed = float(time.perf_counter() - t_frame0)
-                wait_s = float(frame_period_s) - elapsed
-                wait_ms = max(1, int(round(1000.0 * wait_s))) if wait_s > 0.0 else 1
-                key = cv2.waitKey(int(wait_ms)) & 0xFF
-                if key in (ord("q"), 27):
-                    user_exit = True
-                    break
+                    elapsed = float(time.perf_counter() - t_frame0)
+                    wait_s = float(frame_period_s) - elapsed
+                    wait_ms = max(1, int(round(1000.0 * wait_s))) if wait_s > 0.0 else 1
+                    key = cv2.waitKey(int(wait_ms)) & 0xFF
+                    display_wait_ms = (time.perf_counter() - t_display0) * 1000.0
+
+                visualisation_ms = (time.perf_counter() - t_vis0) * 1000.0
+                total_ms = (time.perf_counter() - t_frame0) * 1000.0
+                inst_fps = 1000.0 / max(1e-6, total_ms)
+                fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+
+                if profile_enabled:
+                    inference_ms = float(yolo_infer_ms) + float(temporal_infer_ms)
+                    postprocess_ms = float(win_feature_ms) + float(post_extra_ms)
+                    time_rows.append(
+                        {
+                            "frame_idx": int(display_idx),
+                            "t_s": float(time.perf_counter() - profile_run_t0),
+                            "fps": float(inst_fps),
+                            "fps_ema": float(fps_ema),
+                            "preprocess_ms": float(preprocess_ms),
+                            "inference_ms": float(inference_ms),
+                            "postprocess_ms": float(postprocess_ms),
+                            "visualisation_ms": float(visualisation_ms),
+                            "total_ms": float(total_ms),
+                            "cap_read_ms": float(preprocess_ms),
+                            "yolo_infer_ms": float(yolo_infer_ms),
+                            "window_feature_ms": float(win_feature_ms),
+                            "temporal_infer_ms": float(temporal_infer_ms),
+                            "label_select_ms": float(post_extra_ms),
+                            "draw_ms": float(draw_ms),
+                            "writer_ms": float(writer_ms),
+                            "display_wait_ms": float(display_wait_ms),
+                        }
+                    )
+
+                should_quit = (key in (ord("q"), 27))
 
                 frames_buf.popleft()
                 xy_buf.popleft()
                 cf_buf.popleft()
+                if profile_enabled:
+                    if prep_ms_buf:
+                        prep_ms_buf.popleft()
+                    if yolo_ms_buf:
+                        yolo_ms_buf.popleft()
                 display_idx += 1
 
-                # Effective display FPS (includes processing + waitKey pacing).
-                t_now = time.perf_counter()
-                dt = max(1e-6, float(t_now - t_prev))
-                inst_fps = 1.0 / dt
-                fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
-                t_prev = t_now
+                if should_quit:
+                    user_exit = True
+                    break
 
-            if (not user_exit) and cap_done:
+            if (not user_exit) and cap_done and (not stop_due_profile_duration()):
                 while True:
                     before = int(next_win_start)
                     compute_ready_windows(writer=writer)
@@ -1023,7 +2004,26 @@ def stream_infer_and_display(
         cap.release()
         if video_writer is not None:
             video_writer.release()
-        cv2.destroyAllWindows()
+        if not no_display:
+            cv2.destroyAllWindows()
+        if hw_sampler is not None:
+            hw_sampler.stop()
+            hw_rows = hw_sampler.get_samples()
+        if profile_enabled and profile_out_dir is not None:
+            try:
+                _save_profile_artifacts(
+                    profile_out=profile_out_dir,
+                    time_rows=time_rows,
+                    hw_rows=hw_rows,
+                    extra_summary={
+                        "benchmark_enabled": bool(benchmark_enabled),
+                        "benchmark_duration_s": float(profile_duration_s) if benchmark_enabled else None,
+                        "benchmark_duration_source": "BENCHMARK_DURATION_S" if os.getenv("BENCHMARK_DURATION_S") else "default",
+                    },
+                )
+                print(f"[profile] wrote outputs to: {profile_out_dir.as_posix()}")
+            except Exception as e:
+                print(f"[WARN] Failed to save profiling outputs: {e}")
 
     if img_shape is None:
         raise RuntimeError("No frames read from video.")
@@ -1110,6 +2110,17 @@ def main() -> int:
     ap.add_argument("--display", action="store_true", help="Display video with pose + streaming window prediction (FPS HUD)")
     ap.add_argument("--display-conf-thres", type=float, default=0.2, help="Keypoint conf threshold for drawing")
     ap.add_argument("--display-fps", type=float, default=None, help="Playback FPS for display (default: video FPS)")
+    ap.add_argument("--profile", type=int, default=0, help="Enable profiling outputs (0/1).")
+    ap.add_argument(
+        "--profile-out",
+        type=str,
+        default=None,
+        help="Base directory for profiling outputs. A unique per-run subdirectory is created (timestamp + model).",
+    )
+    ap.add_argument("--profile-duration-s", type=float, default=0.0, help="0 => full run, else stop after N seconds.")
+    ap.add_argument("--benchmark", type=int, default=0, help="Loop inference on the same video for benchmark duration (0/1). Requires CUDA.")
+    ap.add_argument("--hw-sample-hz", type=float, default=1.0, help="Hardware metrics sample rate (Hz).")
+    ap.add_argument("--no-display", type=int, default=0, help="Run headless: skip imshow/waitKey (0/1).")
     ap.add_argument(
         "--save",
         type=str,
@@ -1119,7 +2130,32 @@ def main() -> int:
     ap.add_argument("--no-merge-fall", action="store_true", help="Disable merging the first five fall labels into one class")
     args = ap.parse_args()
 
+    benchmark_enabled = bool(int(args.benchmark))
+    profile_enabled = bool(int(args.profile)) or benchmark_enabled
+    no_display = bool(int(args.no_display))
+    if benchmark_enabled:
+        try:
+            profile_duration_s = get_benchmark_duration_s(default_s=600.0)
+        except ValueError as e:
+            print(f"[benchmark][ERROR] {e}", file=sys.stderr)
+            return 2
+    else:
+        profile_duration_s = max(0.0, float(args.profile_duration_s))
+    hw_sample_hz = max(0.1, float(args.hw_sample_hz))
+
     device = pick_device(args.device)
+    try:
+        assert_benchmark_device_ok(benchmark=benchmark_enabled, device=device)
+    except ValueError as e:
+        print(f"[benchmark][ERROR] {e}", file=sys.stderr)
+        return 2
+    print(
+        f"[runtime] device={device} "
+        f"(requested={args.device if args.device else 'auto'}, cuda_available={torch.cuda.is_available()})"
+    )
+    if benchmark_enabled:
+        duration_src = "BENCHMARK_DURATION_S" if os.getenv("BENCHMARK_DURATION_S") else "default"
+        print(f"[benchmark] enabled: duration_s={float(profile_duration_s):.3f} (source={duration_src}), profile=1")
 
     ckpt_path = resolve_checkpoint_path(args.model)
     video_path = resolve_path(args.video, desc="Video")
@@ -1162,6 +2198,24 @@ def main() -> int:
             print("[WARN] --save provided; enabling --display for annotated video output.")
             args.display = True
 
+    if benchmark_enabled and not args.display:
+        print("[benchmark] enabling streaming path (--display) for timed looping.")
+        args.display = True
+    if profile_enabled and not args.display:
+        print("[profile] enabling streaming path (--display) to collect profiling artifacts.")
+        args.display = True
+    if benchmark_enabled and args.limit_frames is not None:
+        print("[benchmark][WARN] --limit-frames is ignored in benchmark mode (duration controls stop).")
+
+    profile_out_dir: Optional[Path] = None
+    if profile_enabled:
+        profile_out_dir = _pick_profile_out_dir(
+            profile_out_arg=args.profile_out,
+            save_path=save_path,
+            ckpt_path=ckpt_path,
+            run_tag="motionbert",
+        )
+
     if args.display:
         return stream_infer_and_display(
             ckpt_path=ckpt_path,
@@ -1175,6 +2229,12 @@ def main() -> int:
             clip_len_raw=clip_len_raw,
             win_step_raw=win_step_raw,
             save_path=save_path,
+            profile_enabled=profile_enabled,
+            profile_out_dir=profile_out_dir,
+            profile_duration_s=profile_duration_s,
+            hw_sample_hz=hw_sample_hz,
+            benchmark_enabled=benchmark_enabled,
+            no_display=no_display,
             args=args,
         )
 
