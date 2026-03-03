@@ -2121,7 +2121,7 @@ def main() -> int:
         "--keypoint-backend",
         type=str,
         default=None,
-        choices=["yolo", "alphapose"],
+        choices=["yolo", "alphapose", "vitpose"],
         help="Override keypoint backend (auto-detected from --keypoint-model when omitted).",
     )
     ap.add_argument("--imgsz", type=int, default=640)

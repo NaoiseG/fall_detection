@@ -62,6 +62,27 @@ def _keypoint_models_root() -> Path:
     return (get_web_app_root() / "models" / "keypoint").resolve()
 
 
+def _infer_keypoint_backend(model_name: str, model_path: Path) -> str:
+    model_key = str(model_name).strip().lower()
+    if "alphapose" in model_key:
+        return "alphapose"
+    if "vitpose" in model_key:
+        return "vitpose"
+
+    path = Path(model_path).expanduser()
+    path_str = str(path).lower()
+    if path.is_dir():
+        if (path / "alphapose").is_dir() or path.name.lower() == "alphapose":
+            return "alphapose"
+        if "vitpose" in path.name.lower():
+            return "vitpose"
+    if "alphapose" in path_str:
+        return "alphapose"
+    if "vitpose" in path_str:
+        return "vitpose"
+    return "yolo"
+
+
 def _resolve_relative_model_path(root: Path, relative_path: str, model_kind: str) -> Path:
     rel_path = Path(relative_path)
     if rel_path.is_absolute():
@@ -95,7 +116,7 @@ def _validate_alphapose_bundle(root: Path) -> None:
         )
 
 
-def _ensure_keypoint_asset(relative_path: str) -> Path:
+def _ensure_keypoint_asset(*, model_name: str, relative_path: str) -> Path:
     keypoint_root = _keypoint_models_root()
     weights_rel_path = Path(relative_path)
     if weights_rel_path.is_absolute():
@@ -106,6 +127,14 @@ def _ensure_keypoint_asset(relative_path: str) -> Path:
         weights_path.relative_to(keypoint_root)
     except ValueError as error:
         raise ValueError("Invalid keypoint model path.") from error
+
+    backend = _infer_keypoint_backend(model_name, weights_path)
+
+    if backend == "vitpose":
+        if weights_path.exists() and weights_path.is_file():
+            raise ValueError("Invalid ViTPose model path. Expected a directory.")
+        weights_path.mkdir(parents=True, exist_ok=True)
+        return weights_path
 
     if weights_path.is_dir():
         _validate_alphapose_bundle(weights_path)
@@ -186,7 +215,11 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         classification_rel,
         "classification",
     )
-    keypoint_weights_path = _ensure_keypoint_asset(KEYPOINT_MODELS[keypoint_model])
+    keypoint_weights_path = _ensure_keypoint_asset(
+        model_name=keypoint_model,
+        relative_path=KEYPOINT_MODELS[keypoint_model],
+    )
+    keypoint_backend = _infer_keypoint_backend(keypoint_model, keypoint_weights_path)
 
     realtime = bool(payload.get("realtime", True))
     display_fps = _validate_float(payload.get("display_fps", 0.0), name="display_fps", min_value=0.0)
@@ -205,7 +238,7 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     inference_options = {
         "display_fps": float(display_fps),
         "realtime": bool(realtime),
-        "keypoint_backend": "alphapose" if keypoint_weights_path.is_dir() else "yolo",
+        "keypoint_backend": keypoint_backend,
         "max_people": 1,
         "T": int(window_size),
         "stride": int(stride_frames),

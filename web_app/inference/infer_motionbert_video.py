@@ -1724,13 +1724,13 @@ def main() -> int:
         dest="keypoint_model",
         type=str,
         default="models/keypoint/ultralytics/yolo11l-pose.pt",
-        help="Keypoint model path (YOLO weights file or AlphaPose bundle directory).",
+        help="Keypoint model path (YOLO weights file, AlphaPose bundle directory, or ViTPose marker directory).",
     )
     ap.add_argument(
         "--keypoint-backend",
         type=str,
         default=None,
-        choices=["yolo", "alphapose"],
+        choices=["yolo", "alphapose", "vitpose"],
         help="Override keypoint backend (auto-detected from --keypoint-model when omitted).",
     )
     ap.add_argument("--device", type=str, default=None)
