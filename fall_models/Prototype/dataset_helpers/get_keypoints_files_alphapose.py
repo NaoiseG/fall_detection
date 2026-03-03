@@ -3,12 +3,6 @@ Entry-point script to run AlphaPose extraction on the full UP-Fall directory tre
 
 This file ONLY contains the main() logic.
 All pose logic, batching, timestamp parsing, etc. remain in pose_alphapose.py unchanged.
-
-Usage examples:
-  python dataset_helpers/get_keypoints_files_alphapose.py --camera 1
-  python dataset_helpers/get_keypoints_files_alphapose.py --subjects 12-12
-  python dataset_helpers/get_keypoints_files_alphapose.py --subjects 2,4,7
-  python dataset_helpers/get_keypoints_files_alphapose.py --camera 2 --subjects 1-3
 """
 
 from pathlib import Path
@@ -16,10 +10,53 @@ import argparse
 import glob
 import os
 
-try:
-    from .pose_alphapose import AlphaPoseExportConfig, AlphaPoseRunner, run_pose_on_frames_alphapose
-except ImportError:
-    from pose_alphapose import AlphaPoseExportConfig, AlphaPoseRunner, run_pose_on_frames_alphapose
+
+def parse_subjects_arg(value: str):
+    """
+    Parse subjects from:
+    - single value: "12"
+    - comma list: "1,3,7"
+    - ranges: "1-5"
+    - mixed: "1-3,7,10-12"
+    """
+    subjects = []
+    chunks = [c.strip() for c in value.split(",") if c.strip()]
+    if not chunks:
+        raise argparse.ArgumentTypeError("Subjects cannot be empty.")
+
+    for chunk in chunks:
+        if "-" in chunk:
+            parts = chunk.split("-", 1)
+            if len(parts) != 2:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid range '{chunk}'. Use start-end, e.g. 1-5."
+                )
+            try:
+                start = int(parts[0].strip())
+                end = int(parts[1].strip())
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid range '{chunk}'. Subject IDs must be integers."
+                ) from exc
+            if start <= 0 or end <= 0:
+                raise argparse.ArgumentTypeError("Subject IDs must be positive integers.")
+            if end < start:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid range '{chunk}'. End must be >= start."
+                )
+            subjects.extend(range(start, end + 1))
+        else:
+            try:
+                sid = int(chunk)
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid subject '{chunk}'. Subject IDs must be integers."
+                ) from exc
+            if sid <= 0:
+                raise argparse.ArgumentTypeError("Subject IDs must be positive integers.")
+            subjects.append(sid)
+
+    return sorted(set(subjects))
 
 
 def find_camera_folders_subjects(root, camera=1, subjects=range(1, 6)):
@@ -30,91 +67,47 @@ def find_camera_folders_subjects(root, camera=1, subjects=range(1, 6)):
             continue
         pat = subj_root / "**" / f"*Camera{camera}"
         folders.extend([str(p) for p in glob.glob(str(pat), recursive=True) if os.path.isdir(p)])
-    return folders
-
-
-def parse_subjects(subjects_str):
-    if subjects_str is None or str(subjects_str).strip() == "":
-        return range(1, 6)
-
-    raw = str(subjects_str).strip()
-    if "," in raw and "-" in raw:
-        raise ValueError("subjects must be a comma list or a range, not both")
-
-    if "-" in raw:
-        parts = [p.strip() for p in raw.split("-")]
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            raise ValueError("invalid subjects range, expected START-END")
-        if not parts[0].isdigit() or not parts[1].isdigit():
-            raise ValueError("subjects range must be numeric")
-        start = int(parts[0])
-        end = int(parts[1])
-        if start <= 0 or end <= 0:
-            raise ValueError("subjects must be positive integers")
-        if start > end:
-            raise ValueError("subjects range start must be <= end")
-        return range(start, end + 1)
-
-    parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
-    if not parts:
-        raise ValueError("subjects list cannot be empty")
-    subjects = []
-    for p in parts:
-        if not p.isdigit():
-            raise ValueError("subjects list must be numeric")
-        val = int(p)
-        if val <= 0:
-            raise ValueError("subjects must be positive integers")
-        subjects.append(val)
-    return sorted(set(subjects))
-
-
-def build_arg_parser(default_upfall_root, default_output_root):
-    parser = argparse.ArgumentParser(
-        description="Run AlphaPose extraction on UP-Fall frames."
-    )
-    parser.add_argument(
-        "--subjects",
-        type=str,
-        default=None,
-        help="Comma list (e.g., 1,2,3) or range (e.g., 1-5). Default: 1-5.",
-    )
-    parser.add_argument(
-        "--camera",
-        type=int,
-        required=True,
-        help="Camera index to process (e.g., 1 for Camera1).",
-    )
-    parser.add_argument(
-        "--upfall-root",
-        type=str,
-        default=str(default_upfall_root),
-        help="Root directory of the UP-Fall dataset.",
-    )
-    parser.add_argument(
-        "--output-root",
-        type=str,
-        default=str(default_output_root),
-        help="Root directory where keypoint outputs are written.",
-    )
-    return parser
+    return sorted(set(folders))
 
 
 def main():
-    # --- Configure paths for your PC ---
-    UPFALL_ROOT = Path("../../../scratch/UPFall")  # change if needed
-    OUTPUT_ROOT = Path("../../Datasets/UPFall_keypoints_alpha/outputs_npz")  # change if needed
+    ap = argparse.ArgumentParser(description="Extract keypoints with AlphaPose from UP-Fall frame folders.")
+    ap.add_argument(
+        "--camera",
+        type=int,
+        required=True,
+        help="UP-Fall camera number to process (e.g., 1 for Camera1).",
+    )
+    ap.add_argument(
+        "--subjects",
+        type=parse_subjects_arg,
+        default=[12],
+        help="Subjects to process. Examples: 12 | 1,3,7 | 1-5 | 1-3,7,10-12 (default: 12).",
+    )
+    ap.add_argument(
+        "--upfall-root",
+        type=Path,
+        default=Path("../../Datasets/UPFall"),
+        help="Root of UP-Fall dataset (default: ../../Datasets/UPFall).",
+    )
+    ap.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("../../Datasets/UPFall_keypoints_alpha/outputs_npz"),
+        help="Root where outputs are written (default: ../../Datasets/UPFall_keypoints_alpha/outputs_npz).",
+    )
+    args = ap.parse_args()
 
-    parser = build_arg_parser(UPFALL_ROOT, OUTPUT_ROOT)
-    args = parser.parse_args()
+    upfall_root = args.upfall_root.expanduser().resolve()
+    output_root = args.output_root.expanduser().resolve()
 
-    try:
-        subjects = parse_subjects(args.subjects)
-    except ValueError as exc:
-        parser.error(str(exc))
+    if not upfall_root.exists() or not upfall_root.is_dir():
+        raise SystemExit(f"UP-Fall root does not exist or is not a directory: {upfall_root}")
 
-    upfall_root = Path(args.upfall_root)
-    output_root = Path(args.output_root)
+    if __package__:
+        from .pose_alphapose import AlphaPoseExportConfig, AlphaPoseRunner, run_pose_on_frames_alphapose
+    else:
+        from pose_alphapose import AlphaPoseExportConfig, AlphaPoseRunner, run_pose_on_frames_alphapose
 
     cfg = AlphaPoseExportConfig(
         alphapose_root="pose_models/AlphaPose",
@@ -122,22 +115,27 @@ def main():
         checkpoint="pretrained_models/fast_res50_256x192.pth",
         detector_cfg="detector/yolo/cfg/yolov3-spp.cfg",
         detector_weights="detector/yolo/data/yolov3-spp.weights",
-        conf_thres=0.1,
+        conf_thres=0.25,
+        conf_min=0.75,
         nms_thres=0.6,
         fps=30,
         max_people=1,
+        max_jump_px=None,  # None => use max_jump_diag_frac * image_diagonal
+        max_lost=10,
         save_csv=False,
         render_video=True,
     )
-
     runner = AlphaPoseRunner(cfg)
 
     camera_folders = find_camera_folders_subjects(
         root=str(upfall_root),
         camera=args.camera,
-        subjects=subjects,
+        subjects=args.subjects,
     )
 
+    print(f"UP-Fall root: {upfall_root}")
+    print(f"Output root: {output_root}")
+    print(f"Subjects: {args.subjects}")
     print("Camera folders found:", len(camera_folders))
     total = len(camera_folders)
     results = []
@@ -160,7 +158,7 @@ def main():
             print("  -> already exists, skipping")
             continue
 
-        out_video, out_npz, _ = run_pose_on_frames_alphapose(
+        _, out_npz, _ = run_pose_on_frames_alphapose(
             frames_dir=frames_dir,
             out_dir=str(out_dir),
             windows_csv=windows_csv,
@@ -169,7 +167,7 @@ def main():
             runner=runner,
         )
 
-        print(f"  OK wrote {out_npz}")
+        print(f"  -> wrote {out_npz}")
         results.append(out_npz)
 
     print("\nDone.")

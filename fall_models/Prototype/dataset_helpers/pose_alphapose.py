@@ -28,12 +28,21 @@ class AlphaPoseExportConfig:
     detector_weights: str = "detector/yolo/data/yolov3-spp.weights"
 
     conf_thres: float = 0.1
+    conf_min: float = 0.75
     nms_thres: float = 0.6
     fps: int = 30
     max_people: int = 1
     num_kpts: int = 17
     video_codec: str = "mp4v"
     save_csv: bool = False
+    max_jump_px: Optional[float] = None
+    max_jump_diag_frac: float = 0.25
+    max_lost: int = 10
+    target_x_frac: float = 0.5
+    target_y_frac: float = 0.5
+    draw_kpt_threshold: float = 0.30
+    draw_no_target_text: bool = True
+    draw_confidence_text: bool = True
     min_box_area: int = 0
     flip: bool = False
     vis_fast: bool = True
@@ -167,6 +176,143 @@ def init_pose_arrays(num_frames: int, max_people: int, num_kpts: int) -> Dict[st
     kpts_conf = np.full((num_frames, max_people, num_kpts), np.nan, dtype=np.float32)
     person_conf = np.full((num_frames, max_people), np.nan, dtype=np.float32)
     return {"kpts_xy": kpts_xy, "kpts_conf": kpts_conf, "person_conf": person_conf}
+
+
+COCO_SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (5, 6),
+    (5, 7), (7, 9),
+    (6, 8), (8, 10),
+    (5, 11), (6, 12),
+    (11, 12),
+    (11, 13), (13, 15),
+    (12, 14), (14, 16),
+]
+
+
+def select_person_idx(
+    box_centers: np.ndarray,
+    box_conf: Optional[np.ndarray],
+    prev_center: Optional[np.ndarray],
+    target_center: np.ndarray,
+    conf_min: float,
+    max_jump_px: float,
+) -> Tuple[Optional[int], Optional[np.ndarray]]:
+    """
+    Temporal target selection:
+      - Acquire (no prev_center): prefer conf >= conf_min, closest to target center.
+      - Track (has prev_center): closest to prev_center with max-jump gate.
+    """
+    num_people = int(box_centers.shape[0])
+    if num_people == 0:
+        return None, prev_center
+
+    if prev_center is None:
+        candidate_idx = np.arange(num_people, dtype=np.int32)
+        if box_conf is not None and box_conf.shape[0] >= num_people:
+            high_conf = np.where(np.isfinite(box_conf[:num_people]) & (box_conf[:num_people] >= conf_min))[0]
+            if high_conf.size > 0:
+                candidate_idx = high_conf.astype(np.int32, copy=False)
+
+        dists = np.linalg.norm(box_centers[candidate_idx] - target_center[None, :], axis=1)
+        if dists.size == 0:
+            return None, prev_center
+
+        best_rel = int(np.argmin(dists))
+        best_idx = int(candidate_idx[best_rel])
+        return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+
+    dists = np.linalg.norm(box_centers - prev_center[None, :], axis=1)
+    if dists.size == 0:
+        return None, prev_center
+
+    best_idx = int(np.argmin(dists))
+    best_dist = float(dists[best_idx])
+    if not np.isfinite(best_dist) or best_dist > max_jump_px:
+        return None, prev_center
+
+    return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+
+
+def draw_selected_pose(
+    frame: np.ndarray,
+    kpts_xy: Optional[np.ndarray],
+    kpts_conf: Optional[np.ndarray],
+    box_xyxy: Optional[np.ndarray],
+    person_conf: float,
+    draw_kpt_threshold: float,
+    draw_no_target_text: bool,
+    draw_confidence_text: bool,
+) -> np.ndarray:
+    out = frame.copy()
+    if kpts_xy is None:
+        if draw_no_target_text:
+            cv2.putText(
+                out,
+                "NO TARGET",
+                (12, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 165, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        return out
+
+    xy = np.asarray(kpts_xy, dtype=np.float32)
+    conf = None
+    if kpts_conf is not None:
+        conf = np.asarray(kpts_conf, dtype=np.float32).reshape(-1)
+
+    text_origin = (12, 30)
+    if box_xyxy is not None:
+        box_xyxy = np.asarray(box_xyxy, dtype=np.float32).reshape(-1)
+        if box_xyxy.shape[0] >= 4 and np.all(np.isfinite(box_xyxy[:4])):
+            x1, y1, x2, y2 = np.round(box_xyxy[:4]).astype(int).tolist()
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            text_origin = (x1, max(20, y1 - 8))
+
+    for a, b in COCO_SKELETON:
+        if a >= xy.shape[0] or b >= xy.shape[0]:
+            continue
+        if not np.isfinite(xy[a]).all() or not np.isfinite(xy[b]).all():
+            continue
+        if conf is not None:
+            if a >= conf.shape[0] or b >= conf.shape[0]:
+                continue
+            if not np.isfinite(conf[a]) or not np.isfinite(conf[b]):
+                continue
+            if conf[a] < draw_kpt_threshold or conf[b] < draw_kpt_threshold:
+                continue
+
+        pt1 = tuple(np.round(xy[a]).astype(int).tolist())
+        pt2 = tuple(np.round(xy[b]).astype(int).tolist())
+        cv2.line(out, pt1, pt2, (0, 255, 0), 2, cv2.LINE_AA)
+
+    for k in range(xy.shape[0]):
+        if not np.isfinite(xy[k]).all():
+            continue
+        if conf is not None:
+            if k >= conf.shape[0] or not np.isfinite(conf[k]):
+                continue
+            if conf[k] < draw_kpt_threshold:
+                continue
+        pt = tuple(np.round(xy[k]).astype(int).tolist())
+        cv2.circle(out, pt, 3, (0, 0, 255), -1, cv2.LINE_AA)
+
+    if draw_confidence_text and np.isfinite(person_conf):
+        cv2.putText(
+            out,
+            f"CONF {float(person_conf):.3f}",
+            text_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return out
 
 
 # ----------------------------- ALPHAPOSE WRAPPER -----------------------------
@@ -395,11 +541,20 @@ class AlphaPoseRunner:
                 kp_score = preds_scores[k]
                 proposal_score = torch.mean(kp_score) + scores[k] + 1.25 * torch.max(kp_score)
                 box = boxes[k]
+                box_xyxy = np.asarray(box.cpu().numpy() if torch.is_tensor(box) else box, dtype=np.float32).reshape(-1)
+                if box_xyxy.shape[0] < 4:
+                    continue
+                box_xyxy = box_xyxy[:4]
+                score_k = scores[k]
+                if torch.is_tensor(score_k):
+                    score_k_val = float(score_k.reshape(-1)[0].item())
+                else:
+                    score_k_val = float(score_k)
                 box_xywh = [
-                    float(box[0]),
-                    float(box[1]),
-                    float(box[2] - box[0]),
-                    float(box[3] - box[1]),
+                    float(box_xyxy[0]),
+                    float(box_xyxy[1]),
+                    float(box_xyxy[2] - box_xyxy[0]),
+                    float(box_xyxy[3] - box_xyxy[1]),
                 ]
                 result_list.append(
                     {
@@ -415,6 +570,15 @@ class AlphaPoseRunner:
                     {
                         "kpts_xy": kp.cpu().numpy().astype(np.float32),
                         "kpts_conf": kp_score.cpu().numpy().astype(np.float32).reshape(-1),
+                        "box_xyxy": box_xyxy.astype(np.float32, copy=False),
+                        "box_center": np.array(
+                            [
+                                0.5 * (box_xyxy[0] + box_xyxy[2]),
+                                0.5 * (box_xyxy[1] + box_xyxy[3]),
+                            ],
+                            dtype=np.float32,
+                        ),
+                        "box_conf": score_k_val,
                         "person_conf": float(proposal_score),
                     }
                 )
@@ -532,6 +696,19 @@ def run_pose_on_frames_alphapose(
     frame_labels = frames_df["label"].to_numpy()
     frame_window_ids = frames_df["window_id"].to_numpy()
 
+    target_center = np.array(
+        [w * config.target_x_frac, h * config.target_y_frac],
+        dtype=np.float32,
+    )
+    frame_diag = float(np.hypot(float(w), float(h)))
+    max_jump_px = (
+        float(config.max_jump_px)
+        if config.max_jump_px is not None
+        else float(config.max_jump_diag_frac * frame_diag)
+    )
+    prev_center: Optional[np.ndarray] = None
+    lost_count = 0
+
     for i, p in enumerate(frame_paths):
         frame_bgr = cv2.imread(p)
         if frame_bgr is None:
@@ -541,32 +718,100 @@ def run_pose_on_frames_alphapose(
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image_name = os.path.basename(p)
         out = runner.infer(frame_rgb, image_name=image_name)
-
-        im_res = out["im_res"]
         people = out["people"]
+        selected_xy: Optional[np.ndarray] = None
+        selected_kc: Optional[np.ndarray] = None
+        selected_box_xyxy: Optional[np.ndarray] = None
+        selected_person_conf = float("nan")
+
+        if not people:
+            lost_count += 1
+        else:
+            xy = np.asarray([person["kpts_xy"] for person in people], dtype=np.float32)
+            kc = np.asarray([person["kpts_conf"] for person in people], dtype=np.float32)
+            box_centers = np.asarray([person["box_center"] for person in people], dtype=np.float32)
+            boxes_xyxy = np.asarray([person["box_xyxy"] for person in people], dtype=np.float32)
+            box_conf = np.asarray(
+                [float(person.get("box_conf", np.nan)) for person in people],
+                dtype=np.float32,
+            )
+
+            num_candidates = min(
+                int(xy.shape[0]),
+                int(kc.shape[0]),
+                int(box_centers.shape[0]),
+                int(boxes_xyxy.shape[0]),
+            )
+            if num_candidates <= 0:
+                lost_count += 1
+            else:
+                xy = xy[:num_candidates]
+                kc = kc[:num_candidates]
+                box_centers = box_centers[:num_candidates]
+                boxes_xyxy = boxes_xyxy[:num_candidates]
+                box_conf = box_conf[:num_candidates]
+
+                idx, new_center = select_person_idx(
+                    box_centers=box_centers,
+                    box_conf=box_conf,
+                    prev_center=prev_center,
+                    target_center=target_center,
+                    conf_min=config.conf_min,
+                    max_jump_px=max_jump_px,
+                )
+
+                if idx is None:
+                    lost_count += 1
+                else:
+                    prev_center = new_center
+                    lost_count = 0
+
+                    selected_xy = xy[idx]
+                    selected_kc = kc[idx]
+                    selected_box_xyxy = boxes_xyxy[idx]
+
+                    if idx < box_conf.shape[0] and np.isfinite(box_conf[idx]):
+                        selected_person_conf = float(box_conf[idx])
+                    elif selected_kc is not None:
+                        selected_person_conf = float(np.nanmean(selected_kc))
+                    elif idx < len(people):
+                        selected_person_conf = float(people[idx].get("person_conf", np.nan))
+
+                    if config.max_people > 0:
+                        j = 0
+                        xy_sel = np.asarray(selected_xy, dtype=np.float32)
+                        xy_count = min(config.num_kpts, int(xy_sel.shape[0]))
+                        arrays["kpts_xy"][i, j, :xy_count] = xy_sel[:xy_count]
+
+                        kc_sel = np.asarray(selected_kc, dtype=np.float32).reshape(-1)
+                        kc_count = min(config.num_kpts, int(kc_sel.shape[0]))
+                        arrays["kpts_conf"][i, j, :kc_count] = kc_sel[:kc_count]
+                        arrays["person_conf"][i, j] = selected_person_conf
+
+                        if config.save_csv:
+                            for k in range(config.num_kpts):
+                                x, y = arrays["kpts_xy"][i, j, k]
+                                kconf = arrays["kpts_conf"][i, j, k]
+                                pconf = arrays["person_conf"][i, j]
+                                csv_rows.append([i, j, k, float(x), float(y), float(kconf), float(pconf), p])
+
+        if lost_count > config.max_lost:
+            prev_center = None
 
         if config.render_video:
-            annotated = runner.render(frame_bgr, im_res)
+            annotated = draw_selected_pose(
+                frame=frame_bgr,
+                kpts_xy=selected_xy,
+                kpts_conf=selected_kc,
+                box_xyxy=selected_box_xyxy,
+                person_conf=selected_person_conf,
+                draw_kpt_threshold=config.draw_kpt_threshold,
+                draw_no_target_text=config.draw_no_target_text,
+                draw_confidence_text=config.draw_confidence_text,
+            )
             writer.write(annotated)
         else:
             writer.write(frame_bgr)
-
-        if not people:
-            continue
-
-        people_sorted = sorted(people, key=lambda x: float(x["person_conf"]), reverse=True)
-
-        for j, person in enumerate(people_sorted[:config.max_people]):
-            arrays["kpts_xy"][i, j] = person["kpts_xy"]
-            arrays["kpts_conf"][i, j] = person["kpts_conf"]
-            arrays["person_conf"][i, j] = float(person["person_conf"])
-
-            if config.save_csv:
-                for k in range(config.num_kpts):
-                    x, y = arrays["kpts_xy"][i, j, k]
-                    kconf = arrays["kpts_conf"][i, j, k]
-                    pconf = arrays["person_conf"][i, j]
-                    csv_rows.append([i, j, k, float(x), float(y), float(kconf), float(pconf), p])
 
     writer.release()
 
