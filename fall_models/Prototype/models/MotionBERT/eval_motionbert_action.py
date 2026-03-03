@@ -81,6 +81,18 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 
 _TS_DIR_FMT = "%Y-%m-%d_%H-%M-%S_%f"
+_INT_NAME_RE = re.compile(r"^-?\d+$")
+
+# Keep labels consistent with evaluation/eval_models.py merged 7-class naming.
+UPFALL_MERGED_7_LABELS = [
+    "Fall",
+    "Walking",
+    "Standing",
+    "Sitting",
+    "Picking up an object",
+    "Jumping",
+    "Laying",
+]
 
 
 def _seed_everything(seed: int = 0) -> None:
@@ -135,6 +147,7 @@ def _parse_subjects(spec: str) -> List[int]:
 
 
 _SUBJECT_RE = re.compile(r"(?:^|_)Subject(\d+)(?:_|$)", re.IGNORECASE)
+_CAMERA_RE = re.compile(r"(?:^|_)(?:cam|camera)(\d+)(?:_|$)", re.IGNORECASE)
 
 
 def _subject_from_frame_dir(frame_dir: str) -> Optional[int]:
@@ -142,6 +155,19 @@ def _subject_from_frame_dir(frame_dir: str) -> Optional[int]:
     Extract subject id from frame_dir (UP-Fall uses 'Subject10_Activity...').
     """
     m = _SUBJECT_RE.search(frame_dir)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _camera_from_frame_dir(frame_dir: str) -> Optional[int]:
+    """
+    Extract camera id from frame_dir (supports tokens like Cam1 or Camera1).
+    """
+    m = _CAMERA_RE.search(frame_dir)
     if not m:
         return None
     try:
@@ -203,6 +229,42 @@ def _load_class_names_from_label_map_json(label_map_path: Path, num_classes: int
                     return names
 
     return None
+
+
+def _resolve_activity_class_names(
+    *,
+    dataset_name: str,
+    num_classes: int,
+    label_map_path: Path,
+) -> List[str]:
+    """
+    Resolve human-friendly class labels for reports/plots.
+
+    For UP-Fall merged 7-class runs, prefer canonical activity names so confusion
+    matrices match eval_models.py naming even if label_map JSON stores raw ids
+    like "6","7",... for non-fall classes.
+    """
+    names = _load_class_names_from_label_map_json(label_map_path, num_classes)
+    ds = str(dataset_name).strip().lower()
+    n_cls = int(num_classes)
+
+    if ds == "upfall" and n_cls == len(UPFALL_MERGED_7_LABELS):
+        if names is None:
+            return list(UPFALL_MERGED_7_LABELS)
+        cleaned = [str(x).strip() for x in names]
+        if len(cleaned) != n_cls:
+            return list(UPFALL_MERGED_7_LABELS)
+        # If non-fall labels are numeric ids, replace with canonical activity names.
+        if all(_INT_NAME_RE.match(v or "") is not None for v in cleaned[1:]):
+            return list(UPFALL_MERGED_7_LABELS)
+        return cleaned
+
+    if names is None:
+        return [str(i) for i in range(n_cls)]
+    cleaned = [str(x).strip() for x in names]
+    if len(cleaned) < n_cls:
+        cleaned.extend(str(i) for i in range(len(cleaned), n_cls))
+    return cleaned[:n_cls]
 
 
 def _clean_state_dict_for_model(state: Dict[str, torch.Tensor], model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -268,6 +330,8 @@ class FilterResult:
     n_split_before: int
     n_split_after: int
     subjects_found: List[int]
+    cameras_found: List[int]
+    cameras_after_subject_filter: List[int]
 
 
 def _choose_eval_split_key(split_dict: Dict[str, Sequence[str]], base: str) -> str:
@@ -290,10 +354,12 @@ def _filter_pkl_by_subjects(
     chosen_subjects: Set[int],
     base_split: str,
     out_path: Path,
+    chosen_cameras: Optional[Set[int]] = None,
 ) -> FilterResult:
     """
     Filter an action pkl so that its chosen split contains only samples from
-    `chosen_subjects`. Subject is parsed from each sample's frame_dir.
+    `chosen_subjects` and (optionally) `chosen_cameras`. Subject/camera are parsed
+    from each sample's frame_dir.
 
     Returns metadata and writes a filtered pkl to out_path.
     """
@@ -306,20 +372,37 @@ def _filter_pkl_by_subjects(
     n_before = len(frame_dirs)
 
     subjects_in_split: List[int] = []
+    cameras_in_split: List[int] = []
+    cameras_after_subject_filter: List[int] = []
     filtered_frame_dirs: List[str] = []
     for fd in frame_dirs:
         sid = _subject_from_frame_dir(str(fd))
+        cam = _camera_from_frame_dir(str(fd))
         if sid is not None:
             subjects_in_split.append(sid)
-        if sid is not None and sid in chosen_subjects:
+        if cam is not None:
+            cameras_in_split.append(cam)
+        subject_ok = (sid is not None and sid in chosen_subjects)
+        if subject_ok and cam is not None:
+            cameras_after_subject_filter.append(cam)
+        camera_ok = True
+        if chosen_cameras is not None:
+            camera_ok = (cam is not None and cam in chosen_cameras)
+        if subject_ok and camera_ok:
             filtered_frame_dirs.append(fd)
 
     subjects_found = sorted(set(subjects_in_split))
+    cameras_found = sorted(set(cameras_in_split))
+    cameras_found_after_subjects = sorted(set(cameras_after_subject_filter))
 
     if len(filtered_frame_dirs) == 0:
+        cam_req = sorted(chosen_cameras) if chosen_cameras is not None else None
         raise RuntimeError(
-            f"No samples matched subjects={sorted(chosen_subjects)} in split '{split_key}'. "
-            f"Subjects present in that split: {subjects_found[:50]}{'...' if len(subjects_found)>50 else ''}"
+            f"No samples matched subjects={sorted(chosen_subjects)}"
+            f"{'' if cam_req is None else f' and cameras={cam_req}'} in split '{split_key}'. "
+            f"Subjects present in that split: {subjects_found[:50]}{'...' if len(subjects_found)>50 else ''} | "
+            f"Cameras present in split: {cameras_found} | "
+            f"Cameras present after subject filter: {cameras_found_after_subjects}"
         )
 
     keep = set(filtered_frame_dirs)
@@ -346,6 +429,8 @@ def _filter_pkl_by_subjects(
         n_split_before=n_before,
         n_split_after=len(filtered_frame_dirs),
         subjects_found=subjects_found,
+        cameras_found=cameras_found,
+        cameras_after_subject_filter=cameras_found_after_subjects,
     )
 
 
@@ -635,6 +720,8 @@ def _make_html_report(
     out_dir: Path,
     plots_dir: Path,
     out_path: Path,
+    confusion_imgs: List[Tuple[str, str]],
+    f1_imgs: List[Tuple[str, str]],
     extra_html: str = "",
 ) -> None:
     css = """
@@ -648,6 +735,25 @@ def _make_html_report(
     code{background:#f6f6f6;padding:2px 6px;border-radius:6px;}
     .meta{font-size:13px;color:#444;margin-top:16px;}
     """
+
+    conf_imgs_html = "\n".join(
+        f"""
+    <div>
+      <h3>{split_name}</h3>
+      <img src="{img_rel}" alt="Confusion matrix {split_name}"/>
+    </div>
+"""
+        for split_name, img_rel in confusion_imgs
+    )
+    f1_imgs_html = "\n".join(
+        f"""
+    <div>
+      <h3>{split_name}</h3>
+      <img src="{img_rel}" alt="F1 per class {split_name}"/>
+    </div>
+"""
+        for split_name, img_rel in f1_imgs
+    )
 
     html = f"""<!doctype html>
 <html>
@@ -668,15 +774,14 @@ def _make_html_report(
   </p>
   {_df_to_html(overall_df)}
 
+  <h2>Confusion matrices</h2>
   <div class="grid">
-    <div>
-      <h2>Confusion matrix</h2>
-      <img src="{plots_dir.name}/confusion_matrix.png" alt="Confusion matrix"/>
-    </div>
-    <div>
-      <h2>F1 per class</h2>
-      <img src="{plots_dir.name}/f1_per_class.png" alt="F1 per class"/>
-    </div>
+    {conf_imgs_html}
+  </div>
+
+  <h2>F1 per class plots</h2>
+  <div class="grid">
+    {f1_imgs_html}
   </div>
 
   <h2>Per-class metrics</h2>
@@ -729,6 +834,13 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True, help="MotionBERT YAML config used in training.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file (best_epoch.bin or latest_epoch.bin).")
     parser.add_argument("--subjects", type=str, required=True, help="Subject spec like '1-5' or '1-3,7,9-10'.")
+    parser.add_argument(
+        "--camera",
+        nargs="+",
+        type=int,
+        default=[1, 2],
+        help="One or more camera indices to evaluate on; if multiple are given, outputs each camera split and a combined split.",
+    )
     parser.add_argument("--out-dir", type=str, default="eval_outputs", help="Base output directory (timestamped subfolder created).")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64).")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader num_workers (default: 0).")
@@ -794,10 +906,19 @@ def main() -> None:
 
     # Optional overrides
     parser.add_argument(
+        "--test",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When --data-pkl is not set, use data/action/<dataset>_test.pkl (default: enabled). "
+            "Use --no-test to use data/action/<dataset>.pkl."
+        ),
+    )
+    parser.add_argument(
         "--data-pkl",
         type=str,
         default=None,
-        help="Override dataset pkl path (default: data/action/upfall_test.pkl).",
+        help="Override dataset pkl path explicitly (takes precedence over --test/--no-test).",
     )
     parser.add_argument("--split-base", type=str, default=None, help="Override base split name (default: config data_split, e.g. xsub).")
 
@@ -819,6 +940,11 @@ def main() -> None:
 
     cfg = get_config(args_cli.config)
     chosen_subjects = set(_parse_subjects(args_cli.subjects))
+    camera_ids = sorted(set(int(c) for c in args_cli.camera))
+    if not camera_ids:
+        raise SystemExit("--camera must contain at least one camera index.")
+    if any(c <= 0 for c in camera_ids):
+        raise SystemExit(f"--camera values must be positive integers. Got: {camera_ids}")
     device = _torch_device(args_cli.device)
 
     # Extract config values used in train_action.py
@@ -852,20 +978,31 @@ def main() -> None:
 
     scale_range_test = getattr(cfg, "scale_range_test", None)
 
-    # Resolve original pkl path (default is upfall_test.pkl unless overridden)
+    # Resolve source pkl path. --data-pkl has highest priority, then --test/--no-test.
     if args_cli.data_pkl is not None:
         src_pkl = Path(args_cli.data_pkl).expanduser().resolve()
     else:
-        src_pkl = repo_root / "data" / "action" / "upfall_test.pkl"
+        default_name = f"{dataset_name}_test.pkl" if bool(args_cli.test) else f"{dataset_name}.pkl"
+        src_pkl = (repo_root / "data" / "action" / default_name).resolve()
     if not src_pkl.exists():
-        raise FileNotFoundError(f"Dataset pkl not found: {src_pkl.as_posix()}")
+        raise FileNotFoundError(
+            f"Dataset pkl not found: {src_pkl.as_posix()} "
+            f"(resolved from dataset='{dataset_name}', test={bool(args_cli.test)}). "
+            "Use --data-pkl to provide an explicit path."
+        )
+    if args_cli.data_pkl is not None:
+        print(f"[data] Using override pkl: {src_pkl.as_posix()}", flush=True)
+    else:
+        print(f"[data] Using default pkl (test={bool(args_cli.test)}): {src_pkl.as_posix()}", flush=True)
 
     # Optional: class names for plots/CSVs (if a label-map JSON exists).
-    # Falls back to numeric strings if the file doesn't exist or doesn't match num_classes.
+    # Falls back to numeric strings for non-UP-Fall datasets when label-map names are unavailable.
     label_map_json = repo_root / "data" / "action" / f"{dataset_name}_label_map.json"
-    class_names = _load_class_names_from_label_map_json(label_map_json, action_classes)
-    if class_names is None:
-        class_names = [str(i) for i in range(action_classes)]
+    class_names = _resolve_activity_class_names(
+        dataset_name=str(dataset_name),
+        num_classes=int(action_classes),
+        label_map_path=label_map_json,
+    )
 
     # One unique output folder per eval run (like eval_models.py)
     ts = datetime.now().strftime(_TS_DIR_FMT)
@@ -877,43 +1014,14 @@ def main() -> None:
 
     print("Eval output dir:", out_dir.as_posix(), flush=True)
 
-    # Create a filtered pkl (Approach A via split+frame_dir filtering; avoids altering sample format)
-    filtered_pkl = out_dir / f"filtered_{dataset_name}_{base_split}_{_slug(args_cli.subjects)}.pkl"
-    fr = _filter_pkl_by_subjects(
-        pkl_path=src_pkl,
-        chosen_subjects=chosen_subjects,
-        base_split=base_split,
-        out_path=filtered_pkl,
-    )
-    print(
-        f"Split '{fr.split_key}': {fr.n_split_after}/{fr.n_split_before} samples kept "
-        f"for subjects={sorted(chosen_subjects)}. Subjects present in split: {fr.subjects_found}",
-        flush=True,
-    )
-
-    # Dataset + loader (match training evaluate settings)
-    ds_kwargs = dict(
-        data_path=str(fr.filtered_pkl_path),
-        data_split=fr.split_key,
-        n_frames=clip_len_eval,
-        random_move=False,
-    )
-    if scale_range_test is not None:
-        ds_kwargs["scale_range"] = scale_range_test
-
-    eval_ds = NTURGBD(**ds_kwargs)
-    loader_kwargs = dict(
-        batch_size=int(args_cli.batch_size),
-        shuffle=False,
-        drop_last=False,
-        num_workers=int(args_cli.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
-    if int(args_cli.num_workers) > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
-
-    loader = DataLoader(eval_ds, **loader_kwargs)
+    if len(camera_ids) > 1:
+        eval_splits: List[Tuple[str, List[int]]] = [(f"camera_{int(c)}", [int(c)]) for c in camera_ids]
+        eval_splits.append(("combined", list(camera_ids)))
+    else:
+        eval_splits = [("combined", [int(camera_ids[0])])]
+    print("Cameras:", camera_ids, flush=True)
+    for split_name, split_camera_ids in eval_splits:
+        print(f"[split] {split_name}: cameras={split_camera_ids}", flush=True)
 
     # Build model (same as train_action.py)
     model_backbone = load_backbone(cfg)
@@ -979,131 +1087,214 @@ def main() -> None:
         criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(device)
 
-    # Log shape
-    try:
-        sample_x, sample_y = next(iter(loader))
-        print(f"Sample batch_input shape: {tuple(sample_x.shape)} | batch_gt shape: {tuple(sample_y.shape)}", flush=True)
-    except Exception as e:
-        print(f"WARNING: could not read first batch for shape logging: {e}", flush=True)
+    labels = list(range(action_classes))
+    summary_rows: List[Dict[str, object]] = []
+    overall_rows: List[Dict[str, object]] = []
+    per_class_rows: List[Dict[str, object]] = []
+    confusion_imgs: List[Tuple[str, str]] = []
+    f1_imgs: List[Tuple[str, str]] = []
+    last_metrics: Optional[EvalMetrics] = None
 
-    # Evaluate
-    loss_avg, top1, top5, cm, y_true, y_pred = _evaluate(
-        model,
-        loader,
-        device=device,
-        criterion=criterion,
-        num_classes=action_classes,
-        print_freq=int(args_cli.print_freq),
-    )
+    for split_name, split_camera_ids in eval_splits:
+        split_slug = _slug(split_name)
+        split_camera_set = set(int(c) for c in split_camera_ids)
+        filtered_pkl = out_dir / f"filtered_{dataset_name}_{base_split}_{_slug(args_cli.subjects)}_{split_slug}.pkl"
+        fr = _filter_pkl_by_subjects(
+            pkl_path=src_pkl,
+            chosen_subjects=chosen_subjects,
+            base_split=base_split,
+            out_path=filtered_pkl,
+            chosen_cameras=split_camera_set,
+        )
+        print(
+            f"[{split_name}] Split '{fr.split_key}': {fr.n_split_after}/{fr.n_split_before} samples kept "
+            f"for subjects={sorted(chosen_subjects)} cameras={sorted(split_camera_set)}. "
+            f"Subjects present: {fr.subjects_found} | Cameras present: {fr.cameras_found}",
+            flush=True,
+        )
 
-    balanced_acc, macro_f1, recall, precision, f1 = _confusion_metrics_from_cm(cm)
-    support = cm.sum(axis=1).astype(np.int64, copy=False)
-    valid = support > 0
-    support_sum = float(np.sum(support))
-    weighted_f1 = float(np.sum(f1 * support) / support_sum) if support_sum > 0 else 0.0
+        ds_kwargs = dict(
+            data_path=str(fr.filtered_pkl_path),
+            data_split=fr.split_key,
+            n_frames=clip_len_eval,
+            random_move=False,
+        )
+        if scale_range_test is not None:
+            ds_kwargs["scale_range"] = scale_range_test
 
-    macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
-    specificity = _specificity_from_cm(cm)
-    macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
+        eval_ds = NTURGBD(**ds_kwargs)
+        loader_kwargs = dict(
+            batch_size=int(args_cli.batch_size),
+            shuffle=False,
+            drop_last=False,
+            num_workers=int(args_cli.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+        if int(args_cli.num_workers) > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
+        loader = DataLoader(eval_ds, **loader_kwargs)
 
-    overall_df = (
-        pd.DataFrame([{
+        # Log shape per split (best-effort)
+        try:
+            sample_x, sample_y = next(iter(loader))
+            print(
+                f"[{split_name}] Sample batch_input shape: {tuple(sample_x.shape)} | batch_gt shape: {tuple(sample_y.shape)}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[{split_name}] WARNING: could not read first batch for shape logging: {e}", flush=True)
+
+        loss_avg, top1, top5, cm, y_true, y_pred = _evaluate(
+            model,
+            loader,
+            device=device,
+            criterion=criterion,
+            num_classes=action_classes,
+            print_freq=int(args_cli.print_freq),
+        )
+
+        balanced_acc, macro_f1, recall, precision, f1 = _confusion_metrics_from_cm(cm)
+        support = cm.sum(axis=1).astype(np.int64, copy=False)
+        valid = support > 0
+        support_sum = float(np.sum(support))
+        weighted_f1 = float(np.sum(f1 * support) / support_sum) if support_sum > 0 else 0.0
+
+        macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
+        specificity = _specificity_from_cm(cm)
+        macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
+
+        fall_fbeta, fall_prec, fall_rec = _one_vs_rest_fbeta_from_cm(cm, fall_class_idx, beta=ckpt_beta_f)
+        if ckpt_metric == "top1":
+            ckpt_score = float(top1)
+        elif ckpt_metric == "balanced_acc":
+            ckpt_score = float(balanced_acc)
+        else:
+            ckpt_score = float(ckpt_w_f) * float(fall_fbeta) + (1.0 - float(ckpt_w_f)) * float(macro_f1)
+
+        metrics = EvalMetrics(
+            n_samples=int(len(y_true)),
+            loss=float(loss_avg),
+            top1=float(top1),
+            top5=float(top5),
+            balanced_acc=float(balanced_acc),
+            macro_f1=float(macro_f1),
+            weighted_f1=float(weighted_f1),
+            fall_fbeta=float(fall_fbeta),
+            fall_precision=float(fall_prec),
+            fall_recall=float(fall_rec),
+            ckpt_metric=str(ckpt_metric),
+            ckpt_w=float(ckpt_w_f),
+            ckpt_beta=float(ckpt_beta_f),
+            fall_class_idx=int(fall_class_idx),
+            ckpt_score=float(ckpt_score),
+        )
+        last_metrics = metrics
+
+        print(
+            f"[{split_name}] Val: top1={metrics.top1:.3f}, balAcc={metrics.balanced_acc:.3f}, "
+            f"macroF1={metrics.macro_f1:.3f}, fallF{metrics.ckpt_beta:g}={metrics.fall_fbeta:.3f}, "
+            f"ckptScore={metrics.ckpt_score:.3f}",
+            flush=True,
+        )
+
+        split_camera_str = ",".join(str(c) for c in split_camera_ids)
+        overall_rows.append({
+            "eval_split": split_name,
+            "camera": split_camera_str,
+            "n_samples": int(len(y_true)),
             "accuracy": float(top1),
             "recall": float(balanced_acc) * 100.0,
             "specificity": float(macro_specificity) * 100.0,
             "precision": float(macro_precision) * 100.0,
             "f1_score": float(macro_f1) * 100.0,
-        }])
-        .round(3)
-    )
+        })
 
-    fall_fbeta, fall_prec, fall_rec = _one_vs_rest_fbeta_from_cm(cm, fall_class_idx, beta=ckpt_beta_f)
+        for lab in labels:
+            per_class_rows.append({
+                "eval_split": split_name,
+                "camera": split_camera_str,
+                "class_id": int(lab),
+                "class_name": class_names[int(lab)] if 0 <= int(lab) < len(class_names) else str(lab),
+                "precision": float(precision[int(lab)]),
+                "recall": float(recall[int(lab)]),
+                "f1": float(f1[int(lab)]),
+                "support": int(support[int(lab)]),
+            })
 
-    if ckpt_metric == "top1":
-        ckpt_score = float(top1)
-    elif ckpt_metric == "balanced_acc":
-        ckpt_score = float(balanced_acc)
-    else:
-        ckpt_score = float(ckpt_w_f) * float(fall_fbeta) + (1.0 - float(ckpt_w_f)) * float(macro_f1)
+        summary = {
+            "dataset": dataset_name,
+            "data_pkl": src_pkl.as_posix(),
+            "test_mode": bool(args_cli.test),
+            "data_pkl_overridden": bool(args_cli.data_pkl is not None),
+            "eval_split": split_name,
+            "camera": split_camera_str,
+            "split_key": fr.split_key,
+            "subjects": args_cli.subjects,
+            "n_samples": metrics.n_samples,
+            "loss": metrics.loss,
+            "acc_top1": metrics.top1,
+            "acc_top5": metrics.top5,
+            "balanced_acc": metrics.balanced_acc,
+            "macro_f1": metrics.macro_f1,
+            "weighted_f1": metrics.weighted_f1,
+            "fall_class_idx": metrics.fall_class_idx,
+            "fall_fbeta": metrics.fall_fbeta,
+            "fall_precision": metrics.fall_precision,
+            "fall_recall": metrics.fall_recall,
+            "ckpt_metric": metrics.ckpt_metric,
+            "ckpt_w": metrics.ckpt_w,
+            "ckpt_beta": metrics.ckpt_beta,
+            "ckpt_score": metrics.ckpt_score,
+            "checkpoint": ckpt_path.as_posix(),
+            "config": Path(args_cli.config).expanduser().resolve().as_posix(),
+            "device": str(device),
+            "batch_size": int(args_cli.batch_size),
+            "num_workers": int(args_cli.num_workers),
+            "frame_step": int(frame_step),
+            "clip_len_raw": int(clip_len_raw),
+            "clip_len_sampled": int(clip_len_eval),
+        }
+        if args_cli.fall_class_ids:
+            fall_ids = set(int(x) for x in args_cli.fall_class_ids)
+            summary.update(_binary_metrics(y_true, y_pred, fall_ids))
+        summary_rows.append(summary)
 
-    metrics = EvalMetrics(
-        n_samples=int(len(y_true)),
-        loss=float(loss_avg),
-        top1=float(top1),
-        top5=float(top5),
-        balanced_acc=float(balanced_acc),
-        macro_f1=float(macro_f1),
-        weighted_f1=float(weighted_f1),
-        fall_fbeta=float(fall_fbeta),
-        fall_precision=float(fall_prec),
-        fall_recall=float(fall_rec),
-        ckpt_metric=str(ckpt_metric),
-        ckpt_w=float(ckpt_w_f),
-        ckpt_beta=float(ckpt_beta_f),
-        fall_class_idx=int(fall_class_idx),
-        ckpt_score=float(ckpt_score),
-    )
+        cm_csv = out_dir / f"confusion_matrix_{split_slug}.csv"
+        cm_norm = cm.astype(np.float64)
+        row_sums = cm_norm.sum(axis=1, keepdims=True) + 1e-9
+        cm_norm = cm_norm / row_sums
+        pd.DataFrame(
+            cm_norm,
+            index=[class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels],
+            columns=[class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels],
+        ).to_csv(cm_csv)
 
-    # Print training-style metrics summary (matches train_action_weighted_balanced.py)
-    print(
-        f"Val: top1={metrics.top1:.3f}, balAcc={metrics.balanced_acc:.3f}, "
-        f"macroF1={metrics.macro_f1:.3f}, fallF{metrics.ckpt_beta:g}={metrics.fall_fbeta:.3f}, "
-        f"ckptScore={metrics.ckpt_score:.3f}",
-        flush=True,
-    )
+        cm_png_name = f"confusion_matrix_{split_slug}.png"
+        cm_png = plots_dir / cm_png_name
+        _plot_confusion_matrix(
+            cm,
+            class_names=[class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels],
+            out_path=cm_png,
+            normalize=True,
+        )
+        confusion_imgs.append((split_name, f"{plots_dir.name}/{cm_png_name}"))
+
+        split_per_class_df = pd.DataFrame([r for r in per_class_rows if r["eval_split"] == split_name])
+        f1_png_name = f"f1_per_class_{split_slug}.png"
+        f1_png = plots_dir / f1_png_name
+        _plot_f1_bar(split_per_class_df, out_path=f1_png)
+        f1_imgs.append((split_name, f"{plots_dir.name}/{f1_png_name}"))
+
+    if not summary_rows:
+        raise RuntimeError("No evaluation splits were produced.")
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(["eval_split"]).reset_index(drop=True)
+    overall_df = pd.DataFrame(overall_rows).sort_values(["eval_split"]).reset_index(drop=True).round(3)
+    per_class_df = pd.DataFrame(per_class_rows).sort_values(["eval_split", "class_id"]).reset_index(drop=True)
+
     print("\nOverall metrics (%):", flush=True)
     print(overall_df.to_string(index=False), flush=True)
-
-    labels = list(range(action_classes))
-    per_class_df = pd.DataFrame({
-        "class_id": labels,
-        "class_name": [class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels],
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "support": support,
-    })
-
-    # Summary CSV
-    summary = {
-        "dataset": dataset_name,
-        "split_key": fr.split_key,
-        "subjects": args_cli.subjects,
-        "n_samples": metrics.n_samples,
-        "loss": metrics.loss,
-        "acc_top1": metrics.top1,
-        "acc_top5": metrics.top5,
-        "balanced_acc": metrics.balanced_acc,
-        "macro_f1": metrics.macro_f1,
-        "weighted_f1": metrics.weighted_f1,
-        "fall_class_idx": metrics.fall_class_idx,
-        "fall_fbeta": metrics.fall_fbeta,
-        "fall_precision": metrics.fall_precision,
-        "fall_recall": metrics.fall_recall,
-        "ckpt_metric": metrics.ckpt_metric,
-        "ckpt_w": metrics.ckpt_w,
-        "ckpt_beta": metrics.ckpt_beta,
-        "ckpt_score": metrics.ckpt_score,
-        "checkpoint": ckpt_path.as_posix(),
-        "config": Path(args_cli.config).expanduser().resolve().as_posix(),
-        "device": str(device),
-        "batch_size": int(args_cli.batch_size),
-        "num_workers": int(args_cli.num_workers),
-        "frame_step": int(frame_step),
-        "clip_len_raw": int(clip_len_raw),
-        "clip_len_sampled": int(clip_len_eval),
-    }
-
-    extra_html = ""
-    if args_cli.fall_class_ids:
-        fall_ids = set(int(x) for x in args_cli.fall_class_ids)
-        summary.update(_binary_metrics(y_true, y_pred, fall_ids))
-        extra_html = f"""
-  <h2>Binary fall vs no-fall</h2>
-  <p>Fall class ids: <code>{sorted(fall_ids)}</code></p>
-"""
-
-    summary_df = pd.DataFrame([summary])
 
     # Save CSVs
     summary_csv = out_dir / "metrics_summary.csv"
@@ -1111,17 +1302,15 @@ def main() -> None:
     summary_df.to_csv(summary_csv, index=False)
     per_class_df.to_csv(per_class_csv, index=False)
 
-    # Plots
-    _plot_confusion_matrix(
-        cm,
-        class_names=[class_names[int(i)] if 0 <= int(i) < len(class_names) else str(i) for i in labels],
-        out_path=plots_dir / "confusion_matrix.png",
-        normalize=True,
-    )
-    _plot_f1_bar(per_class_df, out_path=plots_dir / "f1_per_class.png")
-
     # Report
     report_path = out_dir / "report.html"
+    extra_html = ""
+    if args_cli.fall_class_ids:
+        fall_ids = sorted(set(int(x) for x in args_cli.fall_class_ids))
+        extra_html = f"""
+  <h2>Binary fall vs no-fall</h2>
+  <p>Fall class ids: <code>{fall_ids}</code></p>
+"""
     _make_html_report(
         summary_df,
         overall_df,
@@ -1129,12 +1318,18 @@ def main() -> None:
         out_dir=out_dir,
         plots_dir=plots_dir,
         out_path=report_path,
+        confusion_imgs=confusion_imgs,
+        f1_imgs=f1_imgs,
         extra_html=extra_html,
     )
 
     # Print final summary line (matches MotionBERT validate output style)
+    if last_metrics is None:
+        raise RuntimeError("No metrics were produced.")
     print(
-        f"Loss {metrics.loss:.4f} \tAcc@1 {metrics.top1:.3f} \tAcc@5 {metrics.top5:.3f} \tMacroF1 {metrics.macro_f1:.3f}",
+        f"[last split={summary_df.iloc[-1]['eval_split']}] "
+        f"Loss {last_metrics.loss:.4f} \tAcc@1 {last_metrics.top1:.3f} \tAcc@5 {last_metrics.top5:.3f} \t"
+        f"MacroF1 {last_metrics.macro_f1:.3f}",
         flush=True,
     )
     print(f"Saved: {summary_csv.as_posix()}", flush=True)
