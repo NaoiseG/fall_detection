@@ -1,5 +1,6 @@
 const classificationSelect = document.getElementById("classification-model");
 const keypointSelect = document.getElementById("keypoint-model");
+const keypointPrecisionSelect = document.getElementById("keypoint-precision");
 const videoSelect = document.getElementById("video-select");
 const windowSizeInput = document.getElementById("window-size");
 const strideOverlapInput = document.getElementById("stride-overlap");
@@ -47,6 +48,18 @@ function setRunReady() {
   }
   runButton.disabled = !videoSelect.value;
   runButton.textContent = "Run";
+}
+
+function syncPrecisionControl() {
+  if (!keypointSelect || !keypointPrecisionSelect) {
+    return;
+  }
+
+  const fp16Supported = keypointSelect.value === "ultralytics-yolo11l";
+  if (!fp16Supported) {
+    keypointPrecisionSelect.value = "FP32";
+  }
+  keypointPrecisionSelect.disabled = !fp16Supported;
 }
 
 function clearFrameQueue() {
@@ -437,6 +450,7 @@ async function runInference() {
   const payload = {
     classification_model: classificationSelect.value,
     keypoint_model: keypointSelect.value,
+    keypoint_precision: keypointPrecisionSelect ? keypointPrecisionSelect.value : "FP32",
     video: videoSelect.value,
     T: knobs.T,
     stride: knobs.overlapPercent,
@@ -491,4 +505,11 @@ if (videoSelect) {
   });
 }
 
+if (keypointSelect) {
+  keypointSelect.addEventListener("change", () => {
+    syncPrecisionControl();
+  });
+}
+
+syncPrecisionControl();
 loadTestVideos();

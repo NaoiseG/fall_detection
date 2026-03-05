@@ -9,7 +9,13 @@ from werkzeug.utils import secure_filename
 
 from app.config import (
     CLASSIFICATION_MODELS,
+    CLASSIFICATION_WEIGHT_FILENAMES,
+    DEFAULT_KEYPOINT_PRECISION,
     KEYPOINT_MODELS,
+    KEYPOINT_PRECISIONS,
+    KEYPOINT_TO_CLASSIFICATION_SUBDIR,
+    KEYPOINT_YOLO_FP16_WEIGHT_FILENAMES,
+    KEYPOINT_YOLO_WEIGHT_FILENAMES,
     VIDEO_EXTENSIONS,
     get_test_videos_dir,
     get_web_app_root,
@@ -83,7 +89,7 @@ def _infer_keypoint_backend(model_name: str, model_path: Path) -> str:
     return "yolo"
 
 
-def _resolve_relative_model_path(root: Path, relative_path: str, model_kind: str) -> Path:
+def _resolve_relative_path(root: Path, relative_path: str, model_kind: str) -> Path:
     rel_path = Path(relative_path)
     if rel_path.is_absolute():
         raise ValueError(f"{model_kind} path must be relative.")
@@ -94,10 +100,65 @@ def _resolve_relative_model_path(root: Path, relative_path: str, model_kind: str
     except ValueError as error:
         raise ValueError(f"Invalid {model_kind} model path.") from error
 
-    if not resolved.is_file():
-        raise FileNotFoundError(f"Missing {model_kind} model weights: {resolved}")
-
     return resolved
+
+
+def _find_named_file_recursive(*, search_root: Path, expected_filename: str, model_kind: str) -> Path:
+    if not search_root.exists() or not search_root.is_dir():
+        raise FileNotFoundError(f"Missing {model_kind} directory: {search_root}")
+
+    matches = [path for path in search_root.rglob(expected_filename) if path.is_file()]
+    if not matches:
+        raise FileNotFoundError(
+            f"Missing {model_kind} weights file '{expected_filename}' under: {search_root}"
+        )
+
+    # Deterministic preference: shallowest match first, then lexical path order.
+    matches.sort(key=lambda path: (len(path.relative_to(search_root).parts), path.as_posix().lower()))
+    return matches[0]
+
+
+def _resolve_classification_weights_path(*, classification_model: str, keypoint_model: str) -> Path:
+    classification_root = _classification_models_root()
+    model_dir_rel = CLASSIFICATION_MODELS[classification_model]
+    model_dir = _resolve_relative_path(
+        classification_root,
+        model_dir_rel,
+        "classification",
+    )
+    if not model_dir.exists() or not model_dir.is_dir():
+        raise FileNotFoundError(
+            f"Missing classification model directory for '{classification_model}': {model_dir}"
+        )
+
+    keypoint_variant = KEYPOINT_TO_CLASSIFICATION_SUBDIR.get(keypoint_model)
+    if not keypoint_variant:
+        raise ValueError(
+            f"Missing classification subdirectory mapping for keypoint model: {keypoint_model}"
+        )
+
+    variant_dir = (model_dir / keypoint_variant).resolve()
+    try:
+        variant_dir.relative_to(model_dir)
+    except ValueError as error:
+        raise ValueError("Invalid classification variant directory.") from error
+
+    if not variant_dir.exists() or not variant_dir.is_dir():
+        raise FileNotFoundError(
+            "Missing classification weights directory for "
+            f"classification_model='{classification_model}' and "
+            f"keypoint_model='{keypoint_model}': {variant_dir}"
+        )
+
+    expected_filename = CLASSIFICATION_WEIGHT_FILENAMES.get(classification_model)
+    if not expected_filename:
+        raise ValueError(f"Missing expected classification filename mapping for: {classification_model}")
+
+    return _find_named_file_recursive(
+        search_root=variant_dir,
+        expected_filename=expected_filename,
+        model_kind=f"classification model '{classification_model}' ({keypoint_variant})",
+    )
 
 
 def _validate_alphapose_bundle(root: Path) -> None:
@@ -116,45 +177,80 @@ def _validate_alphapose_bundle(root: Path) -> None:
         )
 
 
-def _ensure_keypoint_asset(*, model_name: str, relative_path: str) -> Path:
-    keypoint_root = _keypoint_models_root()
-    weights_rel_path = Path(relative_path)
-    if weights_rel_path.is_absolute():
-        raise ValueError("Keypoint model path must be relative.")
+def _normalize_keypoint_precision(raw_precision: Any) -> str:
+    if raw_precision is None:
+        return str(DEFAULT_KEYPOINT_PRECISION)
+    if not isinstance(raw_precision, str):
+        raise ValueError("Invalid keypoint precision selection.")
 
-    weights_path = (keypoint_root / weights_rel_path).resolve()
-    try:
-        weights_path.relative_to(keypoint_root)
-    except ValueError as error:
-        raise ValueError("Invalid keypoint model path.") from error
+    precision = str(raw_precision).strip().upper()
+    if precision not in set(KEYPOINT_PRECISIONS):
+        raise ValueError("Invalid keypoint precision selection.")
+    return precision
+
+
+def _resolve_yolo_weight_filename(*, model_name: str, keypoint_precision: str) -> str:
+    precision = _normalize_keypoint_precision(keypoint_precision)
+    if precision == "FP16":
+        fp16_filename = KEYPOINT_YOLO_FP16_WEIGHT_FILENAMES.get(model_name)
+        if fp16_filename:
+            return fp16_filename
+        raise ValueError(
+            f"FP16 precision is not available for keypoint model: {model_name}"
+        )
+
+    expected_filename = KEYPOINT_YOLO_WEIGHT_FILENAMES.get(model_name)
+    if expected_filename:
+        return expected_filename
+    raise ValueError(f"Missing expected YOLO filename mapping for keypoint model: {model_name}")
+
+
+def _ensure_keypoint_asset(*, model_name: str, relative_path: str, keypoint_precision: str) -> Path:
+    keypoint_root = _keypoint_models_root()
+    weights_path = _resolve_relative_path(keypoint_root, relative_path, "keypoint")
 
     backend = _infer_keypoint_backend(model_name, weights_path)
 
     if backend == "vitpose":
+        if _normalize_keypoint_precision(keypoint_precision) != "FP32":
+            raise ValueError("FP16 precision is only supported for Ultralytics YOLO keypoint models.")
         if weights_path.exists() and weights_path.is_file():
             raise ValueError("Invalid ViTPose model path. Expected a directory.")
         weights_path.mkdir(parents=True, exist_ok=True)
         return weights_path
 
-    if weights_path.is_dir():
+    if backend == "alphapose":
+        if _normalize_keypoint_precision(keypoint_precision) != "FP32":
+            raise ValueError("FP16 precision is only supported for Ultralytics YOLO keypoint models.")
+        if not weights_path.exists() or not weights_path.is_dir():
+            raise FileNotFoundError(f"Missing AlphaPose bundle directory: {weights_path}")
         _validate_alphapose_bundle(weights_path)
         return weights_path
 
-    if weights_path.is_file():
+    expected_filename = _resolve_yolo_weight_filename(
+        model_name=model_name,
+        keypoint_precision=keypoint_precision,
+    )
+
+    # Backward compatibility: accept explicit file paths if they match the expected filename.
+    if weights_path.exists() and weights_path.is_file():
+        if weights_path.name.lower() != expected_filename.lower():
+            raise FileNotFoundError(
+                f"Unexpected keypoint checkpoint filename for '{model_name}': {weights_path.name}. "
+                f"Expected '{expected_filename}'."
+            )
         return weights_path
 
-    weights_path.parent.mkdir(parents=True, exist_ok=True)
+    if not weights_path.exists() or not weights_path.is_dir():
+        raise FileNotFoundError(
+            f"Missing Ultralytics keypoint directory for '{model_name}': {weights_path}"
+        )
 
-    # Use Ultralytics' official asset downloader for missing checkpoint files.
-    if weights_path.suffix.lower() in {".pt", ".onnx", ".engine"}:
-        from ultralytics.utils.downloads import attempt_download_asset
-
-        attempt_download_asset(str(weights_path))
-
-    if not weights_path.is_file():
-        raise FileNotFoundError(f"Missing keypoint model asset: {weights_path}")
-
-    return weights_path
+    return _find_named_file_recursive(
+        search_root=weights_path,
+        expected_filename=expected_filename,
+        model_kind=f"keypoint model '{model_name}'",
+    )
 
 
 def _validate_float(value: Any, *, name: str, min_value: float = 0.0) -> float:
@@ -185,6 +281,9 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
 
     classification_model = payload.get("classification_model")
     keypoint_model = payload.get("keypoint_model")
+    keypoint_precision = _normalize_keypoint_precision(
+        payload.get("keypoint_precision", payload.get("precision", DEFAULT_KEYPOINT_PRECISION))
+    )
     video_name = payload.get("video")
     if video_name is None:
         video_name = payload.get("video_name")
@@ -209,15 +308,14 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     if not resolved_video_path.is_file():
         raise ValueError("Selected video file does not exist.")
 
-    classification_rel = CLASSIFICATION_MODELS[classification_model]
-    classification_weights_path = _resolve_relative_model_path(
-        _classification_models_root(),
-        classification_rel,
-        "classification",
-    )
     keypoint_weights_path = _ensure_keypoint_asset(
         model_name=keypoint_model,
         relative_path=KEYPOINT_MODELS[keypoint_model],
+        keypoint_precision=keypoint_precision,
+    )
+    classification_weights_path = _resolve_classification_weights_path(
+        classification_model=classification_model,
+        keypoint_model=keypoint_model,
     )
     keypoint_backend = _infer_keypoint_backend(keypoint_model, keypoint_weights_path)
 
@@ -257,6 +355,7 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         "video_path": resolved_video_path,
         "classification_model": classification_model,
         "keypoint_model": keypoint_model,
+        "keypoint_precision": keypoint_precision,
         "classification_model_path": classification_weights_path,
         "keypoint_model_path": keypoint_weights_path,
         "inference_options": inference_options,
