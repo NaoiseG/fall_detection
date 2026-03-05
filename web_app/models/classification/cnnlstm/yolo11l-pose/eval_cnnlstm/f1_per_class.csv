@@ -1,0 +1,22 @@
+model,eval_split,class_id,class_name,f1
+cnnlstm,camera_1,0,Fall,0.9122807017538554
+cnnlstm,camera_1,1,Walking,0.9766233766228716
+cnnlstm,camera_1,2,Standing,0.9886104783594044
+cnnlstm,camera_1,3,Sitting,0.9974424552424616
+cnnlstm,camera_1,4,Picking up an object,0.9090909090902478
+cnnlstm,camera_1,5,Jumping,0.9793814432984592
+cnnlstm,camera_1,6,Laying,0.9838472834062517
+cnnlstm,camera_2,0,Fall,0.931034482758091
+cnnlstm,camera_2,1,Walking,0.9260273972597708
+cnnlstm,camera_2,2,Standing,0.9908675799081713
+cnnlstm,camera_2,3,Sitting,0.9948979591831683
+cnnlstm,camera_2,4,Picking up an object,0.9090909090902478
+cnnlstm,camera_2,5,Jumping,0.8738738738733718
+cnnlstm,camera_2,6,Laying,0.9136904761899736
+cnnlstm,combined,0,Fall,0.9217391304342684
+cnnlstm,combined,1,Walking,0.951999999999498
+cnnlstm,combined,2,Standing,0.9897377423028044
+cnnlstm,combined,3,Sitting,0.9961685823749763
+cnnlstm,combined,4,Picking up an object,0.9090909090903305
+cnnlstm,combined,5,Jumping,0.9230769230764196
+cnnlstm,combined,6,Laying,0.9490022172943988

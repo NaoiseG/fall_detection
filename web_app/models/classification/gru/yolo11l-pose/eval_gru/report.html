@@ -1,0 +1,440 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Model Evaluation Report</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111;}
+    h1,h2{margin:0.2em 0;}
+    .tbl{border-collapse:collapse;width:100%;margin:12px 0;}
+    .tbl th,.tbl td{border:1px solid #ddd;padding:8px;font-size:14px;}
+    .tbl th{background:#f6f6f6;text-align:left;}
+    img{max-width:100%;height:auto;border:1px solid #eee;border-radius:10px;padding:8px;background:#fff;}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+    code{background:#f6f6f6;padding:2px 6px;border-radius:6px;}
+    </style>
+</head>
+<body>
+  <h1>Model Evaluation Report</h1>
+  <p>
+    Binary fall/no-fall metrics are computed by collapsing multi-class labels using the provided fall class ids,
+    then macro-averaging precision and sensitivity over the two binary classes.
+  </p>
+
+  <h2>Summary</h2>
+  <table border="1" class="dataframe tbl">
+  <thead>
+    <tr style="text-align: right;">
+      <th>model</th>
+      <th>eval_split</th>
+      <th>n_samples</th>
+      <th>params_m</th>
+      <th>macro_f1</th>
+      <th>binary_mode</th>
+      <th>p_fall_source</th>
+      <th>threshold</th>
+      <th>beta</th>
+      <th>tune_subjects</th>
+      <th>tuned_threshold</th>
+      <th>tuned_precision_fall</th>
+      <th>tuned_recall_fall</th>
+      <th>tuned_fbeta</th>
+      <th>binary_precision_avg</th>
+      <th>binary_sensitivity_avg</th>
+      <th>binary_precision_fall</th>
+      <th>binary_sensitivity_fall</th>
+      <th>binary_precision_no_fall</th>
+      <th>binary_sensitivity_no_fall</th>
+      <th>binary_f1_avg</th>
+      <th>binary_f1_fall</th>
+      <th>binary_f1_no_fall</th>
+      <th>weights</th>
+      <th>camera</th>
+      <th>subjects</th>
+      <th>frame_step</th>
+      <th>window_T_raw</th>
+      <th>window_stride_raw</th>
+      <th>window_T_sampled</th>
+      <th>window_stride_sampled</th>
+      <th>normalize_mode</th>
+      <th>missing_mode</th>
+      <th>interp_mode</th>
+      <th>interp_group</th>
+      <th>rp_center_mode</th>
+      <th>rp_img_w</th>
+      <th>rp_img_h</th>
+      <th>feature_mode</th>
+      <th>motion_xy_scale</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>1079</td>
+      <td>0.228487</td>
+      <td>0.883114</td>
+      <td>threshold</td>
+      <td>activity_softmax</td>
+      <td>0.5</td>
+      <td>2.0</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>0.750000</td>
+      <td>0.987167</td>
+      <td>0.500000</td>
+      <td>1.000000</td>
+      <td>1.000000</td>
+      <td>0.974335</td>
+      <td>0.826834</td>
+      <td>0.666667</td>
+      <td>0.987000</td>
+      <td>models/gru/2026-03-04_18-11-40_266918/gru_best.pt</td>
+      <td>1</td>
+      <td>16,17</td>
+      <td>1</td>
+      <td>64</td>
+      <td>32</td>
+      <td>64</td>
+      <td>32</td>
+      <td>paper_rp</td>
+      <td>zeros_only</td>
+      <td>paper_group_linear</td>
+      <td>100</td>
+      <td>pixel</td>
+      <td>640</td>
+      <td>480</td>
+      <td>full</td>
+      <td>0.25</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>1079</td>
+      <td>0.228487</td>
+      <td>0.867824</td>
+      <td>threshold</td>
+      <td>activity_softmax</td>
+      <td>0.5</td>
+      <td>2.0</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>0.782125</td>
+      <td>0.971976</td>
+      <td>0.565217</td>
+      <td>0.962963</td>
+      <td>0.999032</td>
+      <td>0.980989</td>
+      <td>0.851128</td>
+      <td>0.712329</td>
+      <td>0.989928</td>
+      <td>models/gru/2026-03-04_18-11-40_266918/gru_best.pt</td>
+      <td>2</td>
+      <td>16,17</td>
+      <td>1</td>
+      <td>64</td>
+      <td>32</td>
+      <td>64</td>
+      <td>32</td>
+      <td>paper_rp</td>
+      <td>zeros_only</td>
+      <td>paper_group_linear</td>
+      <td>100</td>
+      <td>pixel</td>
+      <td>640</td>
+      <td>480</td>
+      <td>full</td>
+      <td>0.25</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>2158</td>
+      <td>0.228487</td>
+      <td>0.875341</td>
+      <td>threshold</td>
+      <td>activity_softmax</td>
+      <td>0.5</td>
+      <td>2.0</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>None</td>
+      <td>0.764757</td>
+      <td>0.979572</td>
+      <td>0.530000</td>
+      <td>0.981481</td>
+      <td>0.999514</td>
+      <td>0.977662</td>
+      <td>0.838389</td>
+      <td>0.688312</td>
+      <td>0.988467</td>
+      <td>models/gru/2026-03-04_18-11-40_266918/gru_best.pt</td>
+      <td>1,2</td>
+      <td>16,17</td>
+      <td>1</td>
+      <td>64</td>
+      <td>32</td>
+      <td>64</td>
+      <td>32</td>
+      <td>paper_rp</td>
+      <td>zeros_only</td>
+      <td>paper_group_linear</td>
+      <td>100</td>
+      <td>pixel</td>
+      <td>640</td>
+      <td>480</td>
+      <td>full</td>
+      <td>0.25</td>
+    </tr>
+  </tbody>
+</table>
+
+  <h2>Overall metrics</h2>
+  <p style="margin:0 0 6px 0;color:#444;font-size:13px;">
+    Values are percentages. Precision/recall/specificity/F1 are macro-averaged over classes present in this split.
+  </p>
+  <table border="1" class="dataframe tbl">
+  <thead>
+    <tr style="text-align: right;">
+      <th>model</th>
+      <th>eval_split</th>
+      <th>camera</th>
+      <th>n_samples</th>
+      <th>accuracy</th>
+      <th>recall</th>
+      <th>specificity</th>
+      <th>precision</th>
+      <th>f1_score</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>1</td>
+      <td>1079</td>
+      <td>93.049</td>
+      <td>94.577</td>
+      <td>98.874</td>
+      <td>85.522</td>
+      <td>88.311</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>2</td>
+      <td>1079</td>
+      <td>89.991</td>
+      <td>93.024</td>
+      <td>98.334</td>
+      <td>84.167</td>
+      <td>86.782</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>1,2</td>
+      <td>2158</td>
+      <td>91.520</td>
+      <td>93.800</td>
+      <td>98.604</td>
+      <td>84.530</td>
+      <td>87.534</td>
+    </tr>
+  </tbody>
+</table>
+
+  <div class="grid">
+    <div>
+      <h2>Macro F1</h2>
+      <img src="plots/macro_f1.png" alt="Macro F1"/>
+    </div>
+    <div>
+      <h2>Binary Sensitivity and Precision</h2>
+      <img src="plots/binary_metrics.png" alt="Binary metrics"/>
+    </div>
+  </div>
+
+  <h2>F1 per class (multi-class)</h2>
+  <table border="1" class="dataframe tbl">
+  <thead>
+    <tr style="text-align: right;">
+      <th>model</th>
+      <th>eval_split</th>
+      <th>class_id</th>
+      <th>class_name</th>
+      <th>f1</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>0</td>
+      <td>Fall</td>
+      <td>0.627907</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>1</td>
+      <td>Walking</td>
+      <td>0.909091</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>2</td>
+      <td>Standing</td>
+      <td>0.957346</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>3</td>
+      <td>Sitting</td>
+      <td>0.915789</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>4</td>
+      <td>Picking up an object</td>
+      <td>0.857143</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>5</td>
+      <td>Jumping</td>
+      <td>0.943005</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_1</td>
+      <td>6</td>
+      <td>Laying</td>
+      <td>0.971514</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>0</td>
+      <td>Fall</td>
+      <td>0.650000</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>1</td>
+      <td>Walking</td>
+      <td>0.868571</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>2</td>
+      <td>Standing</td>
+      <td>0.974828</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>3</td>
+      <td>Sitting</td>
+      <td>0.848889</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>4</td>
+      <td>Picking up an object</td>
+      <td>0.857143</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>5</td>
+      <td>Jumping</td>
+      <td>0.959596</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>camera_2</td>
+      <td>6</td>
+      <td>Laying</td>
+      <td>0.915739</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>0</td>
+      <td>Fall</td>
+      <td>0.638554</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>1</td>
+      <td>Walking</td>
+      <td>0.890080</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>2</td>
+      <td>Standing</td>
+      <td>0.966240</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>3</td>
+      <td>Sitting</td>
+      <td>0.879518</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>4</td>
+      <td>Picking up an object</td>
+      <td>0.857143</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>5</td>
+      <td>Jumping</td>
+      <td>0.951407</td>
+    </tr>
+    <tr>
+      <td>gru</td>
+      <td>combined</td>
+      <td>6</td>
+      <td>Laying</td>
+      <td>0.944444</td>
+    </tr>
+  </tbody>
+</table>
+
+  <h2>Confusion matrices</h2>
+  <p>Rows are true labels, columns are predicted labels. Labels follow the merged 7-class scheme.</p>
+  <div class="grid">
+    <div><h3>gru [camera_1]</h3><img src='plots/confusion_matrix_gru_camera_1.png' alt='Confusion matrix gru camera_1'/></div>
+<div><h3>gru [camera_2]</h3><img src='plots/confusion_matrix_gru_camera_2.png' alt='Confusion matrix gru camera_2'/></div>
+<div><h3>gru [combined]</h3><img src='plots/confusion_matrix_gru_combined.png' alt='Confusion matrix gru combined'/></div>
+  </div>
+
+  <p style="margin-top:24px;font-size:13px;color:#444;">
+    Generated by <code>models.eval_models</code>.
+  </p>
+</body>
+</html>

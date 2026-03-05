@@ -76,10 +76,19 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from sklearn.metrics import precision_recall_fscore_support, f1_score, precision_recall_curve
+from sklearn.metrics import precision_recall_fscore_support, precision_recall_curve, confusion_matrix
 
 # Same dataset pipeline as training
-from dataset import find_keypoints_npzs_subjects, load_windows_from_npzs, WindowTensorDataset
+from dataset_helpers.dataset import (
+    find_keypoints_npzs_subjects,
+    load_windows_from_npzs,
+    WindowTensorDataset,
+    detect_label_convention_from_npzs,
+    get_new_label_names,
+    detect_label_convention as _detect_label_convention,
+    remap_label as _remap_label,
+    get_fall_merge_set as _get_fall_merge_set,
+)
 
 # Same model definitions as training
 from .tcn.simple_tcn import TCNBaseline
@@ -90,7 +99,77 @@ from .mlp.simple_mlp import MLPBaseline
 from .stgcn.simple_stgcn import STGCNBaseline
 
 # NEW: CNN + LSTM two-head model
-from .cnnlstm.cnn_lstm_two_head import CNNLSTMTwoHead
+from .cnnlstm.cnn_lstm import CNNLSTMTwoHead
+from .rf.train_rf import windows_to_sklearn_features
+
+
+import inspect
+import pickle
+
+
+# =============================================================================
+# Label scheme: merge fall subclasses into a single "Fall" class (7 classes total)
+#
+# dataset.load_windows_from_npzs returns labels in merged 7-class space (0..6).
+# In this scheme, Fall is always class id 0.
+# =============================================================================
+NUM_CLASSES_MERGED = 7
+FALL_CLASS_ID = 0
+
+# FALL_MERGE_SET and NEW_LABEL_NAMES are filled after we scan NPZ labels.
+FALL_MERGE_SET: set[int] = set()
+NEW_LABEL_NAMES: list[str] = []
+
+def detect_label_convention(observed_labels) -> str:
+    """Wrapper that calls the shared implementation in dataset.py."""
+    return _detect_label_convention(observed_labels)
+
+def remap_label(original_label: int, convention: str) -> int:
+    """Wrapper that calls the shared implementation in dataset.py."""
+    return _remap_label(original_label, convention)
+
+def fall_merge_set(convention: str) -> set[int]:
+    """Return the raw fall ID set for the detected convention."""
+    return _get_fall_merge_set(convention)
+
+def torch_load_safe(path: Path, map_location: str = "cpu"):
+    """Load a torch checkpoint robustly across PyTorch versions.
+
+    PyTorch 2.6+ defaults torch.load(weights_only=True), which can fail when the
+    checkpoint dict contains NumPy scalar metadata (common in our saved ckpts).
+    We first retry with a small allowlist under weights-only loading, then fall
+    back to a full unpickle load if needed.
+    """
+    try:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError:
+        # Retry with an allowlist for NumPy scalar metadata (PyTorch 2.6+).
+        try:
+            import numpy as _np
+            try:
+                _np_scalar = _np.core.multiarray.scalar
+            except Exception:
+                _np_scalar = _np._core.multiarray.scalar  # type: ignore[attr-defined]
+
+            try:
+                from torch.serialization import safe_globals  # PyTorch 2.6+
+                with safe_globals([_np_scalar]):
+                    return torch.load(path, map_location=map_location)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Final fallback: full unpickle (only safe for trusted checkpoints).
+        try:
+            sig = inspect.signature(torch.load)
+            if "weights_only" in sig.parameters:
+                return torch.load(path, map_location=map_location, weights_only=False)
+        except Exception:
+            pass
+
+        # Older torch versions (or if weights_only isn't a valid kwarg)
+        return torch.load(path, map_location=map_location)
 
 
 def slug_models(models: List[str], max_len: int = 80) -> str:
@@ -316,6 +395,61 @@ def predict_probs(model: torch.nn.Module, loader: DataLoader, device: str) -> Tu
     return y_true_np, probs_np, None
 
 
+def pickle_load_safe(path: Path):
+    try:
+        with path.open("rb") as f:
+            return pickle.load(f)
+    except ModuleNotFoundError as e:
+        raise SystemExit(
+            "Failed to load pickle checkpoint. If this is an RF model, you likely need scikit-learn installed.\n"
+            "Install it with: pip install scikit-learn\n"
+            f"Import error: {e}"
+        )
+
+
+def rf_predict_probs(
+    clf,
+    X_windows: np.ndarray,
+    feature_mode: str,
+    num_classes: int,
+    expected_feature_dim: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Returns:
+      probs: (N,C) aligned to class ids 0..C-1
+    """
+    X_feat = windows_to_sklearn_features(X_windows, mode=str(feature_mode))
+    if expected_feature_dim is not None and int(expected_feature_dim) > 0 and int(X_feat.shape[1]) != int(expected_feature_dim):
+        raise ValueError(
+            f"RF feature_dim mismatch: extracted={int(X_feat.shape[1])}, ckpt feature_dim={int(expected_feature_dim)} "
+            f"(mode={str(feature_mode)})"
+        )
+
+    if not hasattr(clf, "predict_proba"):
+        raise TypeError("RF checkpoint model does not implement predict_proba().")
+
+    raw = clf.predict_proba(X_feat)
+    raw = np.asarray(raw)
+    if raw.ndim != 2:
+        raise ValueError(f"Expected predict_proba output (N,C). Got shape {getattr(raw, 'shape', None)}")
+
+    num_classes = int(num_classes)
+    out = np.zeros((int(raw.shape[0]), int(num_classes)), dtype=np.float32)
+
+    classes = getattr(clf, "classes_", None)
+    if classes is None:
+        if int(raw.shape[1]) != int(num_classes):
+            raise ValueError(f"RF predict_proba returned C={int(raw.shape[1])}, expected num_classes={int(num_classes)}")
+        return raw.astype(np.float32, copy=False)
+
+    classes_np = np.asarray(classes).astype(np.int64, copy=False).reshape(-1)
+    for j, cls_id in enumerate(classes_np.tolist()):
+        if 0 <= int(cls_id) < int(num_classes) and j < int(raw.shape[1]):
+            out[:, int(cls_id)] = raw[:, int(j)]
+
+    return out
+
+
 def collapse_to_binary(y: np.ndarray, fall_class_ids_0based: List[int]) -> np.ndarray:
     fall = set(int(x) for x in fall_class_ids_0based)
     return np.array([1 if int(v) in fall else 0 for v in y], dtype=int)
@@ -343,8 +477,53 @@ def pick_threshold_fbeta(y_true_bin: np.ndarray, p_fall: np.ndarray, beta: float
     return float(th[best_i]), float(prec[best_i]), float(rec[best_i]), float(fbeta[best_i])
 
 
+def specificity_from_cm(cm: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    One-vs-rest specificity (true negative rate) per class from a multi-class confusion matrix.
+
+    cm shape: (C, C) with rows=true labels, cols=predicted labels.
+    """
+    cm = cm.astype(np.float64)
+
+    total = float(np.sum(cm))
+    tp = np.diag(cm)
+    fp = cm.sum(axis=0) - tp
+    fn = cm.sum(axis=1) - tp
+    tn = total - tp - fp - fn
+
+    return tn / (tn + fp + eps)
+
+
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
+
+
+def make_cm_plot(cm: np.ndarray, class_names: List[str], out_path: Path, title: str):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax)
+
+    tick_marks = np.arange(len(class_names))
+    ax.set_xticks(tick_marks)
+    ax.set_xticklabels(class_names, rotation=45, ha="right")
+    ax.set_yticks(tick_marks)
+    ax.set_yticklabels(class_names)
+    ax.set_ylabel("True")
+    ax.set_xlabel("Predicted")
+
+    fmt = "d" if np.issubdtype(cm.dtype, np.integer) else ".2f"
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            v = cm[i, j]
+            color = "white" if float(v) == 0.0 else "black"
+            ax.text(j, i, format(v, fmt), ha="center", va="center", color=color)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 
 def make_plots(summary_df: pd.DataFrame, plots_dir: Path):
@@ -374,7 +553,14 @@ def make_plots(summary_df: pd.DataFrame, plots_dir: Path):
     plt.close()
 
 
-def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir: Path, out_path: Path):
+def make_html_report(
+    summary_df: pd.DataFrame,
+    overall_df: pd.DataFrame,
+    f1_long: pd.DataFrame,
+    plots_dir: Path,
+    out_path: Path,
+    model_list: List[str],
+):
     def df_to_html(df: pd.DataFrame) -> str:
         return df.to_html(index=False, escape=False, classes="tbl")
 
@@ -388,6 +574,13 @@ def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir:
     .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
     code{background:#f6f6f6;padding:2px 6px;border-radius:6px;}
     """
+
+    conf_parts = []
+    for m in model_list:
+        p = plots_dir / f"confusion_matrix_{m}.png"
+        if p.exists():
+            conf_parts.append(f"<div><h3>{m}</h3><img src='{plots_dir.name}/confusion_matrix_{m}.png' alt='Confusion matrix {m}'/></div>")
+    conf_imgs = "\n".join(conf_parts) if conf_parts else "<p>No confusion matrices found.</p>"
 
     html = f"""<!doctype html>
 <html>
@@ -406,6 +599,12 @@ def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir:
   <h2>Summary</h2>
   {df_to_html(summary_df)}
 
+  <h2>Overall metrics</h2>
+  <p style="margin:0 0 6px 0;color:#444;font-size:13px;">
+    Values are percentages. Precision/recall/specificity/F1 are macro-averaged over classes present in this split.
+  </p>
+  {df_to_html(overall_df)}
+
   <div class="grid">
     <div>
       <h2>Macro F1</h2>
@@ -420,6 +619,12 @@ def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir:
   <h2>F1 per class (multi-class)</h2>
   {df_to_html(f1_long)}
 
+  <h2>Confusion matrices</h2>
+  <p>Rows are true labels, columns are predicted labels. Labels follow the merged 7-class scheme.</p>
+  <div class="grid">
+    {conf_imgs}
+  </div>
+
   <p style="margin-top:24px;font-size:13px;color:#444;">
     Generated by <code>models.eval_models</code>.
   </p>
@@ -431,10 +636,11 @@ def make_html_report(summary_df: pd.DataFrame, f1_long: pd.DataFrame, plots_dir:
 
 def main():
     # NEW: added "cnnlstm"
-    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm"]
+    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm", "rf"]
 
     parser = argparse.ArgumentParser(description="Evaluate trained models on UP-Fall windowed pose tensors.")
-    parser.add_argument("--models", nargs="+", required=True, help="Models to evaluate, e.g. --models tcn lstm")
+    parser.add_argument("--models", nargs="+", default=None, help="Models to evaluate, e.g. --models tcn lstm")
+    parser.add_argument("--all", action="store_true", help="Evaluate all models (overrides --models).")
     parser.add_argument("--camera", type=int, default=1, help="Camera index (default: 1)")
     parser.add_argument("--test-subjects", type=str, default="1-1", help="Test subject range like '1-5'")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64)")
@@ -452,17 +658,20 @@ def main():
         "--weights-name",
         type=str,
         default=None,
-        help="Override weights filename. If omitted uses '<model>_best.pt'.",
+        help="Override weights filename. If omitted uses '<model>_best.pt' (or '<model>_best.pkl' for rf).",
     )
     parser.add_argument("--out-dir", type=str, default="eval_outputs", help="Output directory")
     parser.add_argument("--use-conf", action="store_true", help="Use confidence channel (x,y,conf).")
     parser.add_argument("--no-conf", action="store_true", help="Disable confidence channel (use x,y only).")
+        # With the merged 7-class scheme, Fall is always class id 0 so you no longer
+    # need to pass fall class ids. This flag is kept only for backwards compatibility
+    # with older runs.
     parser.add_argument(
         "--fall-class-ids",
         nargs="+",
         type=int,
-        required=True,
-        help="Fall class ids in ORIGINAL label space (1-based). Example: --fall-class-ids 9 10 11",
+        default=None,
+        help="(Optional, legacy) Fall class ids in the ORIGINAL label space. Not needed for fall-merged 7-class models.",
     )
 
     # Binary decision options (deployment-style)
@@ -500,11 +709,42 @@ def main():
 
     # Preprocessing options
     parser.add_argument("--normalize", type=int, default=1, help="Normalise pose per frame (0/1).")
+    parser.add_argument(
+        "--normalize-mode",
+        type=str,
+        default="center_scale",
+        choices=["center_scale", "paper_rp"],
+        help="Normalisation mode when --normalize 1. center_scale=legacy translation+scale; paper_rp=paper Relative Position (translation only).",
+    )
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
     parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")
     parser.add_argument("--add-global", type=int, default=1, help="Add global features (0/1).")
     parser.add_argument("--conf-thres", type=float, default=0.2, help="Conf threshold for missing joints.")
     parser.add_argument("--max-interp-gap", type=int, default=5, help="Max gap (frames) for interpolation.")
+    parser.add_argument(
+        "--missing-mode",
+        type=str,
+        default="conf_thres",
+        choices=["conf_thres", "zeros_only", "conf_or_zeros"],
+        help="Missing-keypoint definition. conf_thres=legacy; zeros_only=paper; conf_or_zeros=union.",
+    )
+    parser.add_argument(
+        "--interp-mode",
+        type=str,
+        default="short_gap_hold",
+        choices=["short_gap_hold", "paper_group_linear"],
+        help="Interpolation strategy for missing keypoints. short_gap_hold=legacy; paper_group_linear=paper (requires --interp-group).",
+    )
+    parser.add_argument("--interp-group", type=int, default=100, help="Group size (frames) for paper_group_linear interpolation (default: 100).")
+    parser.add_argument(
+        "--rp-center-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "normalized_01", "pixel"],
+        help="Image center definition for --normalize-mode paper_rp. pixel requires --rp-img-w/--rp-img-h; auto infers [0,1] vs pixel from coords.",
+    )
+    parser.add_argument("--rp-img-w", type=int, default=None, help="Image width W for paper_rp when using pixel coordinates.")
+    parser.add_argument("--rp-img-h", type=int, default=None, help="Image height H for paper_rp when using pixel coordinates.")
     parser.add_argument("--T", type=int, default=64, help="Sliding window length T.")
     parser.add_argument("--stride", type=int, default=16, help="Sliding window stride.")
     parser.add_argument(
@@ -515,6 +755,18 @@ def main():
     )
     parser.add_argument("--min-valid-frac", type=float, default=0.3)
     parser.add_argument("--add-mask-channel", type=int, default=1)
+    parser.add_argument(
+        "--drop-ambig-share",
+        type=float,
+        default=0.0,
+        help="Drop windows where top-label share < this value (measured on valid frames). 0 disables.",
+    )
+    parser.add_argument(
+        "--drop-ambig-nonfall-only",
+        type=int,
+        default=1,
+        help="If 1, only drop ambiguous windows that contain no fall frames (helps preserve fall transitions).",
+    )
     args = parser.parse_args()
 
     normalize_cli = bool(args.normalize)
@@ -523,7 +775,12 @@ def main():
     add_global_cli = bool(args.add_global)
     add_mask_channel_cli = bool(args.add_mask_channel)
 
-    model_list = [m.lower().strip() for m in args.models]
+    if args.all:
+        model_list = ALL_MODELS
+    else:
+        if args.models is None or len(args.models) == 0:
+            raise SystemExit("You must pass --models <one or more> or use --all.")
+        model_list = [m.lower().strip() for m in args.models]
     unknown = sorted(set(model_list) - set(ALL_MODELS))
     if unknown:
         raise SystemExit(f"Unknown model(s): {unknown}. Valid: {ALL_MODELS}")
@@ -542,7 +799,17 @@ def main():
     if not test_npzs:
         raise RuntimeError("No test NPZs found. Check OUTPUT_ROOT, camera, and test subjects.")
 
-    fall_class_ids_0based = [int(x) - 1 for x in args.fall_class_ids]
+    # ---- Detect raw label convention once (1-11 vs 0-10), then keep it consistent ----
+    label_convention, label_stats = detect_label_convention_from_npzs(test_npzs)
+    NEW_LABEL_NAMES = get_new_label_names(label_convention)
+    labels_all = list(range(len(NEW_LABEL_NAMES))) #New ==========================================================
+    FALL_MERGE_SET = fall_merge_set(label_convention)
+    print(f"[labels] Using raw convention: {label_convention} | New labels: {NEW_LABEL_NAMES}")
+
+    # In the merged 7-class scheme, Fall is always class id 0.
+    # Keep legacy support: if user supplies --fall-class-ids, we can still interpret them
+    # for older checkpoints, but for fall-merged models we simply use [0].
+    fall_class_ids_0based = [FALL_CLASS_ID]
 
     # One unique output folder per eval run, includes timestamp + models list
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
@@ -557,13 +824,18 @@ def main():
     print("Eval output dir:", out_dir.as_posix())
 
     summary_rows: List[Dict[str, object]] = []
+    overall_rows: List[Dict[str, object]] = []
     f1_rows: List[Dict[str, object]] = []
 
     ckpt_root = Path(args.ckpt_root)
     ckpt_overrides = parse_ckpt_overrides(args.ckpt)
 
     for m in model_list:
-        weights_name = args.weights_name or f"{m}_best.pt"
+        is_rf = str(m).lower().strip() == "rf"
+        if args.weights_name:
+            weights_name = str(args.weights_name)
+        else:
+            weights_name = f"{m}_best.pkl" if is_rf else f"{m}_best.pt"
 
         model_dir = ckpt_root / m
         run_dir = resolve_run_dir(model_dir, ckpt_overrides.get(m))
@@ -573,9 +845,55 @@ def main():
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Weights not found for {m}: {ckpt_path.as_posix()}")
 
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        rf_model = None
+        rf_feature_mode = "flatten"
+        rf_feature_dim = None
+        model_params_m = float("nan")
 
-        if "state_dict" in ckpt:
+        if is_rf:
+            ckpt = pickle_load_safe(ckpt_path)
+        else:
+            ckpt = torch_load_safe(ckpt_path, map_location="cpu")
+
+        if is_rf:
+            if not isinstance(ckpt, dict) or "model" not in ckpt:
+                raise TypeError(f"[rf] Unsupported checkpoint format: expected dict with key 'model' at {ckpt_path.as_posix()}")
+
+            rf_model = ckpt.get("model", None)
+            rf_feature_mode = str(ckpt.get("feature_mode", "flatten"))
+            rf_feature_dim = ckpt.get("feature_dim", None)
+
+            state = None
+            T_used = None
+            in_features = None
+            num_classes = int(ckpt.get("num_classes", NUM_CLASSES_MERGED))
+            use_conf_ckpt = bool(ckpt.get("use_conf", True))
+
+            normalize_ckpt = bool(ckpt.get("normalize", normalize_cli))
+            normalize_mode_ckpt = str(ckpt.get("normalize_mode", args.normalize_mode))
+            add_vel_ckpt = bool(ckpt.get("add_vel", add_vel_cli))
+            add_acc_ckpt = bool(ckpt.get("add_acc", add_acc_cli))
+            add_global_ckpt = bool(ckpt.get("add_global", add_global_cli))
+            conf_thres_ckpt = float(ckpt.get("conf_thres", args.conf_thres))
+            max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
+            missing_mode_ckpt = str(ckpt.get("missing_mode", args.missing_mode))
+            interp_mode_ckpt = str(ckpt.get("interp_mode", args.interp_mode))
+            interp_group_ckpt = int(ckpt.get("interp_group", args.interp_group))
+            rp_center_mode_ckpt = str(ckpt.get("rp_center_mode", args.rp_center_mode))
+            rp_img_w_ckpt = ckpt.get("rp_img_w", args.rp_img_w)
+            rp_img_h_ckpt = ckpt.get("rp_img_h", args.rp_img_h)
+            T_ckpt = int(ckpt.get("T", ckpt.get("T_used", args.T)))
+            stride_ckpt = int(ckpt.get("stride", args.stride))
+
+            fall_pct_ckpt = float(ckpt.get("fall_pct", args.fall_pct))
+            label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
+            min_valid_frac_ckpt = float(ckpt.get("min_valid_frac", args.min_valid_frac))
+            add_mask_channel_ckpt = bool(ckpt.get("add_mask_channel", add_mask_channel_cli))
+            drop_ambig_share_ckpt = float(ckpt.get("drop_ambig_share", args.drop_ambig_share))
+            drop_ambig_nonfall_only_ckpt = bool(ckpt.get("drop_ambig_nonfall_only", bool(args.drop_ambig_nonfall_only)))
+            node_features_ckpt = None
+
+        elif "state_dict" in ckpt:
             state = ckpt["state_dict"]
             T_used = int(ckpt["T_used"])
             in_features = int(ckpt["in_features"])
@@ -583,11 +901,18 @@ def main():
             use_conf_ckpt = bool(ckpt.get("use_conf", True))
 
             normalize_ckpt = bool(ckpt.get("normalize", normalize_cli))
+            normalize_mode_ckpt = str(ckpt.get("normalize_mode", args.normalize_mode))
             add_vel_ckpt = bool(ckpt.get("add_vel", add_vel_cli))
             add_acc_ckpt = bool(ckpt.get("add_acc", add_acc_cli))
             add_global_ckpt = bool(ckpt.get("add_global", add_global_cli))
             conf_thres_ckpt = float(ckpt.get("conf_thres", args.conf_thres))
             max_interp_gap_ckpt = int(ckpt.get("max_interp_gap", args.max_interp_gap))
+            missing_mode_ckpt = str(ckpt.get("missing_mode", args.missing_mode))
+            interp_mode_ckpt = str(ckpt.get("interp_mode", args.interp_mode))
+            interp_group_ckpt = int(ckpt.get("interp_group", args.interp_group))
+            rp_center_mode_ckpt = str(ckpt.get("rp_center_mode", args.rp_center_mode))
+            rp_img_w_ckpt = ckpt.get("rp_img_w", args.rp_img_w)
+            rp_img_h_ckpt = ckpt.get("rp_img_h", args.rp_img_h)
             T_ckpt = int(ckpt.get("T", ckpt.get("T_used", args.T)))  # support both keys
             stride_ckpt = int(ckpt.get("stride", args.stride))
 
@@ -595,6 +920,8 @@ def main():
             label_mode_ckpt = str(ckpt.get("label_mode", args.label_mode))
             min_valid_frac_ckpt = float(ckpt.get("min_valid_frac", args.min_valid_frac))
             add_mask_channel_ckpt = bool(ckpt.get("add_mask_channel", add_mask_channel_cli))
+            drop_ambig_share_ckpt = float(ckpt.get("drop_ambig_share", args.drop_ambig_share))
+            drop_ambig_nonfall_only_ckpt = bool(ckpt.get("drop_ambig_nonfall_only", bool(args.drop_ambig_nonfall_only)))
             node_features_ckpt = ckpt.get("node_features", None)
             if node_features_ckpt is None and (in_features % 17 == 0):
                 node_features_ckpt = in_features // 17
@@ -605,11 +932,18 @@ def main():
             T_used = None
             use_conf_ckpt = use_conf
             normalize_ckpt = normalize_cli
+            normalize_mode_ckpt = str(args.normalize_mode)
             add_vel_ckpt = add_vel_cli
             add_acc_ckpt = add_acc_cli
             add_global_ckpt = add_global_cli
             conf_thres_ckpt = float(args.conf_thres)
             max_interp_gap_ckpt = int(args.max_interp_gap)
+            missing_mode_ckpt = str(args.missing_mode)
+            interp_mode_ckpt = str(args.interp_mode)
+            interp_group_ckpt = int(args.interp_group)
+            rp_center_mode_ckpt = str(args.rp_center_mode)
+            rp_img_w_ckpt = args.rp_img_w
+            rp_img_h_ckpt = args.rp_img_h
             T_ckpt = int(args.T)
             stride_ckpt = int(args.stride)
 
@@ -617,6 +951,8 @@ def main():
             label_mode_ckpt = str(args.label_mode)
             min_valid_frac_ckpt = float(args.min_valid_frac)
             add_mask_channel_ckpt = add_mask_channel_cli
+            drop_ambig_share_ckpt = float(args.drop_ambig_share)
+            drop_ambig_nonfall_only_ckpt = bool(args.drop_ambig_nonfall_only)
             node_features_ckpt = None
 
         # For hybrid window labelling
@@ -626,93 +962,142 @@ def main():
             extra["fall_pct"] = fall_pct_ckpt
 
         # Load windows using ckpt settings
-        if T_used is None:
-            X_test, y_test_tags, _T_used = load_windows_from_npzs(
-                test_npzs,
-                T=T_ckpt,
-                use_conf=use_conf_ckpt,
-                normalize=normalize_ckpt,
-                add_vel=add_vel_ckpt,
-                add_acc=add_acc_ckpt,
-                add_global=add_global_ckpt,
-                conf_thres=conf_thres_ckpt,
-                max_interp_gap=max_interp_gap_ckpt,
-                stride=stride_ckpt,
-                label_mode=label_mode_ckpt,
-                min_valid_frac=min_valid_frac_ckpt,
-                add_mask_channel=add_mask_channel_ckpt,
-                **extra,
-            )
-            T_used = int(_T_used)
-        else:
-            X_test, y_test_tags, _T_used = load_windows_from_npzs(
-                test_npzs,
-                T=T_ckpt,
-                use_conf=use_conf_ckpt,
-                normalize=normalize_ckpt,
-                add_vel=add_vel_ckpt,
-                add_acc=add_acc_ckpt,
-                add_global=add_global_ckpt,
-                conf_thres=conf_thres_ckpt,
-                max_interp_gap=max_interp_gap_ckpt,
-                stride=stride_ckpt,
-                label_mode=label_mode_ckpt,
-                min_valid_frac=min_valid_frac_ckpt,
-                add_mask_channel=add_mask_channel_ckpt,
-                **extra,
-            )
-            T_used = int(_T_used)
+        X_test, y_test_tags, _T_used = load_windows_from_npzs(
+            test_npzs,
+            T=T_ckpt,
+            use_conf=use_conf_ckpt,
+            normalize=normalize_ckpt,
+            normalize_mode=normalize_mode_ckpt,
+            add_vel=add_vel_ckpt,
+            add_acc=add_acc_ckpt,
+            add_global=add_global_ckpt,
+            conf_thres=conf_thres_ckpt,
+            max_interp_gap=max_interp_gap_ckpt,
+            missing_mode=missing_mode_ckpt,
+            interp_mode=interp_mode_ckpt,
+            interp_group=interp_group_ckpt,
+            stride=stride_ckpt,
+            label_mode=label_mode_ckpt,
+            min_valid_frac=min_valid_frac_ckpt,
+            add_mask_channel=add_mask_channel_ckpt,
+            drop_ambig_share=drop_ambig_share_ckpt,
+            drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+            rp_center_mode=rp_center_mode_ckpt,
+            rp_img_w=rp_img_w_ckpt,
+            rp_img_h=rp_img_h_ckpt,
+            **extra,
+            label_convention=label_convention,
+        )
+        T_used = int(_T_used)
 
         print("Window length (T):", T_used)
 
-        y_test = (y_test_tags.astype(int) - 1).astype(np.int64)
+        y_test = y_test_tags.astype(np.int64, copy=False)
 
-        # Finalise dims for no-metadata checkpoints
-        if "state_dict" not in ckpt:
-            num_classes = int(y_test.max() + 1)
+        if is_rf:
+            num_classes_eval = int(NUM_CLASSES_MERGED)
+            probs_test = rf_predict_probs(
+                rf_model,
+                X_windows=X_test,
+                feature_mode=rf_feature_mode,
+                num_classes=num_classes_eval,
+                expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
+            )
+            y_true = y_test
+            fall_prob_test = None
+            y_pred = probs_test.argmax(axis=1).astype(int)
+        else:
+            # Finalise dims for no-metadata checkpoints
+            if "state_dict" not in ckpt:
+                num_classes = int(y_test.max() + 1)
 
-        test_ds = WindowTensorDataset(X_test, y_test)
+            test_ds = WindowTensorDataset(X_test, y_test)
 
-        sample_X0, _ = test_ds[0]
-        in_features_now = int(sample_X0.shape[-1])
-        if node_features_ckpt is None and (in_features_now % 17 == 0):
-            node_features_ckpt = in_features_now // 17
+            sample_X0, _ = test_ds[0]
+            in_features_now = int(sample_X0.shape[-1])
+            if node_features_ckpt is None and (in_features_now % 17 == 0):
+                node_features_ckpt = in_features_now // 17
 
-        if "state_dict" in ckpt and in_features_now != in_features:
-            raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
+            if "state_dict" in ckpt and in_features_now != in_features:
+                raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
 
-        in_features_final = in_features if "state_dict" in ckpt else in_features_now
+            in_features_final = in_features if "state_dict" in ckpt else in_features_now
 
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
+            test_loader = DataLoader(
+                test_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                drop_last=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+            )
 
-        model = get_model(
-            m,
-            in_features=in_features_final,
-            num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
-            device=args.device,
-            T_used=T_used,
-            node_features=node_features_ckpt,
-        )
+            model = get_model(
+                m,
+                in_features=in_features_final,
+                num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
+                device=args.device,
+                T_used=T_used,
+                node_features=node_features_ckpt,
+            )
 
-        model.load_state_dict(state, strict=False)
+            model.load_state_dict(state, strict=False)
+            model_params_m = float(count_params_m(model))
 
-        # Multi-class predictions + optional fall head probability
-        y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
-        y_pred = probs_test.argmax(axis=1).astype(int)
+            # Multi-class predictions + optional fall head probability
+            y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
+            y_pred = probs_test.argmax(axis=1).astype(int)
 
-        labels_present = np.unique(y_true).astype(int).tolist()
-        per_class_f1 = f1_score(y_true, y_pred, labels=labels_present, average=None, zero_division=0)
-        macro_f1 = f1_score(y_true, y_pred, labels=labels_present, average="macro", zero_division=0)
+        # Confusion matrix
+        if not is_rf:
+            num_classes_eval = int(num_classes if "state_dict" in ckpt else NUM_CLASSES_MERGED)
+        labels_all = list(range(num_classes_eval))
+        cm_counts = confusion_matrix(y_true, y_pred, labels=labels_all).astype(np.float64)
 
-        for lab, f1v in zip(labels_present, per_class_f1):
-            f1_rows.append({"model": m, "class_id": int(lab), "f1": float(f1v)})
+        # Normalized confusion matrix for CSV/plot
+        row_sums = cm_counts.sum(axis=1, keepdims=True) + 1e-9
+        cm = cm_counts / row_sums
+
+        if len(NEW_LABEL_NAMES) >= num_classes_eval:
+            cm_names = NEW_LABEL_NAMES[:num_classes_eval]
+        else:
+            cm_names = [str(i) for i in labels_all]
+
+        cm_csv = out_dir / f"confusion_matrix_{m}.csv"
+        pd.DataFrame(cm, index=cm_names, columns=cm_names).to_csv(cm_csv)
+        make_cm_plot(cm, cm_names, plots_dir / f"confusion_matrix_{m}.png", title=f"Confusion Matrix: {m}")
+
+        # Overall multi-class metrics (macro over classes present in this split)
+        eps = 1e-12
+        support = cm_counts.sum(axis=1)
+        valid = support > 0
+
+        tp = np.diag(cm_counts)
+        pred_support = cm_counts.sum(axis=0)
+        recall = tp / (support + eps)
+        precision = tp / (pred_support + eps)
+        f1 = 2.0 * precision * recall / (precision + recall + eps)
+        specificity = specificity_from_cm(cm_counts, eps=eps)
+
+        total = float(np.sum(cm_counts))
+        acc = float(np.sum(tp) / total) if total > 0 else 0.0
+        macro_recall = float(np.mean(recall[valid])) if np.any(valid) else 0.0
+        macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
+        macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
+        macro_f1 = float(np.mean(f1[valid])) if np.any(valid) else 0.0
+
+        for lab, f1v in zip(labels_all, f1):
+            name = cm_names[lab] if 0 <= lab < len(cm_names) else str(lab)
+            f1_rows.append({"model": m, "class_id": int(lab), "class_name": name, "f1": float(f1v)})
+
+        overall_rows.append({
+            "model": m,
+            "accuracy": float(acc) * 100.0,
+            "recall": float(macro_recall) * 100.0,
+            "specificity": float(macro_specificity) * 100.0,
+            "precision": float(macro_precision) * 100.0,
+            "f1_score": float(macro_f1) * 100.0,
+        })
 
         y_true_bin = collapse_to_binary(y_true, fall_class_ids_0based)
 
@@ -722,7 +1107,7 @@ def main():
             p_fall_source = "fall_head"
         else:
             p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based).astype(np.float32)
-            p_fall_source = "activity_softmax"
+            p_fall_source = "rf_predict_proba" if is_rf else "activity_softmax"
 
         tuned_thr = None
         tuned_prec = None
@@ -747,30 +1132,51 @@ def main():
                     T=T_ckpt,
                     use_conf=use_conf_ckpt,
                     normalize=normalize_ckpt,
+                    normalize_mode=normalize_mode_ckpt,
                     add_vel=add_vel_ckpt,
                     add_acc=add_acc_ckpt,
                     add_global=add_global_ckpt,
                     conf_thres=conf_thres_ckpt,
                     max_interp_gap=max_interp_gap_ckpt,
+                    missing_mode=missing_mode_ckpt,
+                    interp_mode=interp_mode_ckpt,
+                    interp_group=interp_group_ckpt,
                     stride=stride_ckpt,
                     label_mode=label_mode_ckpt,
                     min_valid_frac=min_valid_frac_ckpt,
                     add_mask_channel=add_mask_channel_ckpt,
+                    drop_ambig_share=drop_ambig_share_ckpt,
+                    drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+                    rp_center_mode=rp_center_mode_ckpt,
+                    rp_img_w=rp_img_w_ckpt,
+                    rp_img_h=rp_img_h_ckpt,
                     **extra,
+                    label_convention=label_convention,
                 )
 
-                y_tune = (y_tune_tags.astype(int) - 1).astype(np.int64)
-                tune_ds = WindowTensorDataset(X_tune, y_tune)
-                tune_loader = DataLoader(
-                    tune_ds,
-                    batch_size=args.batch_size,
-                    shuffle=False,
-                    drop_last=False,
-                    num_workers=args.num_workers,
-                    pin_memory=True,
-                )
+                y_tune = y_tune_tags.astype(np.int64, copy=False)
+                if is_rf:
+                    y_tune_true = y_tune
+                    probs_tune = rf_predict_probs(
+                        rf_model,
+                        X_windows=X_tune,
+                        feature_mode=rf_feature_mode,
+                        num_classes=num_classes_eval,
+                        expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
+                    )
+                    fall_prob_tune = None
+                else:
+                    tune_ds = WindowTensorDataset(X_tune, y_tune)
+                    tune_loader = DataLoader(
+                        tune_ds,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        drop_last=False,
+                        num_workers=args.num_workers,
+                        pin_memory=True,
+                    )
 
-                y_tune_true, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
+                    y_tune_true, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
                 y_tune_bin = collapse_to_binary(y_tune_true, fall_class_ids_0based)
 
                 if fall_prob_tune is not None:
@@ -790,14 +1196,14 @@ def main():
         # Keep for reporting
         chosen_thr = float(thr) if thr is not None else None
 
-        pr, rc, _, _ = precision_recall_fscore_support(
+        pr, rc, f1b, _ = precision_recall_fscore_support(
             y_true_bin, y_pred_bin, labels=[0, 1], average=None, zero_division=0
         )
 
         summary_rows.append({
             "model": m,
             "n_samples": int(len(y_true)),
-            "params_m": float(count_params_m(model)),
+            "params_m": float(model_params_m),
             "macro_f1": float(macro_f1),
             "binary_mode": str(args.binary_mode).lower(),
             "p_fall_source": p_fall_source,  # NEW: records which score was used
@@ -814,6 +1220,9 @@ def main():
             "binary_sensitivity_fall": float(rc[1]),
             "binary_precision_no_fall": float(pr[0]),
             "binary_sensitivity_no_fall": float(rc[0]),
+            "binary_f1_avg": float(np.mean(f1b)),
+            "binary_f1_fall": float(f1b[1]),
+            "binary_f1_no_fall": float(f1b[0]),
             "weights": ckpt_path.as_posix(),
             "camera": int(args.camera),
             "subjects": ",".join(str(s) for s in test_subjects),
@@ -822,6 +1231,8 @@ def main():
     summary_df = pd.DataFrame(summary_rows).sort_values("macro_f1", ascending=False).reset_index(drop=True)
     f1_long = pd.DataFrame(f1_rows).sort_values(["model", "class_id"]).reset_index(drop=True)
 
+    overall_df = summary_df[["model"]].merge(pd.DataFrame(overall_rows), on="model", how="left").round(3)
+
     summary_csv = out_dir / "metrics_summary.csv"
     f1_csv = out_dir / "f1_per_class.csv"
     summary_df.to_csv(summary_csv, index=False)
@@ -829,7 +1240,10 @@ def main():
 
     make_plots(summary_df, plots_dir)
     report_path = out_dir / "report.html"
-    make_html_report(summary_df, f1_long, plots_dir, report_path)
+    make_html_report(summary_df, overall_df, f1_long, plots_dir, report_path, model_list)
+
+    print("\nOverall metrics (%):")
+    print(overall_df.to_string(index=False))
 
     print(f"Saved: {summary_csv}")
     print(f"Saved: {f1_csv}")

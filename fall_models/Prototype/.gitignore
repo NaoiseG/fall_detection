@@ -1,0 +1,16 @@
+analysis/
+analysis_outputs/
+evaluation/eval_2sagcn.py
+evaluation/eval_models_two_stream.py
+figures/
+models/2s-AGCN/
+models/har_cnn_lstm/
+models/heatmaps/
+models/prompts/
+models/stgcn/two_stream_stgcn.py
+models/videomae/
+pose_models/AlphaPose/
+pose_models/ViTPose/
+test.py
+training/train_har_rescnn_lstm.py
+training/train_models_two_stream.py

@@ -1,0 +1,5 @@
+Flask>=2.3
+easydict>=1.13
+tqdm>=4.66
+pycocotools>=2.0
+transformers>=4.41
