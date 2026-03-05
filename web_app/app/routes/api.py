@@ -318,6 +318,7 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         keypoint_model=keypoint_model,
     )
     keypoint_backend = _infer_keypoint_backend(keypoint_model, keypoint_weights_path)
+    use_half = int(keypoint_backend == "yolo" and keypoint_precision == "FP16")
 
     realtime = bool(payload.get("realtime", True))
     display_fps = _validate_float(payload.get("display_fps", 0.0), name="display_fps", min_value=0.0)
@@ -337,6 +338,7 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         "display_fps": float(display_fps),
         "realtime": bool(realtime),
         "keypoint_backend": keypoint_backend,
+        "half": int(use_half),
         "max_people": 1,
         "T": int(window_size),
         "stride": int(stride_frames),

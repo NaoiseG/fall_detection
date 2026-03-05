@@ -71,6 +71,7 @@ def test_prepare_stream_request_passes_fp16_to_keypoint_resolver(monkeypatch, tm
     assert captured["keypoint_precision"] == "FP16"
     assert prepared["keypoint_precision"] == "FP16"
     assert prepared["keypoint_model_path"].name == "yolo11l-pose_fp16.engine"
+    assert prepared["inference_options"]["half"] == 1
 
 
 def test_prepare_stream_request_defaults_precision_to_fp32(monkeypatch, tmp_path):
@@ -99,6 +100,7 @@ def test_prepare_stream_request_defaults_precision_to_fp32(monkeypatch, tmp_path
 
     assert captured["keypoint_precision"] == "FP32"
     assert prepared["keypoint_precision"] == "FP32"
+    assert prepared["inference_options"]["half"] == 0
 
 
 def test_ensure_keypoint_asset_fp16_missing_file_raises(monkeypatch, tmp_path):

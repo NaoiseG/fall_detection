@@ -1621,10 +1621,12 @@ def run_inference_stream_packets(
         resolved_save_path = candidate
 
     run_device = pick_device(device)
-    use_half = bool(int(half)) and run_device.startswith("cuda")
+    use_half_requested = bool(int(half)) and run_device.startswith("cuda")
+    use_half_keypoint = bool(use_half_requested)
+    use_half_temporal = bool(use_half_requested)
     print(
         f"[runtime] device={run_device} "
-        f"(requested={device if device else 'auto'}, cuda_available={torch.cuda.is_available()}, half={int(use_half)})"
+        f"(requested={device if device else 'auto'}, cuda_available={torch.cuda.is_available()}, half={int(use_half_requested)})"
     )
     if int(max_people) <= 1:
         print("[track][WARN] --max-people=1 limits disambiguation when multiple people are present.")
@@ -1720,6 +1722,13 @@ def run_inference_stream_packets(
     if unexpected:
         print("[WARN] unexpected keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
     model.eval()
+    if use_half_temporal:
+        try:
+            model.half()
+        except Exception as error:
+            use_half_temporal = False
+            model.float()
+            print(f"[runtime][WARN] Failed to enable FP16 for temporal model: {error}. Falling back to FP32.")
 
     keypoint_runtime = KeypointRuntime(
         model_path=Path(keypoint_model_path).expanduser(),
@@ -1811,7 +1820,7 @@ def run_inference_stream_packets(
                     imgsz=int(imgsz),
                     yolo_conf=float(yolo_conf),
                     max_people=int(max_people),
-                    use_half=use_half,
+                    use_half=use_half_keypoint,
                     prev_center=track_prev_center,
                     target_center=track_target_center,
                     conf_min=float(track_conf_min),
@@ -1884,7 +1893,7 @@ def run_inference_stream_packets(
                 model=model,
                 window_feat=window_feat,
                 device=run_device,
-                use_half=use_half,
+                use_half=use_half_temporal,
                 merge_fall_11_to_7=merge_fall_11_to_7,
             )
             window_preds[start] = (pred, pconf, p_fall)
