@@ -1021,6 +1021,66 @@ def resolve_yolo_predict_device(device: str, yolo_is_engine: bool) -> Any:
     return device_str
 
 
+def _has_ultralytics_engine_metadata(engine_path: Path) -> bool:
+    """
+    Ultralytics TensorRT loader expects engine files to begin with:
+      [4-byte little-endian metadata length][JSON metadata][serialized TRT engine]
+    """
+    try:
+        file_size = int(engine_path.stat().st_size)
+        if file_size <= 4:
+            return False
+
+        with engine_path.open("rb") as f:
+            raw_len = f.read(4)
+            if len(raw_len) != 4:
+                return False
+            meta_len = int.from_bytes(raw_len, byteorder="little", signed=False)
+
+            max_reasonable = min(file_size - 4, 8 * 1024 * 1024)
+            if meta_len <= 0 or meta_len > int(max_reasonable):
+                return False
+
+            meta_raw = f.read(meta_len)
+            if len(meta_raw) != int(meta_len):
+                return False
+
+        meta = json.loads(meta_raw.decode("utf-8"))
+        return isinstance(meta, dict)
+    except Exception:
+        return False
+
+
+def ensure_ultralytics_engine_header(engine_path: Path) -> Path:
+    """
+    Wrap metadata-less TRT engines with an empty Ultralytics metadata header
+    to avoid JSON metadata parse failures in some Ultralytics builds.
+    """
+    if _has_ultralytics_engine_metadata(engine_path):
+        return engine_path
+
+    stem = engine_path.stem
+    if not stem.endswith(".ultra"):
+        stem = f"{stem}.ultra"
+    wrapped_path = engine_path.with_name(f"{stem}.engine")
+
+    try:
+        src_stat = engine_path.stat()
+        if wrapped_path.exists():
+            dst_stat = wrapped_path.stat()
+            if int(dst_stat.st_mtime) >= int(src_stat.st_mtime) and int(dst_stat.st_size) > int(src_stat.st_size):
+                return wrapped_path
+    except OSError:
+        pass
+
+    meta_raw = b"{}"  # Keep empty dict so Ultralytics treats metadata as unavailable.
+    with engine_path.open("rb") as src, wrapped_path.open("wb") as dst:
+        dst.write(int(len(meta_raw)).to_bytes(4, byteorder="little", signed=False))
+        dst.write(meta_raw)
+        shutil.copyfileobj(src, dst, length=1024 * 1024)
+    return wrapped_path
+
+
 def infer_arch_from_path(p: Path) -> Optional[str]:
     tokens = [p.name.lower(), p.stem.lower()] + [x.lower() for x in p.parts]
     for arch in sorted(KNOWN_ARCHES, key=len, reverse=True):
@@ -1922,6 +1982,7 @@ def main() -> int:
     if not yolo_weights_path.exists():
         raise FileNotFoundError(f"--yolo-weights not found: {yolo_weights_path}")
     yolo_is_engine = is_engine_weights_path(yolo_weights_path)
+    yolo_runtime_weights_path = yolo_weights_path
 
     use_half_temporal = bool(int(args.half)) and device.startswith("cuda")
     use_half_yolo = bool(use_half_temporal)
@@ -1934,6 +1995,7 @@ def main() -> int:
             return 2
         # TensorRT FP16 engines should run with FP16 pre-processing.
         use_half_yolo = True
+        yolo_runtime_weights_path = ensure_ultralytics_engine_header(yolo_weights_path)
 
     yolo_predict_device = resolve_yolo_predict_device(device=device, yolo_is_engine=yolo_is_engine)
     sync_cuda_timing = bool(device.startswith("cuda") and torch.cuda.is_available())
@@ -1944,6 +2006,11 @@ def main() -> int:
     )
     if yolo_is_engine:
         print(f"[yolo] TensorRT engine detected: {yolo_weights_path.as_posix()} (predict_device={yolo_predict_device})")
+        if yolo_runtime_weights_path != yolo_weights_path:
+            print(
+                "[yolo][WARN] Engine lacks Ultralytics metadata header; "
+                f"using wrapped copy: {yolo_runtime_weights_path.as_posix()}"
+            )
     if benchmark_enabled:
         duration_src = "BENCHMARK_DURATION_S" if os.getenv("BENCHMARK_DURATION_S") else "default"
         print(f"[benchmark] enabled: duration_s={float(profile_duration_s):.3f} (source={duration_src}), profile=1")
@@ -2073,9 +2140,9 @@ def main() -> int:
         model.eval()
 
     try:
-        pose_model = YOLO(str(yolo_weights_path), task="pose")
+        pose_model = YOLO(str(yolo_runtime_weights_path), task="pose")
     except TypeError:
-        pose_model = YOLO(str(yolo_weights_path))
+        pose_model = YOLO(str(yolo_runtime_weights_path))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
