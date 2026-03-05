@@ -103,7 +103,24 @@ def test_prepare_stream_request_defaults_precision_to_fp32(monkeypatch, tmp_path
     assert prepared["inference_options"]["half"] == 0
 
 
-def test_ensure_keypoint_asset_fp16_missing_file_raises(monkeypatch, tmp_path):
+def test_ensure_keypoint_asset_fp16_falls_back_to_fp32_pt(monkeypatch, tmp_path):
+    keypoint_root = tmp_path / "models" / "keypoint"
+    yolo_dir = keypoint_root / "ultralytics" / "yolo11l-pose"
+    yolo_dir.mkdir(parents=True, exist_ok=True)
+    fp32_pt = yolo_dir / "yolo11l-pose.pt"
+    fp32_pt.write_bytes(b"pt")
+    monkeypatch.setattr(api, "_keypoint_models_root", lambda: keypoint_root)
+
+    resolved = api._ensure_keypoint_asset(
+        model_name="ultralytics-yolo11l",
+        relative_path="ultralytics/yolo11l-pose",
+        keypoint_precision="FP16",
+    )
+
+    assert resolved == fp32_pt
+
+
+def test_ensure_keypoint_asset_fp16_raises_when_no_fp16_or_fp32_assets(monkeypatch, tmp_path):
     keypoint_root = tmp_path / "models" / "keypoint"
     (keypoint_root / "ultralytics" / "yolo11l-pose").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(api, "_keypoint_models_root", lambda: keypoint_root)

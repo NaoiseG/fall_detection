@@ -208,11 +208,12 @@ def _resolve_yolo_weight_filename(*, model_name: str, keypoint_precision: str) -
 def _ensure_keypoint_asset(*, model_name: str, relative_path: str, keypoint_precision: str) -> Path:
     keypoint_root = _keypoint_models_root()
     weights_path = _resolve_relative_path(keypoint_root, relative_path, "keypoint")
+    precision = _normalize_keypoint_precision(keypoint_precision)
 
     backend = _infer_keypoint_backend(model_name, weights_path)
 
     if backend == "vitpose":
-        if _normalize_keypoint_precision(keypoint_precision) != "FP32":
+        if precision != "FP32":
             raise ValueError("FP16 precision is only supported for Ultralytics YOLO keypoint models.")
         if weights_path.exists() and weights_path.is_file():
             raise ValueError("Invalid ViTPose model path. Expected a directory.")
@@ -220,7 +221,7 @@ def _ensure_keypoint_asset(*, model_name: str, relative_path: str, keypoint_prec
         return weights_path
 
     if backend == "alphapose":
-        if _normalize_keypoint_precision(keypoint_precision) != "FP32":
+        if precision != "FP32":
             raise ValueError("FP16 precision is only supported for Ultralytics YOLO keypoint models.")
         if not weights_path.exists() or not weights_path.is_dir():
             raise FileNotFoundError(f"Missing AlphaPose bundle directory: {weights_path}")
@@ -229,15 +230,21 @@ def _ensure_keypoint_asset(*, model_name: str, relative_path: str, keypoint_prec
 
     expected_filename = _resolve_yolo_weight_filename(
         model_name=model_name,
-        keypoint_precision=keypoint_precision,
+        keypoint_precision=precision,
     )
+    fp32_fallback_filename = None
+    if precision == "FP16":
+        fp32_fallback_filename = KEYPOINT_YOLO_WEIGHT_FILENAMES.get(model_name)
 
     # Backward compatibility: accept explicit file paths if they match the expected filename.
     if weights_path.exists() and weights_path.is_file():
-        if weights_path.name.lower() != expected_filename.lower():
+        accepted_names = {expected_filename.lower()}
+        if fp32_fallback_filename:
+            accepted_names.add(str(fp32_fallback_filename).lower())
+        if weights_path.name.lower() not in accepted_names:
             raise FileNotFoundError(
                 f"Unexpected keypoint checkpoint filename for '{model_name}': {weights_path.name}. "
-                f"Expected '{expected_filename}'."
+                f"Expected one of: {', '.join(sorted(accepted_names))}."
             )
         return weights_path
 
@@ -246,11 +253,24 @@ def _ensure_keypoint_asset(*, model_name: str, relative_path: str, keypoint_prec
             f"Missing Ultralytics keypoint directory for '{model_name}': {weights_path}"
         )
 
-    return _find_named_file_recursive(
-        search_root=weights_path,
-        expected_filename=expected_filename,
-        model_kind=f"keypoint model '{model_name}'",
-    )
+    try:
+        return _find_named_file_recursive(
+            search_root=weights_path,
+            expected_filename=expected_filename,
+            model_kind=f"keypoint model '{model_name}'",
+        )
+    except FileNotFoundError as fp16_error:
+        if precision != "FP16" or not fp32_fallback_filename:
+            raise
+        # FP16 can run with .pt weights using runtime half precision when engine assets are unavailable.
+        try:
+            return _find_named_file_recursive(
+                search_root=weights_path,
+                expected_filename=fp32_fallback_filename,
+                model_kind=f"keypoint model '{model_name}'",
+            )
+        except FileNotFoundError:
+            raise fp16_error
 
 
 def _validate_float(value: Any, *, name: str, min_value: float = 0.0) -> float:
