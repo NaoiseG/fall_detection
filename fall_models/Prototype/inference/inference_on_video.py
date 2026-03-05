@@ -998,6 +998,29 @@ def pick_device(device: Optional[str]) -> str:
     return device
 
 
+def is_engine_weights_path(weights_path: Path) -> bool:
+    return weights_path.suffix.lower() == ".engine"
+
+
+def resolve_yolo_predict_device(device: str, yolo_is_engine: bool) -> Any:
+    """
+    Ultralytics accepts string/int device selectors.
+    For TensorRT engines, a numeric GPU index is often the most compatible.
+    """
+    device_str = str(device).strip()
+    if not yolo_is_engine:
+        return device_str
+
+    d = device_str.lower()
+    if d == "cuda":
+        return 0
+    if d.startswith("cuda:"):
+        idx = d.split(":", 1)[1].strip()
+        if idx.isdigit():
+            return int(idx)
+    return device_str
+
+
 def infer_arch_from_path(p: Path) -> Optional[str]:
     tokens = [p.name.lower(), p.stem.lower()] + [x.lower() for x in p.parts]
     for arch in sorted(KNOWN_ARCHES, key=len, reverse=True):
@@ -1453,7 +1476,7 @@ def pose_on_frame(
     frame_bgr: np.ndarray,
     imgsz: int,
     yolo_conf: float,
-    device: str,
+    device: Any,
     max_people: int,
     use_half: bool,
     prev_center: Optional[np.ndarray],
@@ -1736,7 +1759,12 @@ def main() -> int:
     ap.add_argument("--video", type=str, required=True, help="Path to input .mp4")
     ap.add_argument("--model", type=str, required=True, help="Checkpoint *.pt/*.pkl OR model folder OR model .py")
     ap.add_argument("--arch", type=str, default=None, choices=KNOWN_ARCHES, help="Override model architecture if needed")
-    ap.add_argument("--yolo-weights", type=str, default="pose_models/ultralytics/yolo11l-pose.pt")
+    ap.add_argument(
+        "--yolo-weights",
+        type=str,
+        default="pose_models/ultralytics/yolo11l-pose.pt",
+        help="Path to YOLO pose weights (.pt or TensorRT .engine).",
+    )
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--yolo-conf", type=float, default=0.25)
     ap.add_argument(
@@ -1889,12 +1917,33 @@ def main() -> int:
     except ValueError as e:
         print(f"[benchmark][ERROR] {e}", file=sys.stderr)
         return 2
-    use_half = bool(int(args.half)) and device.startswith("cuda")
+
+    yolo_weights_path = Path(args.yolo_weights).expanduser()
+    if not yolo_weights_path.exists():
+        raise FileNotFoundError(f"--yolo-weights not found: {yolo_weights_path}")
+    yolo_is_engine = is_engine_weights_path(yolo_weights_path)
+
+    use_half_temporal = bool(int(args.half)) and device.startswith("cuda")
+    use_half_yolo = bool(use_half_temporal)
+    if yolo_is_engine:
+        if not str(device).lower().startswith("cuda"):
+            print(
+                f"[yolo][ERROR] TensorRT .engine weights require CUDA, but resolved device is '{device}'.",
+                file=sys.stderr,
+            )
+            return 2
+        # TensorRT FP16 engines should run with FP16 pre-processing.
+        use_half_yolo = True
+
+    yolo_predict_device = resolve_yolo_predict_device(device=device, yolo_is_engine=yolo_is_engine)
     sync_cuda_timing = bool(device.startswith("cuda") and torch.cuda.is_available())
     print(
         f"[runtime] device={device} "
-        f"(requested={args.device if args.device else 'auto'}, cuda_available={torch.cuda.is_available()}, half={int(use_half)})"
+        f"(requested={args.device if args.device else 'auto'}, cuda_available={torch.cuda.is_available()}, "
+        f"half_temporal={int(use_half_temporal)}, half_yolo={int(use_half_yolo)})"
     )
+    if yolo_is_engine:
+        print(f"[yolo] TensorRT engine detected: {yolo_weights_path.as_posix()} (predict_device={yolo_predict_device})")
     if benchmark_enabled:
         duration_src = "BENCHMARK_DURATION_S" if os.getenv("BENCHMARK_DURATION_S") else "default"
         print(f"[benchmark] enabled: duration_s={float(profile_duration_s):.3f} (source={duration_src}), profile=1")
@@ -2019,9 +2068,14 @@ def main() -> int:
             print("[WARN] missing keys:", missing[:8], "..." if len(missing) > 8 else "")
         if unexpected:
             print("[WARN] unexpected keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
+        if use_half_temporal:
+            model.half()
         model.eval()
 
-    pose_model = YOLO(str(Path(args.yolo_weights).expanduser()))
+    try:
+        pose_model = YOLO(str(yolo_weights_path), task="pose")
+    except TypeError:
+        pose_model = YOLO(str(yolo_weights_path))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -2179,9 +2233,9 @@ def main() -> int:
                     frame_bgr=frame,
                     imgsz=int(args.imgsz),
                     yolo_conf=float(args.yolo_conf),
-                    device=device,
+                    device=yolo_predict_device,
                     max_people=int(args.max_people),
-                    use_half=use_half,
+                    use_half=use_half_yolo,
                     prev_center=track_prev_center,
                     target_center=track_target_center,
                     conf_min=float(track_conf_min),
@@ -2295,7 +2349,7 @@ def main() -> int:
                     model=model,
                     window_feat=window_feat,
                     device=device,
-                    use_half=use_half,
+                    use_half=use_half_temporal,
                     merge_fall_11_to_7=merge_fall_11_to_7,
                 )
                 if profile_enabled:
