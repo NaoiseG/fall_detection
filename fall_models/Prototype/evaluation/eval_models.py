@@ -65,12 +65,13 @@ Choosing model weights:
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import re
 import math
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import tempfile
 
 import numpy as np
@@ -211,6 +212,57 @@ def parse_ckpt_overrides(items: Optional[List[str]]) -> Dict[str, str]:
             raise SystemExit(f"--ckpt entries must be like model=RUNFOLDER or model=latest, got: {s}")
         k, v = s.split("=", 1)
         out[k.lower().strip()] = v.strip()
+    return out
+
+
+def parse_weights_path_overrides(
+    items: Optional[List[str]],
+    model_list: List[str],
+) -> Dict[str, Path]:
+    """
+    Parse direct weight-file overrides.
+
+    Accepted forms:
+      - Single model only: --weights-path /abs/or/rel/path/to/file.pt
+      - Multi-model (or explicit): --weights-path tcn=.../tcn_best.pt lstm=.../lstm_best.pt
+    """
+    out: Dict[str, Path] = {}
+    if not items:
+        return out
+
+    models_norm = [str(m).lower().strip() for m in model_list]
+    model_set = set(models_norm)
+
+    if len(items) == 1 and "=" not in str(items[0]):
+        if len(models_norm) != 1:
+            raise SystemExit(
+                "When --weights-path is provided as a single path, exactly one model must be selected.\n"
+                "Use --weights-path model=PATH for multiple models."
+            )
+        out[models_norm[0]] = Path(str(items[0]).strip()).expanduser()
+        return out
+
+    for s in items:
+        if "=" not in s:
+            raise SystemExit(
+                f"--weights-path entries must be like model=PATH (or a single PATH with one model). Got: {s}"
+            )
+        k, v = s.split("=", 1)
+        mk = k.lower().strip()
+        pv = v.strip()
+        if not mk:
+            raise SystemExit(f"--weights-path entry has empty model name: {s}")
+        if not pv:
+            raise SystemExit(f"--weights-path entry has empty path: {s}")
+        out[mk] = Path(pv).expanduser()
+
+    unknown = sorted(set(out.keys()) - model_set)
+    if unknown:
+        raise SystemExit(
+            f"--weights-path contains model(s) not selected in --models/--all: {unknown}. "
+            f"Selected models: {sorted(model_set)}"
+        )
+
     return out
 
 
@@ -535,6 +587,484 @@ def predict_probs(model: torch.nn.Module, loader: DataLoader, device: str) -> Tu
     return y_true_np, probs_np, None
 
 
+def is_engine_weights_path(weights_path: Path) -> bool:
+    return weights_path.suffix.lower() == ".engine"
+
+
+def _strip_ultralytics_engine_header(raw: bytes) -> Optional[bytes]:
+    """
+    Ultralytics may prepend engine bytes with:
+      [4-byte little-endian metadata length][JSON metadata][serialized TRT engine]
+    Return stripped bytes if header looks valid, otherwise None.
+    """
+    if len(raw) <= 4:
+        return None
+    meta_len = int.from_bytes(raw[:4], byteorder="little", signed=False)
+    max_reasonable = min(len(raw) - 4, 8 * 1024 * 1024)
+    if meta_len <= 0 or meta_len > int(max_reasonable):
+        return None
+    meta_raw = raw[4 : 4 + meta_len]
+    try:
+        meta = json.loads(meta_raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    return raw[4 + meta_len :]
+
+
+def _torch_dtype_from_numpy(np_dtype: np.dtype) -> torch.dtype:
+    d = np.dtype(np_dtype)
+    if d == np.float16:
+        return torch.float16
+    if d == np.float32:
+        return torch.float32
+    if d == np.float64:
+        return torch.float64
+    if d == np.int8:
+        return torch.int8
+    if d == np.int16:
+        return torch.int16
+    if d == np.int32:
+        return torch.int32
+    if d == np.int64:
+        return torch.int64
+    if d == np.uint8:
+        return torch.uint8
+    if d == np.bool_:
+        return torch.bool
+    raise TypeError(f"Unsupported numpy dtype for TensorRT tensor IO: {d}")
+
+
+class TensorRTEngineRunner:
+    """
+    Minimal TensorRT runtime wrapper for batched inference on CUDA tensors.
+    Supports both legacy (binding index) and name-based TensorRT Python APIs.
+    """
+
+    def __init__(self, engine_path: Path, device: str = "cuda"):
+        self.engine_path = Path(engine_path)
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"TensorRT .engine requires CUDA, but CUDA is unavailable. "
+                f"Cannot load: {self.engine_path.as_posix()}"
+            )
+        device_str = str(device).strip().lower()
+        if not device_str.startswith("cuda"):
+            raise RuntimeError(
+                f"TensorRT .engine requires a CUDA device, but got --device={device!r} "
+                f"for {self.engine_path.as_posix()}."
+            )
+        self.device = torch.device(device)
+
+        try:
+            import tensorrt as trt  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "TensorRT python package is required for .engine inference.\n"
+                "Install the matching `tensorrt` wheel for your CUDA/TensorRT stack."
+            ) from e
+
+        self.trt = trt
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.runtime = trt.Runtime(self.logger)
+
+        raw = self.engine_path.read_bytes()
+        self.engine = self.runtime.deserialize_cuda_engine(raw)
+        if self.engine is None:
+            stripped = _strip_ultralytics_engine_header(raw)
+            if stripped:
+                self.engine = self.runtime.deserialize_cuda_engine(stripped)
+        if self.engine is None:
+            raise RuntimeError(
+                f"Failed to deserialize TensorRT engine: {self.engine_path.as_posix()}\n"
+                "If this engine was exported with Ultralytics metadata, make sure it is valid for this TensorRT runtime."
+            )
+
+        self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError(f"Failed to create TensorRT execution context for {self.engine_path.as_posix()}")
+
+        self._name_api = hasattr(self.engine, "num_io_tensors") and hasattr(self.engine, "get_tensor_name")
+
+        self.input_name: str
+        self.input_index: Optional[int]
+        self.input_shape_template: Tuple[int, ...]
+        self.input_np_dtype: np.dtype
+        self.output_names: List[str] = []
+        self.output_indices: List[int] = []
+
+        if self._name_api:
+            n_io = int(self.engine.num_io_tensors)
+            input_names: List[str] = []
+            output_names: List[str] = []
+            for i in range(n_io):
+                name = str(self.engine.get_tensor_name(i))
+                mode = self.engine.get_tensor_mode(name)
+                if mode == self.trt.TensorIOMode.INPUT:
+                    input_names.append(name)
+                elif mode == self.trt.TensorIOMode.OUTPUT:
+                    output_names.append(name)
+
+            if len(input_names) != 1:
+                raise RuntimeError(
+                    f"Expected exactly 1 TensorRT input tensor, found {len(input_names)} in {self.engine_path.as_posix()}"
+                )
+            if len(output_names) < 1:
+                raise RuntimeError(f"No TensorRT output tensors found in {self.engine_path.as_posix()}")
+
+            self.input_name = input_names[0]
+            self.output_names = output_names
+            self.input_index = None
+
+            self.input_shape_template = tuple(int(v) for v in self.engine.get_tensor_shape(self.input_name))
+            self.input_np_dtype = self._trt_dtype_to_numpy(self.engine.get_tensor_dtype(self.input_name))
+        else:
+            n_bindings = int(self.engine.num_bindings)
+            input_indices = [i for i in range(n_bindings) if bool(self.engine.binding_is_input(i))]
+            output_indices = [i for i in range(n_bindings) if not bool(self.engine.binding_is_input(i))]
+
+            if len(input_indices) != 1:
+                raise RuntimeError(
+                    f"Expected exactly 1 TensorRT input binding, found {len(input_indices)} in {self.engine_path.as_posix()}"
+                )
+            if len(output_indices) < 1:
+                raise RuntimeError(f"No TensorRT output bindings found in {self.engine_path.as_posix()}")
+
+            self.input_index = int(input_indices[0])
+            self.output_indices = [int(i) for i in output_indices]
+            self.input_name = str(self.engine.get_binding_name(self.input_index))
+            self.output_names = [str(self.engine.get_binding_name(i)) for i in self.output_indices]
+
+            self.input_shape_template = tuple(int(v) for v in self.engine.get_binding_shape(self.input_index))
+            self.input_np_dtype = self._trt_dtype_to_numpy(self.engine.get_binding_dtype(self.input_index))
+
+        self.static_batch_size: Optional[int]
+        if len(self.input_shape_template) >= 1 and int(self.input_shape_template[0]) > 0:
+            self.static_batch_size = int(self.input_shape_template[0])
+        else:
+            self.static_batch_size = None
+
+    def _trt_dtype_to_numpy(self, trt_dtype) -> np.dtype:
+        try:
+            return np.dtype(self.trt.nptype(trt_dtype))
+        except Exception:
+            s = str(trt_dtype).lower()
+            if "float16" in s or "half" in s:
+                return np.dtype(np.float16)
+            if "float32" in s:
+                return np.dtype(np.float32)
+            if "int8" in s:
+                return np.dtype(np.int8)
+            if "int32" in s:
+                return np.dtype(np.int32)
+            if "bool" in s:
+                return np.dtype(np.bool_)
+            return np.dtype(np.float32)
+
+    def _set_input_shape_if_needed(self, shape: Tuple[int, ...]) -> None:
+        shape_t = tuple(int(v) for v in shape)
+        if len(shape_t) != len(self.input_shape_template):
+            raise ValueError(
+                f"Input rank mismatch for TensorRT engine {self.engine_path.as_posix()}: "
+                f"expected rank={len(self.input_shape_template)}, got rank={len(shape_t)} ({shape_t})"
+            )
+
+        for dim_i, (expect, got) in enumerate(zip(self.input_shape_template, shape_t)):
+            if int(expect) >= 0 and int(expect) != int(got):
+                raise ValueError(
+                    f"Input shape mismatch at dim={dim_i} for {self.engine_path.as_posix()}: "
+                    f"engine expects {self.input_shape_template}, got {shape_t}"
+                )
+
+        if any(int(v) < 0 for v in self.input_shape_template):
+            if self._name_api and hasattr(self.context, "set_input_shape"):
+                ok = self.context.set_input_shape(self.input_name, shape_t)
+                if ok is False:
+                    raise RuntimeError(
+                        f"Failed to set TensorRT dynamic input shape {shape_t} on tensor '{self.input_name}'"
+                    )
+            elif self.input_index is not None and hasattr(self.context, "set_binding_shape"):
+                ok = self.context.set_binding_shape(int(self.input_index), shape_t)
+                if ok is False:
+                    raise RuntimeError(
+                        f"Failed to set TensorRT dynamic input shape {shape_t} on binding index {self.input_index}"
+                    )
+            else:
+                raise RuntimeError(
+                    "TensorRT engine appears to use dynamic shapes, but this runtime/context does not "
+                    "expose set_input_shape or set_binding_shape."
+                )
+
+    def infer(self, x_batch: np.ndarray) -> List[np.ndarray]:
+        x_np = np.asarray(x_batch)
+        if x_np.ndim != len(self.input_shape_template):
+            raise ValueError(
+                f"TensorRT input rank mismatch for {self.engine_path.as_posix()}: "
+                f"expected rank={len(self.input_shape_template)}, got shape={tuple(x_np.shape)}"
+            )
+
+        if x_np.dtype != self.input_np_dtype:
+            x_np = x_np.astype(self.input_np_dtype, copy=False)
+        if not x_np.flags.c_contiguous:
+            x_np = np.ascontiguousarray(x_np)
+
+        x_t = torch.as_tensor(
+            x_np,
+            device=self.device,
+            dtype=_torch_dtype_from_numpy(self.input_np_dtype),
+        )
+        self._set_input_shape_if_needed(tuple(int(v) for v in x_t.shape))
+
+        if self._name_api and hasattr(self.context, "set_tensor_address"):
+            output_tensors: Dict[str, torch.Tensor] = {}
+            self.context.set_tensor_address(self.input_name, int(x_t.data_ptr()))
+
+            for out_name in self.output_names:
+                out_shape = tuple(int(v) for v in self.context.get_tensor_shape(out_name))
+                if any(int(v) < 0 for v in out_shape):
+                    raise RuntimeError(
+                        f"Unresolved dynamic output shape for tensor '{out_name}' in {self.engine_path.as_posix()}: {out_shape}"
+                    )
+                out_dtype = self._trt_dtype_to_numpy(self.engine.get_tensor_dtype(out_name))
+                out_t = torch.empty(
+                    out_shape,
+                    device=self.device,
+                    dtype=_torch_dtype_from_numpy(out_dtype),
+                )
+                self.context.set_tensor_address(out_name, int(out_t.data_ptr()))
+                output_tensors[out_name] = out_t
+
+            if hasattr(self.context, "execute_async_v3"):
+                stream = torch.cuda.current_stream(device=self.device)
+                ok = self.context.execute_async_v3(stream_handle=int(stream.cuda_stream))
+            elif hasattr(self.context, "execute_v3"):
+                ok = self.context.execute_v3()
+            else:
+                if not hasattr(self.engine, "num_bindings") or not hasattr(self.engine, "get_binding_index"):
+                    raise RuntimeError("TensorRT context does not support execute_v3/execute_async_v3 or binding fallback.")
+                bindings = [0] * int(self.engine.num_bindings)
+                in_idx = int(self.engine.get_binding_index(self.input_name))
+                bindings[in_idx] = int(x_t.data_ptr())
+                for out_name, out_t in output_tensors.items():
+                    out_idx = int(self.engine.get_binding_index(out_name))
+                    bindings[out_idx] = int(out_t.data_ptr())
+                ok = self.context.execute_v2(bindings)
+
+            if not ok:
+                raise RuntimeError(f"TensorRT execution failed for {self.engine_path.as_posix()}")
+            torch.cuda.synchronize(self.device)
+            return [output_tensors[name].detach().cpu().numpy() for name in self.output_names]
+
+        if self.input_index is None or not hasattr(self.engine, "num_bindings"):
+            raise RuntimeError(
+                "TensorRT runtime does not expose required tensor-address or binding APIs for inference."
+            )
+
+        n_bindings = int(self.engine.num_bindings)
+        bindings = [0] * n_bindings
+        bindings[int(self.input_index)] = int(x_t.data_ptr())
+
+        out_tensors: List[torch.Tensor] = []
+        for out_idx in self.output_indices:
+            out_shape = tuple(int(v) for v in self.context.get_binding_shape(int(out_idx)))
+            if any(int(v) < 0 for v in out_shape):
+                raise RuntimeError(
+                    f"Unresolved dynamic output shape for binding index {out_idx} "
+                    f"in {self.engine_path.as_posix()}: {out_shape}"
+                )
+            out_dtype = self._trt_dtype_to_numpy(self.engine.get_binding_dtype(int(out_idx)))
+            out_t = torch.empty(
+                out_shape,
+                device=self.device,
+                dtype=_torch_dtype_from_numpy(out_dtype),
+            )
+            bindings[int(out_idx)] = int(out_t.data_ptr())
+            out_tensors.append(out_t)
+
+        ok = self.context.execute_v2(bindings)
+        if not ok:
+            raise RuntimeError(f"TensorRT execution failed for {self.engine_path.as_posix()}")
+        torch.cuda.synchronize(self.device)
+        return [t.detach().cpu().numpy() for t in out_tensors]
+
+
+def _split_engine_outputs(outputs: List[np.ndarray], batch_size: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    if not outputs:
+        raise ValueError("TensorRT engine returned no outputs.")
+
+    normalized: List[np.ndarray] = []
+    for out in outputs:
+        arr = np.asarray(out)
+        if arr.ndim == 0:
+            arr = arr.reshape(1, 1)
+        if arr.ndim == 1:
+            if arr.shape[0] == int(batch_size):
+                arr = arr.reshape(int(batch_size), 1)
+            else:
+                arr = arr.reshape(1, -1)
+        elif arr.ndim > 2:
+            if arr.shape[0] != int(batch_size):
+                raise ValueError(
+                    f"Unexpected TensorRT output shape {tuple(arr.shape)} for batch_size={batch_size}."
+                )
+            arr = arr.reshape(int(batch_size), -1)
+        else:
+            if arr.shape[0] != int(batch_size):
+                raise ValueError(
+                    f"Unexpected TensorRT output batch dimension: got {tuple(arr.shape)}, batch_size={batch_size}."
+                )
+        normalized.append(arr.astype(np.float32, copy=False))
+
+    activity_i = max(range(len(normalized)), key=lambda i: int(normalized[i].shape[1]))
+    activity_logits = normalized[activity_i]
+
+    fall_logit = None
+    if len(normalized) > 1:
+        for i, arr in enumerate(normalized):
+            if i == activity_i:
+                continue
+            if int(arr.shape[1]) == 1:
+                fall_logit = arr.reshape(-1)
+                break
+
+    return activity_logits, fall_logit
+
+
+def _softmax_np(logits: np.ndarray) -> np.ndarray:
+    z = logits - np.max(logits, axis=1, keepdims=True)
+    ez = np.exp(z)
+    return ez / (np.sum(ez, axis=1, keepdims=True) + 1e-12)
+
+
+def predict_probs_engine(
+    engine_runner: TensorRTEngineRunner,
+    X_windows: np.ndarray,
+    y_true: np.ndarray,
+    batch_size: int,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    X = np.asarray(X_windows)
+    y = np.asarray(y_true).reshape(-1).astype(np.int64, copy=False)
+    if int(X.shape[0]) != int(y.shape[0]):
+        raise ValueError(f"X/y size mismatch for engine inference: X={int(X.shape[0])}, y={int(y.shape[0])}")
+
+    if int(batch_size) <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    eff_bs = int(batch_size)
+    static_bs = engine_runner.static_batch_size
+    if static_bs is not None and int(static_bs) > 0:
+        eff_bs = int(static_bs)
+
+    y_all: List[np.ndarray] = []
+    probs_all: List[np.ndarray] = []
+    fall_prob_all: List[np.ndarray] = []
+    has_fall_head = False
+
+    n = int(X.shape[0])
+    for start in range(0, n, eff_bs):
+        stop = min(start + eff_bs, n)
+        xb = np.asarray(X[start:stop], dtype=np.float32)
+        valid_n = int(xb.shape[0])
+
+        if static_bs is not None and valid_n < eff_bs:
+            pad_shape = (eff_bs - valid_n,) + tuple(int(v) for v in xb.shape[1:])
+            xb = np.concatenate([xb, np.zeros(pad_shape, dtype=xb.dtype)], axis=0)
+
+        out_list = engine_runner.infer(xb)
+        activity_logits, fall_logit = _split_engine_outputs(out_list, batch_size=int(xb.shape[0]))
+
+        if valid_n < int(xb.shape[0]):
+            activity_logits = activity_logits[:valid_n]
+            if fall_logit is not None:
+                fall_logit = fall_logit[:valid_n]
+
+        probs = _softmax_np(activity_logits.astype(np.float32, copy=False)).astype(np.float32, copy=False)
+
+        y_all.append(y[start:stop])
+        probs_all.append(probs)
+
+        if fall_logit is not None:
+            has_fall_head = True
+            clipped = np.clip(fall_logit.astype(np.float32, copy=False), -50.0, 50.0)
+            fp = (1.0 / (1.0 + np.exp(-clipped))).astype(np.float32, copy=False)
+            fall_prob_all.append(fp)
+
+    y_np = np.concatenate(y_all)
+    probs_np = np.concatenate(probs_all)
+    if has_fall_head:
+        return y_np, probs_np, np.concatenate(fall_prob_all)
+    return y_np, probs_np, None
+
+
+def load_engine_metadata(
+    *,
+    engine_path: Path,
+    model_name: str,
+    run_dir: Path,
+    engine_meta_arg: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    """
+    Load optional metadata for TensorRT engines.
+
+    `engine_meta_arg`:
+      - "auto": try nearby .pt/.json metadata files
+      - "none": disable metadata loading
+      - otherwise: explicit path to .pt/.pth/.bin or .json
+    """
+    mode = str(engine_meta_arg).strip()
+    mode_l = mode.lower()
+    if mode_l == "none":
+        return None, None
+
+    candidate_paths: List[Path] = []
+    if mode_l == "auto":
+        seen: set[str] = set()
+
+        def _add(p: Path):
+            k = p.resolve().as_posix() if p.is_absolute() else p.as_posix()
+            if k not in seen:
+                seen.add(k)
+                candidate_paths.append(p)
+
+        stem = engine_path.stem
+        _add(run_dir / f"{model_name}_best.pt")
+        _add(run_dir / f"{stem}.pt")
+        _add(run_dir / "best.pt")
+        _add(engine_path.with_suffix(".json"))
+        _add(run_dir / f"{stem}.json")
+        _add(run_dir / f"{model_name}_engine_meta.json")
+        _add(run_dir / "engine_meta.json")
+    else:
+        p_user = Path(mode).expanduser()
+        if p_user.is_absolute():
+            candidate_paths = [p_user]
+        else:
+            candidate_paths = [run_dir / p_user, p_user]
+
+    for p in candidate_paths:
+        if not p.exists() or not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        try:
+            if suf in {".pt", ".pth", ".bin"}:
+                obj = torch_load_safe(p, map_location="cpu")
+                if isinstance(obj, dict):
+                    return obj, p
+            elif suf == ".json":
+                with p.open("r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                if isinstance(obj, dict):
+                    return obj, p
+        except Exception as e:
+            if mode_l != "auto":
+                raise RuntimeError(f"Failed to load --engine-meta from {p.as_posix()}: {e}") from e
+
+    if mode_l != "auto":
+        raise FileNotFoundError(f"--engine-meta path not found or unsupported: {mode}")
+    return None, None
+
+
 def pickle_load_safe(path: Path):
     try:
         with path.open("rb") as f:
@@ -832,7 +1362,23 @@ def main():
         "--weights-name",
         type=str,
         default=None,
-        help="Override weights filename. If omitted uses '<model>_best.pt' (or '<model>_best.pkl' for rf).",
+        help="Override weights filename. If omitted uses '<model>_best.pt' (or '<model>_best.pkl' for rf). Supports .engine for TensorRT.",
+    )
+    parser.add_argument(
+        "--weights-path",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional direct weight file path override. "
+            "Use either a single PATH when evaluating one model, or model=PATH entries for multiple models. "
+            "When set for a model, this takes precedence over --ckpt-root/--ckpt/--weights-name."
+        ),
+    )
+    parser.add_argument(
+        "--engine-meta",
+        type=str,
+        default="auto",
+        help="Metadata source when using .engine weights: 'auto', 'none', or a path to .pt/.pth/.bin/.json metadata.",
     )
     parser.add_argument("--out-dir", type=str, default="eval_outputs", help="Output directory")
     parser.add_argument("--use-conf", action="store_true", help="Use confidence channel (x,y,conf).")
@@ -1091,6 +1637,7 @@ def main():
 
     ckpt_root = Path(args.ckpt_root)
     ckpt_overrides = parse_ckpt_overrides(args.ckpt)
+    weights_path_overrides = parse_weights_path_overrides(args.weights_path, model_list)
 
     for m in model_list:
         is_rf = str(m).lower().strip() == "rf"
@@ -1099,21 +1646,58 @@ def main():
         else:
             weights_name = f"{m}_best.pkl" if is_rf else f"{m}_best.pt"
 
-        model_dir = ckpt_root / m
-        run_dir = resolve_run_dir(model_dir, ckpt_overrides.get(m))
-        ckpt_path = run_dir / weights_name
+        if m in weights_path_overrides:
+            ckpt_path = weights_path_overrides[m]
+            if not ckpt_path.is_absolute():
+                ckpt_path = (Path.cwd() / ckpt_path).resolve()
+            else:
+                ckpt_path = ckpt_path.resolve()
+            run_dir = ckpt_path.parent
+            print(f"[{m}] Using direct weights path: {ckpt_path.as_posix()}")
+        else:
+            model_dir = ckpt_root / m
+            run_dir = resolve_run_dir(model_dir, ckpt_overrides.get(m))
+            ckpt_path = run_dir / weights_name
+            print(f"[{m}] Using run folder: {run_dir.name}")
 
-        print(f"[{m}] Using run folder: {run_dir.name}")
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Weights not found for {m}: {ckpt_path.as_posix()}")
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Weights path for {m} is not a file: {ckpt_path.as_posix()}")
 
         rf_model = None
         rf_feature_mode = "flatten"
         rf_feature_dim = None
         model_params_m = float("nan")
+        is_engine = (not is_rf) and is_engine_weights_path(ckpt_path)
+        engine_runner: Optional[TensorRTEngineRunner] = None
+        has_state_dict = False
+        state = None
+        T_used = None
+        in_features: Optional[int] = None
+        num_classes: Optional[int] = None
+        node_features_ckpt: Optional[int] = None
 
         if is_rf:
             ckpt = pickle_load_safe(ckpt_path)
+        elif is_engine:
+            ckpt, engine_meta_source = load_engine_metadata(
+                engine_path=ckpt_path,
+                model_name=str(m),
+                run_dir=run_dir,
+                engine_meta_arg=str(args.engine_meta),
+            )
+            if ckpt is None:
+                ckpt = {}
+                print(f"[{m}][engine] No metadata found (engine_meta={args.engine_meta!r}); using CLI preprocessing args.")
+            else:
+                print(f"[{m}][engine] Using metadata: {engine_meta_source.as_posix() if engine_meta_source else 'unknown'}")
+            engine_runner = TensorRTEngineRunner(ckpt_path, device=args.device)
+            if engine_runner.static_batch_size is not None and int(engine_runner.static_batch_size) != int(args.batch_size):
+                print(
+                    f"[{m}][engine][INFO] static batch size={int(engine_runner.static_batch_size)} "
+                    f"overrides --batch-size={int(args.batch_size)} for TensorRT inference."
+                )
         else:
             ckpt = torch_load_safe(ckpt_path, map_location="cpu")
 
@@ -1125,9 +1709,6 @@ def main():
             rf_feature_mode = str(ckpt.get("feature_mode", ckpt.get("rf_feature_mode", "flatten")))
             rf_feature_dim = ckpt.get("feature_dim", None)
 
-            state = None
-            T_used = None
-            in_features = None
             num_classes = int(ckpt.get("num_classes", NUM_CLASSES_MERGED))
             pre_cfg = resolve_preprocess_config(
                 ckpt=ckpt,
@@ -1183,7 +1764,77 @@ def main():
             drop_ambig_nonfall_only_ckpt = bool(pre_cfg["drop_ambig_nonfall_only"])
             node_features_ckpt = None
 
-        elif "state_dict" in ckpt:
+        elif is_engine:
+            ckpt_dict = ckpt if isinstance(ckpt, dict) else {}
+
+            in_features_raw = ckpt_dict.get("in_features", None)
+            if in_features_raw is not None:
+                in_features = int(in_features_raw)
+
+            num_classes_raw = ckpt_dict.get("num_classes", None)
+            if num_classes_raw is not None:
+                num_classes = int(num_classes_raw)
+
+            pre_cfg = resolve_preprocess_config(
+                ckpt=ckpt_dict if ckpt_dict else None,
+                is_rf=False,
+                use_conf_default=use_conf,
+                normalize_default=normalize_cli,
+                normalize_mode_default=str(args.normalize_mode),
+                add_vel_default=add_vel_cli,
+                add_acc_default=add_acc_cli,
+                add_global_default=add_global_cli,
+                feature_mode_default=feature_mode_cli,
+                motion_xy_scale_default=float(args.motion_xy_scale),
+                conf_thres_default=float(args.conf_thres),
+                max_interp_gap_default=int(args.max_interp_gap),
+                missing_mode_default=str(args.missing_mode),
+                interp_mode_default=str(args.interp_mode),
+                interp_group_default=int(args.interp_group),
+                rp_center_mode_default=str(args.rp_center_mode),
+                rp_img_w_default=args.rp_img_w,
+                rp_img_h_default=args.rp_img_h,
+                T_default=int(args.T),
+                stride_default=int(args.stride),
+                fall_pct_default=float(args.fall_pct),
+                label_mode_default=str(args.label_mode),
+                min_valid_frac_default=float(args.min_valid_frac),
+                add_mask_channel_default=add_mask_channel_cli,
+                drop_ambig_share_default=float(args.drop_ambig_share),
+                drop_ambig_nonfall_only_default=bool(args.drop_ambig_nonfall_only),
+            )
+            use_conf_ckpt = bool(pre_cfg["use_conf"])
+            normalize_ckpt = bool(pre_cfg["normalize"])
+            normalize_mode_ckpt = str(pre_cfg["normalize_mode"])
+            add_vel_ckpt = bool(pre_cfg["add_vel"])
+            add_acc_ckpt = bool(pre_cfg["add_acc"])
+            add_global_ckpt = bool(pre_cfg["add_global"])
+            feature_mode_ckpt = str(pre_cfg["feature_mode"])
+            motion_xy_scale_ckpt = float(pre_cfg["motion_xy_scale"])
+            conf_thres_ckpt = float(pre_cfg["conf_thres"])
+            max_interp_gap_ckpt = int(pre_cfg["max_interp_gap"])
+            missing_mode_ckpt = str(pre_cfg["missing_mode"])
+            interp_mode_ckpt = str(pre_cfg["interp_mode"])
+            interp_group_ckpt = int(pre_cfg["interp_group"])
+            rp_center_mode_ckpt = str(pre_cfg["rp_center_mode"])
+            rp_img_w_ckpt = pre_cfg["rp_img_w"]
+            rp_img_h_ckpt = pre_cfg["rp_img_h"]
+            T_ckpt_raw = int(pre_cfg["T_raw"])
+            stride_ckpt_raw = int(pre_cfg["stride_raw"])
+            fall_pct_ckpt = float(pre_cfg["fall_pct"])
+            label_mode_ckpt = str(pre_cfg["label_mode"])
+            min_valid_frac_ckpt = float(pre_cfg["min_valid_frac"])
+            add_mask_channel_ckpt = bool(pre_cfg["add_mask_channel"])
+            drop_ambig_share_ckpt = float(pre_cfg["drop_ambig_share"])
+            drop_ambig_nonfall_only_ckpt = bool(pre_cfg["drop_ambig_nonfall_only"])
+            node_features_ckpt = ckpt_dict.get("node_features", None)
+            if node_features_ckpt is None and in_features is not None and (int(in_features) % 17 == 0):
+                node_features_ckpt = int(in_features) // 17
+            if node_features_ckpt is not None:
+                node_features_ckpt = int(node_features_ckpt)
+
+        elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+            has_state_dict = True
             state = ckpt["state_dict"]
             T_used = int(ckpt["T_used"])
             in_features = int(ckpt["in_features"])
@@ -1388,50 +2039,68 @@ def main():
                 fall_prob_test = None
                 y_pred = probs_test.argmax(axis=1).astype(int)
             else:
-                # Finalise dims for no-metadata checkpoints
-                if "state_dict" not in ckpt:
-                    num_classes = int(y_test.max() + 1)
+                if is_engine:
+                    if engine_runner is None:
+                        raise RuntimeError(f"[{m}] Internal error: TensorRT engine runner was not initialised.")
+                    y_true, probs_test, fall_prob_test = predict_probs_engine(
+                        engine_runner,
+                        X_windows=X_test,
+                        y_true=y_test,
+                        batch_size=int(args.batch_size),
+                    )
+                    if num_classes is None or int(num_classes) <= 0:
+                        num_classes = int(probs_test.shape[1])
+                    y_pred = probs_test.argmax(axis=1).astype(int)
+                else:
+                    # Finalise dims for no-metadata checkpoints
+                    if not has_state_dict:
+                        num_classes = int(y_test.max() + 1)
 
-                test_ds = WindowTensorDataset(X_test, y_test)
+                    test_ds = WindowTensorDataset(X_test, y_test)
 
-                sample_X0, _ = test_ds[0]
-                in_features_now = int(sample_X0.shape[-1])
-                if node_features_ckpt is None and (in_features_now % 17 == 0):
-                    node_features_ckpt = in_features_now // 17
+                    sample_X0, _ = test_ds[0]
+                    in_features_now = int(sample_X0.shape[-1])
+                    if node_features_ckpt is None and (in_features_now % 17 == 0):
+                        node_features_ckpt = in_features_now // 17
 
-                if "state_dict" in ckpt and in_features_now != in_features:
-                    raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
+                    if has_state_dict and in_features is not None and in_features_now != int(in_features):
+                        raise RuntimeError(f"[{m}] in_features mismatch: ckpt={in_features}, dataset={in_features_now}")
 
-                in_features_final = in_features if "state_dict" in ckpt else in_features_now
+                    in_features_final = int(in_features) if (has_state_dict and in_features is not None) else in_features_now
 
-                test_loader = DataLoader(
-                    test_ds,
-                    batch_size=args.batch_size,
-                    shuffle=False,
-                    drop_last=False,
-                    num_workers=args.num_workers,
-                    pin_memory=True,
-                )
+                    test_loader = DataLoader(
+                        test_ds,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        drop_last=False,
+                        num_workers=args.num_workers,
+                        pin_memory=True,
+                    )
 
-                model = get_model(
-                    m,
-                    in_features=in_features_final,
-                    num_classes=num_classes if "state_dict" in ckpt else int(y_test.max() + 1),
-                    device=args.device,
-                    T_used=T_used,
-                    node_features=node_features_ckpt,
-                )
+                    model = get_model(
+                        m,
+                        in_features=in_features_final,
+                        num_classes=int(num_classes) if (has_state_dict and num_classes is not None) else int(y_test.max() + 1),
+                        device=args.device,
+                        T_used=T_used,
+                        node_features=node_features_ckpt,
+                    )
 
-                model.load_state_dict(state, strict=False)
-                model_params_m = float(count_params_m(model))
+                    if state is None:
+                        raise RuntimeError(f"[{m}] Missing model state while evaluating non-engine checkpoint.")
+                    model.load_state_dict(state, strict=False)
+                    model_params_m = float(count_params_m(model))
 
-                # Multi-class predictions + optional fall head probability
-                y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
-                y_pred = probs_test.argmax(axis=1).astype(int)
+                    # Multi-class predictions + optional fall head probability
+                    y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
+                    y_pred = probs_test.argmax(axis=1).astype(int)
 
             # Confusion matrix
             if not is_rf:
-                num_classes_eval = int(num_classes if "state_dict" in ckpt else NUM_CLASSES_MERGED)
+                if has_state_dict and num_classes is not None:
+                    num_classes_eval = int(num_classes)
+                else:
+                    num_classes_eval = int(probs_test.shape[1])
             labels_all = list(range(num_classes_eval))
             cm_counts = confusion_matrix(y_true, y_pred, labels=labels_all).astype(np.float64)
 
@@ -1582,6 +2251,15 @@ def main():
                             expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
                         )
                         fall_prob_tune = None
+                    elif is_engine:
+                        if engine_runner is None:
+                            raise RuntimeError(f"[{m}] Internal error: TensorRT engine runner was not initialised.")
+                        y_tune_true, probs_tune, fall_prob_tune = predict_probs_engine(
+                            engine_runner,
+                            X_windows=X_tune,
+                            y_true=y_tune,
+                            batch_size=int(args.batch_size),
+                        )
                     else:
                         tune_ds = WindowTensorDataset(X_tune, y_tune)
                         tune_loader = DataLoader(
