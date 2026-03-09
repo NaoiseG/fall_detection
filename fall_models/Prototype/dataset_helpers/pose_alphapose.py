@@ -38,6 +38,8 @@ class AlphaPoseExportConfig:
     max_jump_px: Optional[float] = None
     max_jump_diag_frac: float = 0.25
     max_lost: int = 10
+    switch_margin_px: float = 20.0
+    reset_on_max_lost: bool = False
     target_x_frac: float = 0.5
     target_y_frac: float = 0.5
     draw_kpt_threshold: float = 0.30
@@ -197,11 +199,13 @@ def select_person_idx(
     target_center: np.ndarray,
     conf_min: float,
     max_jump_px: float,
+    switch_margin_px: float,
 ) -> Tuple[Optional[int], Optional[np.ndarray]]:
     """
     Temporal target selection:
       - Acquire (no prev_center): prefer conf >= conf_min, closest to target center.
       - Track (has prev_center): closest to prev_center with max-jump gate.
+        If multiple candidates are similarly close, keep the current target lock.
     """
     num_people = int(box_centers.shape[0])
     if num_people == 0:
@@ -226,10 +230,18 @@ def select_person_idx(
     if dists.size == 0:
         return None, prev_center
 
-    best_idx = int(np.argmin(dists))
-    best_dist = float(dists[best_idx])
-    if not np.isfinite(best_dist) or best_dist > max_jump_px:
+    valid = np.where(np.isfinite(dists) & (dists <= max_jump_px))[0]
+    if valid.size == 0:
         return None, prev_center
+
+    ranked = valid[np.argsort(dists[valid])]
+    best_idx = int(ranked[0])
+
+    if ranked.size >= 2 and switch_margin_px > 0.0:
+        second_idx = int(ranked[1])
+        margin = float(dists[second_idx] - dists[best_idx])
+        if margin < switch_margin_px:
+            return None, prev_center
 
     return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
 
@@ -758,6 +770,7 @@ def run_pose_on_frames_alphapose(
                     target_center=target_center,
                     conf_min=config.conf_min,
                     max_jump_px=max_jump_px,
+                    switch_margin_px=config.switch_margin_px,
                 )
 
                 if idx is None:
@@ -795,7 +808,7 @@ def run_pose_on_frames_alphapose(
                                 pconf = arrays["person_conf"][i, j]
                                 csv_rows.append([i, j, k, float(x), float(y), float(kconf), float(pconf), p])
 
-        if lost_count > config.max_lost:
+        if config.reset_on_max_lost and lost_count > config.max_lost:
             prev_center = None
 
         if config.render_video:

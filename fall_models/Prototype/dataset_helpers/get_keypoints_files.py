@@ -119,7 +119,7 @@ def main():
 
     cfg = PoseExportConfig(
         model_path=str(model_path),
-        conf_thres=0.25,
+        conf_thres=0.1,
         conf_min=0.75,
         fps=30,
         max_people=1,

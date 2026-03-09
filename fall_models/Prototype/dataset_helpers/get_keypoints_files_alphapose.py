@@ -115,7 +115,7 @@ def main():
         checkpoint="pretrained_models/fast_res50_256x192.pth",
         detector_cfg="detector/yolo/cfg/yolov3-spp.cfg",
         detector_weights="detector/yolo/data/yolov3-spp.weights",
-        conf_thres=0.25,
+        conf_thres=0.1,
         conf_min=0.75,
         nms_thres=0.6,
         fps=30,
