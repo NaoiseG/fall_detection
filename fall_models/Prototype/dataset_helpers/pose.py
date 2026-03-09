@@ -23,6 +23,7 @@ class PoseExportConfig:
     conf_min: float = 0.75
     fps: int = 30
     max_people: int = 1
+    detector_max_det: int = 10
     num_kpts: int = 17               # COCO keypoints for Ultralytics pose models
     video_codec: str = "mp4v"        # mp4v is widely supported
     save_csv: bool = False
@@ -498,6 +499,8 @@ def run_pose_on_frames(
             print(f"Skipping unreadable frame: {p}")
             continue
 
+        # Keep detector candidate count independent from exported people count.
+        max_det = max(1, int(config.detector_max_det))
         if yolo_is_engine:
             results = model.predict(
                 source=frame,
@@ -505,10 +508,16 @@ def run_pose_on_frames(
                 verbose=False,
                 device=yolo_predict_device,
                 half=use_half_yolo,
-                max_det=max(1, int(config.max_people)),
+                max_det=max_det,
             )
         else:
-            results = model(frame, conf=config.conf_thres, verbose=False)
+            results = model.predict(
+                source=frame,
+                conf=config.conf_thres,
+                verbose=False,
+                device=yolo_predict_device,
+                max_det=max_det,
+            )
         r = results[0]
         selected_xy: Optional[np.ndarray] = None
         selected_kc: Optional[np.ndarray] = None
