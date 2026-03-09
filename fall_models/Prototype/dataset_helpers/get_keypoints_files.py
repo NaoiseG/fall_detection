@@ -96,10 +96,17 @@ def main():
         default=Path("../../Datasets/UPFall_keypoints/outputs_npz"),
         help="Root where outputs are written (default: ../../Datasets/UPFall_keypoints/outputs_npz).",
     )
+    ap.add_argument(
+        "--model-path",
+        type=Path,
+        default=Path("pose_models/ultralytics/yolo11l-pose.pt"),
+        help="Path to YOLO pose weights (.pt or TensorRT .engine).",
+    )
     args = ap.parse_args()
 
     upfall_root = args.upfall_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
+    model_path = args.model_path.expanduser().resolve()
 
     if not upfall_root.exists() or not upfall_root.is_dir():
         raise SystemExit(f"UP-Fall root does not exist or is not a directory: {upfall_root}")
@@ -111,7 +118,7 @@ def main():
         from pose import PoseExportConfig, run_pose_on_frames
 
     cfg = PoseExportConfig(
-        model_path=str(Path("pose_models/ultralytics/yolo11l-pose.pt")),
+        model_path=str(model_path),
         conf_thres=0.25,
         conf_min=0.75,
         fps=30,
@@ -129,6 +136,7 @@ def main():
 
     print(f"UP-Fall root: {upfall_root}")
     print(f"Output root: {output_root}")
+    print(f"Model path: {model_path}")
     print(f"Subjects: {args.subjects}")
     print("Camera folders found:", len(camera_folders))
     total = len(camera_folders)

@@ -1,6 +1,9 @@
+import json
 import os
 import glob
 import re
+import shutil
+from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 import pandas as pd
@@ -74,6 +77,88 @@ def read_image(path: str) -> np.ndarray:
     if img is None:
         raise RuntimeError(f"Failed to read image: {path}")
     return img
+
+
+def is_engine_weights_path(weights_path: Path) -> bool:
+    return weights_path.suffix.lower() == ".engine"
+
+
+def resolve_yolo_predict_device(device: str, yolo_is_engine: bool) -> Any:
+    """
+    Ultralytics accepts string/int device selectors.
+    For TensorRT engines, a numeric GPU index is often the most compatible.
+    """
+    device_str = str(device).strip()
+    if not yolo_is_engine:
+        return device_str
+
+    d = device_str.lower()
+    if d == "cuda":
+        return 0
+    if d.startswith("cuda:"):
+        idx = d.split(":", 1)[1].strip()
+        if idx.isdigit():
+            return int(idx)
+    return device_str
+
+
+def _has_ultralytics_engine_metadata(engine_path: Path) -> bool:
+    """
+    Ultralytics TensorRT loader expects engine files to begin with:
+      [4-byte little-endian metadata length][JSON metadata][serialized TRT engine]
+    """
+    try:
+        file_size = int(engine_path.stat().st_size)
+        if file_size <= 4:
+            return False
+
+        with engine_path.open("rb") as f:
+            raw_len = f.read(4)
+            if len(raw_len) != 4:
+                return False
+            meta_len = int.from_bytes(raw_len, byteorder="little", signed=False)
+
+            max_reasonable = min(file_size - 4, 8 * 1024 * 1024)
+            if meta_len <= 0 or meta_len > int(max_reasonable):
+                return False
+
+            meta_raw = f.read(meta_len)
+            if len(meta_raw) != int(meta_len):
+                return False
+
+        meta = json.loads(meta_raw.decode("utf-8"))
+        return isinstance(meta, dict)
+    except Exception:
+        return False
+
+
+def ensure_ultralytics_engine_header(engine_path: Path) -> Path:
+    """
+    Wrap metadata-less TRT engines with an empty Ultralytics metadata header.
+    """
+    if _has_ultralytics_engine_metadata(engine_path):
+        return engine_path
+
+    stem = engine_path.stem
+    if not stem.endswith(".ultra"):
+        stem = f"{stem}.ultra"
+    wrapped_path = engine_path.with_name(f"{stem}.engine")
+
+    try:
+        src_stat = engine_path.stat()
+        if wrapped_path.exists():
+            dst_stat = wrapped_path.stat()
+            if int(dst_stat.st_mtime) >= int(src_stat.st_mtime) and int(dst_stat.st_size) > int(src_stat.st_size):
+                return wrapped_path
+    except OSError:
+        pass
+
+    meta_raw = b"{}"
+    with engine_path.open("rb") as src, wrapped_path.open("wb") as dst:
+        dst.write(int(len(meta_raw)).to_bytes(4, byteorder="little", signed=False))
+        dst.write(meta_raw)
+        shutil.copyfileobj(src, dst, length=1024 * 1024)
+    return wrapped_path
 
 
 # ----------------------------- DATA STRUCTURES -----------------------------
@@ -314,10 +399,36 @@ def run_pose_on_frames(
     frame_paths = list_frames(frames_dir, pattern=pattern)
     num_frames = len(frame_paths)
 
-    model = YOLO(config.model_path)
+    weights_path = Path(config.model_path).expanduser()
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Pose model not found: {weights_path}")
+
+    yolo_is_engine = is_engine_weights_path(weights_path)
+    runtime_weights_path = weights_path
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    if yolo_is_engine:
+        if not str(device).lower().startswith("cuda"):
+            raise RuntimeError(
+                f"TensorRT .engine model requires CUDA, but resolved device is '{device}'."
+            )
+        runtime_weights_path = ensure_ultralytics_engine_header(weights_path)
+
+    try:
+        model = YOLO(str(runtime_weights_path), task="pose")
+    except TypeError:
+        model = YOLO(str(runtime_weights_path))
+
+    if not yolo_is_engine:
+        model.to(device)
+
+    yolo_predict_device = resolve_yolo_predict_device(device=device, yolo_is_engine=yolo_is_engine)
+    use_half_yolo = bool(yolo_is_engine and str(device).lower().startswith("cuda"))
     print("Using device:", device)
+    if yolo_is_engine:
+        print(f"Using TensorRT engine: {weights_path}")
+        if runtime_weights_path != weights_path:
+            print(f"Wrapped engine path: {runtime_weights_path}")
 
     first = read_image(frame_paths[0])
     h, w = first.shape[:2]
@@ -375,7 +486,17 @@ def run_pose_on_frames(
             print(f"Skipping unreadable frame: {p}")
             continue
 
-        results = model(frame, conf=config.conf_thres, verbose=False)
+        if yolo_is_engine:
+            results = model.predict(
+                source=frame,
+                conf=config.conf_thres,
+                verbose=False,
+                device=yolo_predict_device,
+                half=use_half_yolo,
+                max_det=max(1, int(config.max_people)),
+            )
+        else:
+            results = model(frame, conf=config.conf_thres, verbose=False)
         r = results[0]
         selected_xy: Optional[np.ndarray] = None
         selected_kc: Optional[np.ndarray] = None
