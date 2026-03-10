@@ -20,6 +20,9 @@ Usage:
   --profile-duration-s 60 \
   --hw-sample-hz 1.0 \
   --no-display 1
+
+
+  python -m inference.inference_on_video --video ../../Datasets/test_vids/sitting.mp4 --model ../../web_app/models/classification/MotionBERT/yolo11l-pose/checkpoint/action/FT_MB_release_MB_ft_UPFall_xsub/best_epoch.bin --yolo-weights ../../quantisation/models/ultralytics/yolo11l-pose/yolo11l-pose_int8.engine --arch cnnlstm --device cuda --benchmark 1 --profile-out benchmarks --no-display 1
 """
 
 from __future__ import annotations
