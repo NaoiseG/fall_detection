@@ -238,10 +238,10 @@ def _pick_profile_out_dir(
     arch: str,
 ) -> Path:
     base_root = Path(profile_out_arg).expanduser() if profile_out_arg else (save_path.parent if save_path is not None else Path("runs") / "profiling")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     model_tag = _slugify_name(Path(ckpt_path).stem)
     arch_tag = _slugify_name(str(arch).lower())
-    run_name = f"{stamp}_{arch_tag}_{model_tag}"
+    run_name = f"{ts}__model_{arch_tag}_{model_tag}"
     out_dir = base_root / run_name
 
     # Very unlikely with microseconds, but keep guaranteed uniqueness.
@@ -1913,7 +1913,7 @@ def main() -> int:
         "--profile-out",
         type=str,
         default=None,
-        help="Base directory for profiling outputs. A unique per-run subdirectory is created (timestamp + model).",
+        help="Base directory for profiling outputs. Creates a unique run folder named like YYYY-MM-DD_HH-MM-SS_micro__model_<arch>_<ckpt>.",
     )
     ap.add_argument("--profile-duration-s", type=float, default=0.0, help="0 => full run, else stop after N seconds.")
     ap.add_argument("--benchmark", type=int, default=0, help="Loop inference on the same video for benchmark duration (0/1). Requires CUDA.")
@@ -2160,6 +2160,8 @@ def main() -> int:
     metrics_cutoff_frame_idx: Optional[int] = None
     last_hw_print_t = 0.0
     hw_print_interval_s = max(0.5, 1.0 / max(hw_sample_hz, 1e-3))
+    minute_update_interval_s = 60.0
+    last_minute_update_t = profile_run_t0
     benchmark_loop_count = 0
 
     try:
@@ -2615,6 +2617,36 @@ def main() -> int:
             total_ms = (time.perf_counter() - t_frame_start) * 1000.0
             inst_fps = 1000.0 / max(1e-6, total_ms)
             fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+
+            now_update_t = time.perf_counter()
+            if (now_update_t - last_minute_update_t) >= minute_update_interval_s:
+                elapsed_s = now_update_t - profile_run_t0
+                frame_progress = f"{int(display_idx) + 1}"
+                if frame_count > 0:
+                    frame_progress += f"/{int(frame_count)}"
+                update_msg = (
+                    "[update] "
+                    f"t={_fmt_live_metric(elapsed_s, 's')} "
+                    f"frame={frame_progress} "
+                    f"sampled={int(sampled_total)} "
+                    f"loops={int(benchmark_loop_count)} "
+                    f"fps={_fmt_live_metric(fps_ema if fps_ema is not None else np.nan)} "
+                    f"pre={_fmt_live_metric(preprocess_ms, 'ms')} "
+                    f"yolo={_fmt_live_metric(yolo_infer_ms, 'ms')} "
+                    f"temp={_fmt_live_metric(temporal_infer_ms, 'ms')} "
+                    f"total={_fmt_live_metric(total_ms, 'ms')}"
+                )
+                if hw_sampler is not None:
+                    latest_hw = hw_sampler.get_latest_sample()
+                    if latest_hw is not None:
+                        update_msg += (
+                            f" gpu={_fmt_live_metric(latest_hw.get('gpu_pct', np.nan), '%')} "
+                            f"cpu={_fmt_live_metric(latest_hw.get('cpu_pct', np.nan), '%')} "
+                            f"ram={_fmt_live_metric(latest_hw.get('ram_used_pct', np.nan), '%')} "
+                            f"pwr={_fmt_live_metric(latest_hw.get('power_w', np.nan), 'W')}"
+                        )
+                print(update_msg)
+                last_minute_update_t = now_update_t
 
             if profile_enabled and not metrics_cutoff_active:
                 inference_ms = float(yolo_infer_ms) + float(temporal_infer_ms)
