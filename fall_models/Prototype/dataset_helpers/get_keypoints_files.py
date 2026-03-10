@@ -119,16 +119,20 @@ def main():
 
     cfg = PoseExportConfig(
         model_path=str(model_path),
-        conf_thres=0.05,
-        conf_min=0.1,
+        conf_thres=0.01,
+        conf_min=0.01,
         fps=30,
         max_people=1,        # export one tracked person
         detector_max_det=10, # but allow detector to return multiple candidates
         max_jump_px=None,  # None => use max_jump_diag_frac * image_diagonal
-        max_jump_diag_frac=0.4,
-        max_lost=15,
-        switch_margin_px=8.0,
+        max_jump_diag_frac=0.12,
+        max_lost=60,
+        switch_margin_px=9999.0,
         reset_on_max_lost=False,
+        lock_first_target=True,
+        strict_reacquire=True,
+        min_iou_same_track=0.05,
+        max_box_area_ratio=2.5,
         save_csv=False,
     )
 

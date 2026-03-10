@@ -46,10 +46,10 @@ class VitPoseExportConfig:
     pose_model: str = "usyd-community/vitpose-base"
 
     # thresholds
-    person_threshold: float = 0.1
-    pose_threshold: float = 0.3
-    conf_min: float = 0.75
-    draw_kpt_threshold: float = 0.3
+    person_threshold: float = 0.01
+    pose_threshold: float = 0.01
+    conf_min: float = 0.01
+    draw_kpt_threshold: float = 0.01
 
     fps: int = 30
     max_people: int = 1
@@ -61,6 +61,10 @@ class VitPoseExportConfig:
     max_lost: int = 10
     switch_margin_px: float = 20.0
     reset_on_max_lost: bool = False
+    lock_first_target: bool = True
+    min_iou_same_track: float = 0.1
+    max_box_area_ratio: float = 2.0
+    strict_reacquire: bool = True
     target_x_frac: float = 0.5
     target_y_frac: float = 0.5
     draw_no_target_text: bool = True
@@ -270,28 +274,75 @@ def _pose_to_arrays(person_pose: Dict[str, Any], num_kpts: int) -> Tuple[np.ndar
     return xy, conf
 
 
+def _box_area_xyxy(box_xyxy: np.ndarray) -> float:
+    box = np.asarray(box_xyxy, dtype=np.float32).reshape(-1)
+    if box.shape[0] < 4 or not np.all(np.isfinite(box[:4])):
+        return 0.0
+    w = float(max(0.0, float(box[2] - box[0])))
+    h = float(max(0.0, float(box[3] - box[1])))
+    return w * h
+
+
+def box_iou_xyxy(box1, box2) -> float:
+    b1 = np.asarray(box1, dtype=np.float32).reshape(-1)
+    b2 = np.asarray(box2, dtype=np.float32).reshape(-1)
+    if b1.shape[0] < 4 or b2.shape[0] < 4:
+        return 0.0
+    if not np.all(np.isfinite(b1[:4])) or not np.all(np.isfinite(b2[:4])):
+        return 0.0
+
+    x_left = max(float(b1[0]), float(b2[0]))
+    y_top = max(float(b1[1]), float(b2[1]))
+    x_right = min(float(b1[2]), float(b2[2]))
+    y_bottom = min(float(b1[3]), float(b2[3]))
+
+    inter_w = max(0.0, x_right - x_left)
+    inter_h = max(0.0, y_bottom - y_top)
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+
+    a1 = _box_area_xyxy(b1[:4])
+    a2 = _box_area_xyxy(b2[:4])
+    denom = a1 + a2 - inter
+    if denom <= 0.0:
+        return 0.0
+    return float(inter / denom)
+
+
 def select_person_idx(
     box_centers: np.ndarray,
     box_conf: Optional[np.ndarray],
+    boxes_xyxy: np.ndarray,
     prev_center: Optional[np.ndarray],
+    prev_box_xyxy: Optional[np.ndarray],
     target_center: np.ndarray,
     conf_min: float,
     max_jump_px: float,
-    switch_margin_px: float,
+    min_iou_same_track: float,
+    max_box_area_ratio: float,
+    locked: bool,
+    strict_reacquire: bool = True,
 ) -> Tuple[Optional[int], Optional[np.ndarray]]:
     """
-    Temporal target selection:
-      - Acquire (no prev_center): prefer conf >= conf_min, closest to target center.
-      - Track (has prev_center): closest to prev_center with max-jump gate.
-        If multiple candidates are similarly close, keep the current target lock.
+    Single-target selection:
+      - Before lock: acquire once, closest to target_center (optionally preferring conf >= conf_min).
+      - After lock: never center-reacquire. Match only candidates consistent with previous target.
+        Strict mode gates by center jump, IoU to previous box, and box-area ratio.
+        Candidates are ranked by highest IoU, then smallest center distance.
     """
-    num_people = int(box_centers.shape[0])
+    num_people = min(int(box_centers.shape[0]), int(boxes_xyxy.shape[0]))
     if num_people == 0:
         return None, prev_center
 
-    if prev_center is None:
+    box_centers = box_centers[:num_people]
+    boxes_xyxy = boxes_xyxy[:num_people]
+    if box_conf is not None:
+        box_conf = box_conf[:num_people]
+
+    if not locked:
         candidate_idx = np.arange(num_people, dtype=np.int32)
-        if box_conf is not None and box_conf.shape[0] >= num_people:
+        if box_conf is not None:
             high_conf = np.where(np.isfinite(box_conf[:num_people]) & (box_conf[:num_people] >= conf_min))[0]
             if high_conf.size > 0:
                 candidate_idx = high_conf.astype(np.int32, copy=False)
@@ -304,22 +355,61 @@ def select_person_idx(
         best_idx = int(candidate_idx[best_rel])
         return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
 
+    # After lock: never return to generic center acquisition.
+    if prev_center is None or prev_box_xyxy is None:
+        return None, prev_center
+
     dists = np.linalg.norm(box_centers - prev_center[None, :], axis=1)
     if dists.size == 0:
         return None, prev_center
 
-    valid = np.where(np.isfinite(dists) & (dists <= max_jump_px))[0]
-    if valid.size == 0:
+    valid_jump = np.where(np.isfinite(dists) & (dists <= max_jump_px))[0]
+    if valid_jump.size == 0:
         return None, prev_center
 
-    ranked = valid[np.argsort(dists[valid])]
-    best_idx = int(ranked[0])
+    if not strict_reacquire:
+        ranked = valid_jump[np.argsort(dists[valid_jump])]
+        best_idx = int(ranked[0])
+        return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
 
-    if ranked.size >= 2 and switch_margin_px > 0.0:
-        second_idx = int(ranked[1])
-        margin = float(dists[second_idx] - dists[best_idx])
-        if margin < switch_margin_px:
-            return None, prev_center
+    prev_area = _box_area_xyxy(prev_box_xyxy)
+    if prev_area <= 0.0:
+        return None, prev_center
+
+    area_ratio_limit = max(1.0, float(max_box_area_ratio))
+    min_area_ratio = 1.0 / area_ratio_limit
+    min_iou = max(0.0, float(min_iou_same_track))
+
+    best_idx: Optional[int] = None
+    best_iou = -1.0
+    best_dist = float("inf")
+
+    for idx in valid_jump.tolist():
+        if box_conf is not None and idx < box_conf.shape[0]:
+            conf_val = float(box_conf[idx])
+            if np.isfinite(conf_val) and conf_val < conf_min:
+                continue
+
+        cand_box = boxes_xyxy[idx]
+        iou = box_iou_xyxy(cand_box, prev_box_xyxy)
+        if iou < min_iou:
+            continue
+
+        cand_area = _box_area_xyxy(cand_box)
+        if cand_area <= 0.0:
+            continue
+        area_ratio = cand_area / prev_area
+        if area_ratio < min_area_ratio or area_ratio > area_ratio_limit:
+            continue
+
+        dist = float(dists[idx])
+        if (iou > best_iou + 1e-6) or (abs(iou - best_iou) <= 1e-6 and dist < best_dist):
+            best_idx = int(idx)
+            best_iou = iou
+            best_dist = dist
+
+    if best_idx is None:
+        return None, prev_center
 
     return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
 
@@ -626,6 +716,8 @@ def run_pose_on_frames_vitpose(
         else float(config.max_jump_diag_frac * frame_diag)
     )
     prev_center: Optional[np.ndarray] = None
+    prev_box_xyxy: Optional[np.ndarray] = None
+    track_locked = False
     lost_count = 0
 
     for i, p in enumerate(frame_paths):
@@ -667,25 +759,40 @@ def run_pose_on_frames_vitpose(
                 boxes_xyxy = boxes_xyxy[:num_candidates]
                 box_conf = box_conf[:num_candidates]
 
+                locked_for_selection = bool(
+                    track_locked or (
+                        (not config.lock_first_target) and
+                        (prev_center is not None) and
+                        (prev_box_xyxy is not None)
+                    )
+                )
                 idx, new_center = select_person_idx(
                     box_centers=box_centers,
                     box_conf=box_conf,
+                    boxes_xyxy=boxes_xyxy,
                     prev_center=prev_center,
+                    prev_box_xyxy=prev_box_xyxy,
                     target_center=target_center,
                     conf_min=config.conf_min,
                     max_jump_px=max_jump_px,
-                    switch_margin_px=config.switch_margin_px,
+                    min_iou_same_track=config.min_iou_same_track,
+                    max_box_area_ratio=config.max_box_area_ratio,
+                    locked=locked_for_selection,
+                    strict_reacquire=config.strict_reacquire,
                 )
 
                 if idx is None:
                     lost_count += 1
                 else:
                     prev_center = new_center
+                    prev_box_xyxy = np.asarray(boxes_xyxy[idx], dtype=np.float32).copy()
+                    if config.lock_first_target and not track_locked:
+                        track_locked = True
                     lost_count = 0
 
                     selected_xy = xy[idx]
                     selected_kc = kc[idx]
-                    selected_box_xyxy = boxes_xyxy[idx]
+                    selected_box_xyxy = prev_box_xyxy
 
                     if idx < box_conf.shape[0] and np.isfinite(box_conf[idx]):
                         selected_person_conf = float(box_conf[idx])
@@ -712,8 +819,9 @@ def run_pose_on_frames_vitpose(
                                 pconf = arrays["person_conf"][i, j]
                                 csv_rows.append([i, j, k, float(x), float(y), float(kconf), float(pconf), p])
 
-        if config.reset_on_max_lost and lost_count > config.max_lost:
+        if config.reset_on_max_lost and (not track_locked) and lost_count > config.max_lost:
             prev_center = None
+            prev_box_xyxy = None
 
         if config.render_video:
             annotated = draw_selected_pose(
@@ -793,14 +901,21 @@ def main() -> None:
     cfg = VitPoseExportConfig(
         detector_model="PekingU/rtdetr_r50vd_coco_o365",
         pose_model="usyd-community/vitpose-base",
-        person_threshold=0.25,
+        person_threshold=0.02,
         pose_threshold=0.3,
-        conf_min=0.75,
+        conf_min=0.05,
         draw_kpt_threshold=0.3,
         fps=30,
         max_people=1,
         max_jump_px=None,  # None => use max_jump_diag_frac * image_diagonal
-        max_lost=10,
+        max_jump_diag_frac=0.12,
+        max_lost=60,
+        switch_margin_px=9999.0,
+        reset_on_max_lost=False,
+        lock_first_target=True,
+        strict_reacquire=True,
+        min_iou_same_track=0.05,
+        max_box_area_ratio=2.5,
         save_csv=False,
         render_video=True,
     )
