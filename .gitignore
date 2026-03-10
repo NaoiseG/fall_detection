@@ -35,3 +35,4 @@ web_app/venv/
 web_app/models/
 fall_models/Prototype/models/HAR-WISDM-Dataset/
 *.onnx
+*.cache

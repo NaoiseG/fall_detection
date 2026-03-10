@@ -1,0 +1,8 @@
+path: /home/jetson/NaoiseG/fall_detection/quantisation/calibration_dataset_upfall
+train: images/val
+val: images/val
+
+names:
+  0: person
+
+kpt_shape: [17, 3]
