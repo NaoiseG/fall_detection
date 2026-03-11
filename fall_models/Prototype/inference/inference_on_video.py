@@ -237,14 +237,14 @@ def _slugify_name(name: str) -> str:
 def _pick_profile_out_dir(
     profile_out_arg: Optional[str],
     save_path: Optional[Path],
-    ckpt_path: Path,
     arch: str,
+    yolo_weights_path: Path,
 ) -> Path:
     base_root = Path(profile_out_arg).expanduser() if profile_out_arg else (save_path.parent if save_path is not None else Path("runs") / "profiling")
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-    model_tag = _slugify_name(Path(ckpt_path).stem)
     arch_tag = _slugify_name(str(arch).lower())
-    run_name = f"{ts}__model_{arch_tag}_{model_tag}"
+    yolo_tag = _slugify_name(Path(yolo_weights_path).name)
+    run_name = f"{ts}__model_{arch_tag}__kpts_{yolo_tag}"
     out_dir = base_root / run_name
 
     # Very unlikely with microseconds, but keep guaranteed uniqueness.
@@ -1916,7 +1916,7 @@ def main() -> int:
         "--profile-out",
         type=str,
         default=None,
-        help="Base directory for profiling outputs. Creates a unique run folder named like YYYY-MM-DD_HH-MM-SS_micro__model_<arch>_<ckpt>.",
+        help="Base directory for profiling outputs. Creates a unique run folder named like YYYY-MM-DD_HH-MM-SS_micro__model_<arch>__kpts_<yolo_weights_filename>.",
     )
     ap.add_argument("--profile-duration-s", type=float, default=0.0, help="0 => full run, else stop after N seconds.")
     ap.add_argument("--benchmark", type=int, default=0, help="Loop inference on the same video for benchmark duration (0/1). Requires CUDA.")
@@ -2026,8 +2026,8 @@ def main() -> int:
         profile_out_dir = _pick_profile_out_dir(
             profile_out_arg=args.profile_out,
             save_path=save_path,
-            ckpt_path=ckpt_path,
             arch=arch,
+            yolo_weights_path=yolo_weights_path,
         )
 
     is_rf = str(arch).lower().strip() == "rf" or ckpt_path.suffix.lower() in {".pkl", ".pickle"}
