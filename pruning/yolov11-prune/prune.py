@@ -10,19 +10,19 @@ ultralytics/nn/tasks_pruend.py: 新增DetectionModelPruned, parse_model_pruned
 import re
 import os
 import sys
+import copy
 from pathlib import Path
 
 import yaml
 import argparse
-import onnx  
-import onnxslim
 
 import torch
 import torch.nn as nn
 from ultralytics import YOLO
 from ultralytics.utils import colorstr
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.nn.modules import Conv, Concat, Bottleneck, Attention, PSABlock, C2PSA, DWConv, Detect
+from ultralytics.nn.modules import Conv, Concat, Bottleneck, Attention, PSABlock, C2PSA, DWConv, Detect, Pose
+from ultralytics.nn.tasks import PoseModel
 
 from ultralytics.nn.modules.block_pruned import SPPFPruned, C3k2Pruned, C2PSAPruned
 from ultralytics.nn.modules.head_pruned import DetectPruned
@@ -40,6 +40,25 @@ def main(opt):
     weights, prune_ratio, cfg, model_size, save_dir = opt.weights, opt.prune_ratio, opt.cfg, opt.model_size, opt.save_dir
     model = AutoBackend(weights, fuse=False)
     model.eval()
+    os.makedirs(save_dir, exist_ok=True)
+
+    is_pose_model = isinstance(model.model, PoseModel) or any(isinstance(m, Pose) for m in model.model.modules())
+    pose_module_prefixes = {
+        name
+        for name, module in model.model.named_modules()
+        if isinstance(module, Pose) or ".pose" in name.lower()
+    }
+
+    def is_pose_head_module(module_name):
+        if ".pose" in module_name.lower():
+            return True
+        for prefix in pose_module_prefixes:
+            if prefix and (module_name == prefix or module_name.startswith(prefix + ".")):
+                return True
+        return False
+
+    if is_pose_model:
+        print(colorstr('blue', 'PoseModel detected, preserving Pose head and skipping pose-head pruning.'))
     # =========================================step1=========================================
     """
     遍历所有module:
@@ -50,20 +69,17 @@ def main(opt):
     # 聚集所有的bn层和忽略剪枝的bn层
     bn_dict = {}
     # 这三层是连接Detect的三个卷积层, 因为Detect中的右侧分支的第一个卷积是深度可分离卷积, 输入通道数和输出通道数必须一样, 所以连接其的前一个卷积忽略剪枝
-    ignore_bn_list = ['model.16.cv2.bn', 'model.19.cv2.bn', 'model.22.cv2.bn'] 
+    ignore_bn_list = {'model.16.cv2.bn', 'model.19.cv2.bn', 'model.22.cv2.bn'}
     chunk_bn_list = []
     for name, module in model.model.named_modules():
 
-        if "pose" in name.lower():
-            continue
-
-        if module.__class__.__name__ == "Pose":
-            continue
+        if isinstance(module, nn.BatchNorm2d) and is_pose_head_module(name):
+            ignore_bn_list.add(name)
         # 在Bottleneck结构中, 如果有残差连接, 那么Add相加的两个分支的通道数要保持一致, 所以不剪
         if isinstance(module, Bottleneck):
             if module.add:  # 虽然在v11中是C3k2模块, 但实际上上和v8中的C2f模块对忽略剪枝的bn层的处理是一样的
-                ignore_bn_list.append(name.rsplit(".", 2)[0] + ".cv1.bn")  # C2f模块中的第一个卷积层的bn层
-                ignore_bn_list.append(name + '.cv2.bn')                    # C2f模块中的BottleNeck模块中的第二个卷积层
+                ignore_bn_list.add(name.rsplit(".", 2)[0] + ".cv1.bn")  # C2f模块中的第一个卷积层的bn层
+                ignore_bn_list.add(name + '.cv2.bn')                    # C2f模块中的BottleNeck模块中的第二个卷积层
             else:
                 # yolov11与yolov8是由backbone+head构成的, 与v8不同的是, v8中的head中所有的c2f模块是没有add操作的, 所以也可以剪,
                 # 但是由于C2f在forward时有chunck操作, 所以要保证chunck之前的通道数是偶数, 这里用chunk_bn_list保存一下
@@ -71,19 +87,19 @@ def main(opt):
                 # 但是v11的是有add操作的, 所以这个else代码其实不生效
                 chunk_bn_list.append(f"{name[:-4]}.cv1.bn")
         if isinstance(module, Attention):
-            ignore_bn_list.append(name + ".qkv.bn")                        # Attention模块中的qkv中的bn层
-            ignore_bn_list.append(name + ".pe.bn")                         # Attention模块中的pe分支的卷积层的bn层
-            ignore_bn_list.append(name + ".proj.bn")                       # Attention模块中的proj分支的卷积层的bn层
+            ignore_bn_list.add(name + ".qkv.bn")                        # Attention模块中的qkv中的bn层
+            ignore_bn_list.add(name + ".pe.bn")                         # Attention模块中的pe分支的卷积层的bn层
+            ignore_bn_list.add(name + ".proj.bn")                       # Attention模块中的proj分支的卷积层的bn层
         if isinstance(module, PSABlock):
-            ignore_bn_list.append(name + ".ffn.1.bn")                      # Attention模块中的ffn分支的第二个卷积层的bn层
+            ignore_bn_list.add(name + ".ffn.1.bn")                      # Attention模块中的ffn分支的第二个卷积层的bn层
         if isinstance(module, C2PSA):
-            ignore_bn_list.append(name + ".cv1.bn")
+            ignore_bn_list.add(name + ".cv1.bn")
         if isinstance(module, Detect):                                     # Detect模块右侧分支的中两个深度可分离卷积之间的卷积
             for i in range(3):
-                ignore_bn_list.append(name + f".cv3.{i}.0.1.bn")
-                ignore_bn_list.append(name + f".cv3.{i}.1.1.bn")
+                ignore_bn_list.add(name + f".cv3.{i}.0.1.bn")
+                ignore_bn_list.add(name + f".cv3.{i}.1.1.bn")
         if isinstance(module, DWConv):
-            ignore_bn_list.append(name + ".bn")
+            ignore_bn_list.add(name + ".bn")
         # 这里bn_dict保存了所有bn层的信息(包括忽略剪枝的bn层)
         if isinstance(module, nn.BatchNorm2d):
             bn_dict[name] = module     
@@ -215,32 +231,13 @@ def main(opt):
     """ 
     print(colorstr('blue', 'Building pruned model.....'), end='')
     pruned_model = DetectionModelPruned(maskbndict=maskbndict, cfg=pruned_yaml, ch=3).cuda()
+    if is_pose_model:
+        assert isinstance(model.model.model[-1], Pose), "PoseModel detected but last layer is not Pose"
+        pruned_model.model[-1] = copy.deepcopy(model.model.model[-1]).cuda()
+        pruned_model.stride = pruned_model.model[-1].stride
     pruned_model.eval() 
     # ========================================step9========================================= 
-    # """
-    # 将剪枝后的模型保存为onnx格式, 可以使用netron查看
-    # """
-    print(colorstr('blue', 'Exporting pruned model to onnx.....'))
-    f = os.path.join(save_dir, 'pruned.onnx')
     pruned_model = pruned_model.cpu()
-    for m in pruned_model.modules():
-        if isinstance(m, (DetectPruned)):
-            m.export = True
-            m.format = 'CPU'
-            m.shape = None
-    dummies = torch.randn([1, 3, 640, 640], dtype=torch.float32).cpu()
-    torch.onnx.export(
-        pruned_model,
-        dummies,
-        f,
-        input_names=['images'],
-        output_names=['output'],
-        opset_version=13
-    )
-    model_onnx = onnx.load(f)
-    model_onnx = onnxslim.slim(model_onnx)
-    onnx.save(model_onnx, f)
-    print(colorstr('blue', f'Onnx Model has been saved to {f}'))
     # ========================================step10=========================================      
     """
     将原模型与剪枝后构建好的模型zip起来, 然后遍历每一层的module, 将原模型对应于剪枝后的通道位置的参数赋值给剪枝后的模型
@@ -260,7 +257,7 @@ def main(opt):
     # 匹配c2psa中的attention模块中的pe层
     pattern_attention_pe = re.compile(r"model.\d+.m.\d.attn.pe.bn")
     # 匹配Detect模块中的最后一个卷积层
-    pattern_detect = re.compile(r"model.\d+.cv\d.\d.2")
+    pattern_detect = re.compile(r"model.\d+.cv[23].\d.2")
     model_yamls = model_yamls['backbone'] + model_yamls['head']
     for (name_org, module_org), (name_pruned, module_pruned) in \
         zip(model.model.named_modules(), pruned_model.named_modules()): 
@@ -270,7 +267,7 @@ def main(opt):
         use_c3k = False if layer_index is None else 'C3k2' in model_yamls[layer_index] and 'True' in [str(model_yamls[layer_index][-1][i]) for i in range(len(model_yamls[layer_index][-1]))]
         
         # 如果是dfl层, 说明已经结束了
-        if 'dfl' in name_org:
+        if 'dfl' in name_org and not is_pose_model:
             break
         
         # 如果是Detect模块中的最后一个卷积(不带BN层的卷积)  
@@ -287,6 +284,12 @@ def main(opt):
             
         if isinstance(module_org, nn.Conv2d):
             currnet_bn_layer_name = name_org[:-4] + 'bn'
+            if currnet_bn_layer_name not in maskbndict:
+                module_pruned.weight.data = module_org.weight.data
+                if module_org.bias is not None:
+                    assert module_pruned.bias.data is not None, f"{name_pruned} has no bias"
+                    module_pruned.bias.data = module_org.bias.data
+                continue
             state_dict_org = module_org.weight.data
             out_channels_mask = maskbndict[currnet_bn_layer_name].to(torch.bool)
             prev_bn_layer_name = current_to_prev.get(currnet_bn_layer_name, None)
@@ -348,7 +351,8 @@ def main(opt):
     保存模型
     """
     print(colorstr('blue', 'Saving pruned model.....'))
-    pruned_model.model[23].shape = None
+    if hasattr(pruned_model.model[-1], "shape"):
+        pruned_model.model[-1].shape = None
     pruned_model.eval().cpu()
     save_path = os.path.join(save_dir, "pruned.pt")
     torch.save(
@@ -371,10 +375,11 @@ def parse_opt():
     parser.add_argument('--cfg', type=str, default=ROOT / 'ultralytics/cfg/models/11/yolo11.yaml', help='model.yaml path')
     parser.add_argument('--model-size', type=str, default='l', help='(yolov11)n, s, m, l or x?')
     parser.add_argument('--prune-ratio', type=float, default=0.2, help='prune ratio, leave it -1 if you dont want to prune(for example, debug purpose)')
-    parser.add_argument('--save-dir', type=str, default=ROOT / 'weights', help='pruned model weight save dir')
+    parser.add_argument('--save-dir', type=str, default=ROOT / 'runs/pruning', help='pruned model weight save dir')
     opt = parser.parse_args()
     return opt
 
 if __name__ == "__main__":
     opt = parse_opt()
     main(opt)
+
