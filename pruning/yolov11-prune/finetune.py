@@ -43,7 +43,7 @@ def parse_opt():
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--optimizer", type=str, default="Adam")
+    parser.add_argument("--optimizer", type=str, default="SGD")
     parser.add_argument("--lr0", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--workers", type=int, default=8)
