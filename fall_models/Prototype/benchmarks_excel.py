@@ -162,14 +162,68 @@ def get_nested_number(data: dict, *keys: str) -> Optional[float]:
         return None
 
 
-def extract_metrics(summary: dict) -> Metrics:
+def compute_temporal_ms_per_frame(summary: dict) -> Optional[float]:
+    """
+    Best-effort temporal classifier cost per raw frame.
+
+    Priority:
+    1) avg_temporal_effective_ms_per_frame (already amortized)
+    2) avg_temporal_total_ms_per_window * num_windows_evaluated / num_frames_processed
+    """
+    temporal_effective = get_nested_number(summary, "avg_temporal_effective_ms_per_frame")
+    if temporal_effective is not None and temporal_effective > 0.0:
+        return temporal_effective
+
+    temporal_per_window = get_nested_number(summary, "avg_temporal_total_ms_per_window")
+    windows = get_nested_number(summary, "num_windows_evaluated")
+    frames = get_nested_number(summary, "num_frames_processed")
+    if (
+        temporal_per_window is not None
+        and windows is not None
+        and frames is not None
+        and frames > 0.0
+    ):
+        return (temporal_per_window * windows) / frames
+
+    return None
+
+
+def compute_inference_time_per_frame_ms(summary: dict) -> Optional[float]:
+    """
+    Compute the workbook's "Inference Time/Frame (ms)" robustly across
+    legacy and new benchmark summary formats.
+    """
+    # New shared wrapper summaries expose this directly.
+    total_loop_ms = get_nested_number(summary, "avg_total_loop_ms_per_frame")
+    if total_loop_ms is not None and total_loop_ms > 0.0:
+        return total_loop_ms
+
+    # Fallback for new-format components when total loop is absent.
+    pose_ms = get_nested_number(summary, "avg_pose_infer_ms_per_frame")
+    track_ms = get_nested_number(summary, "avg_track_ms_per_frame")
+    render_ms = get_nested_number(summary, "avg_render_ms_per_frame")
+    writer_ms = get_nested_number(summary, "avg_writer_ms_per_frame")
+    temporal_ms = compute_temporal_ms_per_frame(summary)
+    if None not in (pose_ms, track_ms, render_ms, writer_ms, temporal_ms):
+        return pose_ms + track_ms + render_ms + writer_ms + temporal_ms
+
+    # Legacy format compatibility.
     preprocess = get_nested_number(summary, "preprocess_ms", "mean")
     inference = get_nested_number(summary, "inference_ms", "mean")
     postprocess = get_nested_number(summary, "postprocess_ms", "mean")
-
-    inference_time_per_frame_ms = None
     if preprocess is not None and inference is not None and postprocess is not None:
-        inference_time_per_frame_ms = preprocess + inference + postprocess
+        return preprocess + inference + postprocess
+
+    # Last resort.
+    avg_fps = get_nested_number(summary, "avg_fps")
+    if avg_fps is not None and avg_fps > 0.0:
+        return 1000.0 / avg_fps
+
+    return None
+
+
+def extract_metrics(summary: dict) -> Metrics:
+    inference_time_per_frame_ms = compute_inference_time_per_frame_ms(summary)
 
     cpu_temp = get_nested_number(summary, "avg_cpu_temp_c")
     gpu_temp = get_nested_number(summary, "avg_gpu_temp_c")
