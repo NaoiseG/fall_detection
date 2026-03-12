@@ -6,11 +6,12 @@ import torch.nn as nn
 
 from ultralytics.nn.tasks import BaseModel
 from ultralytics.nn.modules.conv import Conv, Concat
+from ultralytics.nn.modules import Pose
 from ultralytics.nn.modules.head_pruned import DetectPruned
 from ultralytics.nn.modules.block_pruned import C3k2Pruned, SPPFPruned, C2PSAPruned
 
 from ultralytics.utils import LOGGER, colorstr
-from ultralytics.utils.loss import v8DetectionLoss, E2EDetectLoss
+from ultralytics.utils.loss import v8DetectionLoss, E2EDetectLoss, v8PoseLoss
 from ultralytics.utils.torch_utils import initialize_weights,scale_img
 from ultralytics.utils.ops import make_divisible
 
@@ -29,17 +30,33 @@ class DetectionModelPruned(BaseModel):
         self.names = {i: f'{i}' for i in range(self.yaml['nc'])}  # default names dict
         self.inplace = self.yaml.get('inplace', True)
 
-        # Build strides
-        m = self.model[-1]  # Detect()
-        if isinstance(m, (DetectPruned)):
+        # =============================================
+        # Build strides (support both DetectPruned and Pose head)
+        # =============================================
+        m = self.model[-1]  # Detect/Pose
+        self.end2end = getattr(m, "end2end", False)
+        self.task = "pose" if isinstance(m, Pose) else "detect"
+        if isinstance(m, Pose):
+            # =============================================
+            # Expose pose metadata on top-level model so AutoBackend can read it on .pt reload.
+            # =============================================
+            self.kpt_shape = m.kpt_shape
+            # =============================================
+        if isinstance(m, (DetectPruned, Pose)):
             s = 256  # 2x min stride
             m.inplace = self.inplace
-            forward = lambda x: self.forward(x)
-            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
+
+            def _forward(x):
+                if self.end2end:
+                    return self.forward(x)["one2many"]
+                return self.forward(x)[0] if isinstance(m, Pose) else self.forward(x)
+
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
             m.bias_init()  # only run once
         else:
             self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
+        # =============================================
 
         # Init weights, biases
         initialize_weights(self)
@@ -88,7 +105,11 @@ class DetectionModelPruned(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
+        # =============================================
+        if isinstance(self.model[-1], Pose):
+            return v8PoseLoss(self)
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        # =============================================
     
 def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_channels(3)
     """    
@@ -149,6 +170,10 @@ def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_ch
     # 按照{索引: 本层最后一个bn层的名字}记录
     idx_to_bn_layer_name = {}
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+        # =============================================
+        if isinstance(m, str):
+            m = getattr(torch.nn, m[3:]) if "nn." in m else globals()[m]
+        # =============================================
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
@@ -328,16 +353,17 @@ def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_ch
             idx_to_bn_layer_name[i] = fx
             # =============================================
         elif m in [DetectPruned]:
-            # cv2x?是有所有的左侧分支, cv3x?是所有的右侧分支
+            # cv2x? are box branches and cv3x? are cls branches
             args.append([ch[x] for x in f])
-            cv2x0_out_bn_layer_names = [base_name + f'.cv2.{i}.0.bn' for i in range(3)]
-            cv2x1_out_bn_layer_names = [base_name + f'.cv2.{i}.1.bn' for i in range(3)]
-            cv2x2_out_conv_layer_names = [base_name + f'.cv2.{i}.2' for i in range(3)]
-            cv3x0x0_out_bn_layer_names = [base_name + f'.cv3.{i}.0.0.bn' for i in range(3)]
-            cv3x0x1_out_bn_layer_names = [base_name + f'.cv3.{i}.0.1.bn' for i in range(3)]
-            cv3x1x0_out_bn_layer_names = [base_name + f'.cv3.{i}.1.0.bn' for i in range(3)]
-            cv3x1x1_out_bn_layer_names = [base_name + f'.cv3.{i}.1.1.bn' for i in range(3)]
-            cv3x2_out_conv_layer_names = [base_name + f'.cv3.{i}.2' for i in range(3)]
+            nl = len(f)
+            cv2x0_out_bn_layer_names = [base_name + f'.cv2.{i}.0.bn' for i in range(nl)]
+            cv2x1_out_bn_layer_names = [base_name + f'.cv2.{i}.1.bn' for i in range(nl)]
+            cv2x2_out_conv_layer_names = [base_name + f'.cv2.{i}.2' for i in range(nl)]
+            cv3x0x0_out_bn_layer_names = [base_name + f'.cv3.{i}.0.0.bn' for i in range(nl)]
+            cv3x0x1_out_bn_layer_names = [base_name + f'.cv3.{i}.0.1.bn' for i in range(nl)]
+            cv3x1x0_out_bn_layer_names = [base_name + f'.cv3.{i}.1.0.bn' for i in range(nl)]
+            cv3x1x1_out_bn_layer_names = [base_name + f'.cv3.{i}.1.1.bn' for i in range(nl)]
+            cv3x2_out_conv_layer_names = [base_name + f'.cv3.{i}.2' for i in range(nl)]
             cv2x0_mask = [maskbndict[x] for x in cv2x0_out_bn_layer_names]
             cv2x1_mask = [maskbndict[x] for x in cv2x1_out_bn_layer_names]
             cv3x0_mask = [maskbndict[x] for sublist in zip(cv3x0x0_out_bn_layer_names, cv3x0x1_out_bn_layer_names) for x in sublist]
@@ -346,21 +372,54 @@ def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_ch
             cv2x1_outs = [torch.sum(x).int().item() for x in cv2x1_mask]
             cv3x0_outs = [torch.sum(x).int().item() for x in cv3x0_mask]
             cv3x1_outs = [torch.sum(x).int().item() for x in cv3x1_mask]
-            cv3x0_outs = [cv3x0_outs[:2], cv3x0_outs[2:4], cv3x0_outs[4:]]
-            cv3x1_outs = [cv3x1_outs[:2], cv3x1_outs[2:4], cv3x1_outs[4:]]
+            cv3x0_outs = [cv3x0_outs[i * 2:(i + 1) * 2] for i in range(nl)]
+            cv3x1_outs = [cv3x1_outs[i * 2:(i + 1) * 2] for i in range(nl)]
             args = [cv2x0_outs, cv2x1_outs, cv3x0_outs, cv3x1_outs, *args]
             # =============================================
-            for ix, (cv2x0_out_bn_layer_name, cv3x0x0_out_bn_layer_name) \
-                in enumerate(zip(cv2x0_out_bn_layer_names, cv3x0x0_out_bn_layer_names)):
+            for ix, (cv2x0_out_bn_layer_name, cv3x0x0_out_bn_layer_name) in enumerate(
+                zip(cv2x0_out_bn_layer_names, cv3x0x0_out_bn_layer_names)
+            ):
                 current_to_prev[cv2x0_out_bn_layer_name] = idx_to_bn_layer_name[f[ix]]
                 current_to_prev[cv3x0x0_out_bn_layer_name] = idx_to_bn_layer_name[f[ix]]
-            for ix in range(3):
+            for ix in range(nl):
                 current_to_prev[cv2x1_out_bn_layer_names[ix]] = cv2x0_out_bn_layer_names[ix]
                 current_to_prev[cv2x2_out_conv_layer_names[ix]] = cv2x1_out_bn_layer_names[ix]
                 current_to_prev[cv3x0x1_out_bn_layer_names[ix]] = cv3x0x0_out_bn_layer_names[ix]
                 current_to_prev[cv3x1x0_out_bn_layer_names[ix]] = cv3x0x1_out_bn_layer_names[ix]
                 current_to_prev[cv3x1x1_out_bn_layer_names[ix]] = cv3x1x0_out_bn_layer_names[ix]
                 current_to_prev[cv3x2_out_conv_layer_names[ix]] = cv3x1x1_out_bn_layer_names[ix]
+            # =============================================
+        elif m in [Pose]:
+            # =============================================
+            # Pose head stays unpruned internally; only its input-facing channels are rebuilt.
+            # =============================================
+            args.append([ch[x] for x in f])
+            nl = len(f)
+            cv2x0_out_bn_layer_names = [base_name + f'.cv2.{i}.0.bn' for i in range(nl)]
+            cv2x1_out_bn_layer_names = [base_name + f'.cv2.{i}.1.bn' for i in range(nl)]
+            cv2x2_out_conv_layer_names = [base_name + f'.cv2.{i}.2' for i in range(nl)]
+            cv3x0x0_out_bn_layer_names = [base_name + f'.cv3.{i}.0.0.bn' for i in range(nl)]
+            cv3x0x1_out_bn_layer_names = [base_name + f'.cv3.{i}.0.1.bn' for i in range(nl)]
+            cv3x1x0_out_bn_layer_names = [base_name + f'.cv3.{i}.1.0.bn' for i in range(nl)]
+            cv3x1x1_out_bn_layer_names = [base_name + f'.cv3.{i}.1.1.bn' for i in range(nl)]
+            cv3x2_out_conv_layer_names = [base_name + f'.cv3.{i}.2' for i in range(nl)]
+            cv4x0_out_bn_layer_names = [base_name + f'.cv4.{i}.0.bn' for i in range(nl)]
+            cv4x1_out_bn_layer_names = [base_name + f'.cv4.{i}.1.bn' for i in range(nl)]
+            cv4x2_out_conv_layer_names = [base_name + f'.cv4.{i}.2' for i in range(nl)]
+            for ix in range(nl):
+                source_bn_name = idx_to_bn_layer_name[f[ix]]
+                current_to_prev[cv2x0_out_bn_layer_names[ix]] = source_bn_name
+                current_to_prev[cv3x0x0_out_bn_layer_names[ix]] = source_bn_name
+                current_to_prev[cv4x0_out_bn_layer_names[ix]] = source_bn_name
+                current_to_prev[cv2x1_out_bn_layer_names[ix]] = cv2x0_out_bn_layer_names[ix]
+                current_to_prev[cv2x2_out_conv_layer_names[ix]] = cv2x1_out_bn_layer_names[ix]
+                current_to_prev[cv3x0x1_out_bn_layer_names[ix]] = cv3x0x0_out_bn_layer_names[ix]
+                current_to_prev[cv3x1x0_out_bn_layer_names[ix]] = cv3x0x1_out_bn_layer_names[ix]
+                current_to_prev[cv3x1x1_out_bn_layer_names[ix]] = cv3x1x0_out_bn_layer_names[ix]
+                current_to_prev[cv3x2_out_conv_layer_names[ix]] = cv3x1x1_out_bn_layer_names[ix]
+                current_to_prev[cv4x1_out_bn_layer_names[ix]] = cv4x0_out_bn_layer_names[ix]
+                current_to_prev[cv4x2_out_conv_layer_names[ix]] = cv4x1_out_bn_layer_names[ix]
+            c2 = ch[f[-1]]
             # =============================================
         else:
             raise ValueError(f"ERROR ❌ module {m} not supported in parse_model.")
@@ -388,3 +447,4 @@ if __name__ == "__main__":
     model = DetectionModelPruned(maskbndict, pruned_yaml, ch=3)
     model.train().cuda()
     out = model(dummies)
+

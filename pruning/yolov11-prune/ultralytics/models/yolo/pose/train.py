@@ -4,6 +4,7 @@ from copy import copy
 
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import PoseModel
+from ultralytics.nn.tasks_pruned import DetectionModelPruned
 from ultralytics.utils import DEFAULT_CFG, LOGGER
 from ultralytics.utils.plotting import plot_images, plot_results
 
@@ -37,7 +38,14 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
 
     def get_model(self, cfg=None, weights=None, verbose=True, maskbndict=None):
         """Get pose estimation model with specified configuration and weights."""
-        model = PoseModel(cfg, ch=3, nc=self.data["nc"], data_kpt_shape=self.data["kpt_shape"], verbose=verbose)
+        # ===========================================================================
+        if self.finetune:
+            assert maskbndict is not None, "maskbndict must be stored in weights so that it can be loaded for finetuing"
+            model = DetectionModelPruned(maskbndict, cfg, nc=self.data["nc"], verbose=verbose)
+            assert getattr(model, "task", None) == "pose", "finetune=True for pose requires a pruned pose model"
+        else:
+            model = PoseModel(cfg, ch=3, nc=self.data["nc"], data_kpt_shape=self.data["kpt_shape"], verbose=verbose)
+        # ===========================================================================
         if weights:
             model.load(weights)
 
