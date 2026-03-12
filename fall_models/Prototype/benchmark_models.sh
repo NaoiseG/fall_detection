@@ -110,6 +110,18 @@ classifier_weight_for_arch() {
   esac
 }
 
+half_flag_for_version() {
+  local version="$1"
+
+  case "$version" in
+    base|fp32) printf '%s' "0" ;;
+    fp16|int8) printf '%s' "1" ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 snapshot_top_level_dirs() {
   # Print absolute paths of immediate subdirectories inside benchmarks, sorted.
   # This includes both structured destination dirs and run dirs.
@@ -172,8 +184,12 @@ combination_already_done() {
 
 build_command() {
   local classifier="$1"
-  local cls_weight="$2"
-  local pose_weight="$3"
+  local version="$2"
+  local cls_weight="$3"
+  local pose_weight="$4"
+  local half_flag
+
+  half_flag="$(half_flag_for_version "${version}")" || return 1
 
   if [[ "$classifier" == "motionbert" ]]; then
     printf '%s\0' \
@@ -183,9 +199,16 @@ build_command() {
       --config "${MOTIONBERT_CONFIG}" \
       --yolo-weights "${pose_weight}" \
       --device cuda \
+      --half "${half_flag}" \
+      --max-people 10 \
+      --max-det 10 \
+      --warmup-frames 0 \
+      --warmup-windows 0 \
       --benchmark 1 \
       --profile-out "${BENCH_DIR}" \
-      --no-display 1
+      --no-display 1 \
+      --out-csv "" \
+      --out-pkl ""
   else
     printf '%s\0' \
       python -m inference.inference_on_video \
@@ -194,6 +217,11 @@ build_command() {
       --yolo-weights "${pose_weight}" \
       --arch "${classifier}" \
       --device cuda \
+      --half "${half_flag}" \
+      --max-people 10 \
+      --max-det 10 \
+      --warmup-frames 0 \
+      --warmup-windows 0 \
       --benchmark 1 \
       --profile-out "${BENCH_DIR}" \
       --no-display 1
@@ -239,7 +267,7 @@ run_one_benchmark() {
   local cmd=()
   while IFS= read -r -d '' token; do
     cmd+=("$token")
-  done < <(build_command "${classifier}" "${cls_weight}" "${pose_weight}")
+  done < <(build_command "${classifier}" "${version}" "${cls_weight}" "${pose_weight}")
 
   cmd_str="$(join_cmd "${cmd[@]}")"
 
