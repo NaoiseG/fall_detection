@@ -3,9 +3,14 @@ ultralytics/cfg/__init__.pyä¸­ä¿®æ”¹äº†å¢žåŠ 'finetune'ä»�
 ultralytics/engine/model.pyä¸­å¢žåŠ äº†å¯¹'maskbndict'çš„åŠ è½½
 """
 import argparse
+from pathlib import Path
 
 from ultralytics import YOLO
 from ultralytics.nn.modules import Detect, Pose
+
+
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[0]
 
 
 # =========================================helper=========================================
@@ -50,7 +55,7 @@ def main(opt):
     model = YOLO(opt.weights)
     detected_task = detect_task(model)
     task = resolve_task(opt.task, detected_task)
-    data = opt.data or ("ultralytics/cfg/datasets/coco8-pose.yaml" if task == "pose" else "ultralytics/cfg/datasets/coco.yaml")
+    data = opt.data or (str(ROOT / "coco-pose.yaml") if task == "pose" else str(ROOT / "ultralytics/cfg/datasets/coco.yaml"))
 
     print(f"detected task: {detected_task}")
     print(f"finetune task: {task}")

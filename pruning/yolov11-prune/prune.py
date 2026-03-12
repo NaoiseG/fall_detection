@@ -12,11 +12,11 @@ Commands
 Prune YOLO11-pose checkpoint:
 python prune.py --weights weights/yolo11n-pose.pt --cfg ultralytics/cfg/models/11/yolo11-pose.yaml --model-size n --prune-ratio 0.2 --task auto --save-dir runs/pruning
 Fine-tune pruned pose model:
-python finetune.py --weights weights/pruned.pt --task auto --data ultralytics/cfg/datasets/coco8-pose.yaml --device 0
+python finetune.py --weights weights/pruned.pt --task auto --data coco-pose.yaml --device 0
 Validate pruned pose model:
-yolo val model=weights/pruned.pt data=ultralytics/cfg/datasets/coco8-pose.yaml task=pose
+yolo val model=weights/pruned.pt data=coco-pose.yaml task=pose
 Validate fine-tuned pose model:
-yolo val model=runs/finetune/weights/best.pt data=ultralytics/cfg/datasets/coco8-po
+yolo val model=runs/finetune/weights/best.pt data=coco-pose.yaml task=pose
 """
 import re
 import os
@@ -501,7 +501,7 @@ def main(opt):
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default=ROOT / 'ultralytics/cfg/datasets/coco.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default=ROOT / 'coco-pose.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'runs/train-sparsity/weights/last.pt', help='model.pt path(s)')
     parser.add_argument('--cfg', type=str, default=ROOT / 'ultralytics/cfg/models/11/yolo11.yaml', help='model.yaml path')
     parser.add_argument('--model-size', type=str, default='l', help='(yolov11)n, s, m, l or x?')

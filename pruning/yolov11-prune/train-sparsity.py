@@ -1,25 +1,53 @@
 """
-修改的代码:
-ultralytics/nn/modules/block.py: 对C3k2增加一个C3k布尔值属性
-ultralytics/engine/trainer.py: 禁用amp, 梯度裁剪, 增加梯度惩罚项系数
-ultralytics/engine/model.py: 主要是将sr参数绑定到self.trainer上
-ultralytics/cfg/__init__.py: 对额外参数finetune的处理, 防止DDP下报错
-ultralytics/engine/model.py: 对sr, maskbndict等额外参数的处理
+ä¿®æ”¹çš„ä»£ç :
+ultralytics/nn/modules/block.py: å¯¹C3k2å¢žåŠ ä¸€ä¸ªC3kå¸ƒå°”å€¼å±žæ€§
+ultralytics/engine/trainer.py: ç¦ç”¨amp, æ¢¯åº¦è£å‰ª, å¢žåŠ æ¢¯åº¦æƒ©ç½šé¡¹ç³»æ•°
+ultralytics/engine/model.py: ä¸»è¦æ˜¯å°†srå‚æ•°ç»‘å®šåˆ°self.trainerä¸Š
+ultralytics/cfg/__init__.py: å¯¹é¢å¤–å‚æ•°finetuneçš„å¤„ç†, é˜²æ­¢DDPä¸‹æŠ¥é”™
+ultralytics/engine/model.py: å¯¹sr, maskbndictç­‰é¢å¤–å‚æ•°çš„å¤„ç†
 """
+import argparse
+from pathlib import Path
+
 from ultralytics import YOLO
 
-model = YOLO("runs/train-normal/weights/best.pt")
-# L1正则的惩罚项系数sr
-model.train(
-    sr=1e-3, 
-    data="ultralytics/cfg/datasets/coco.yaml", 
-    cfg='ultralytics/cfg/default.yaml',
-    project='.',
-    name='runs/train-sparsity',
-    device=0, # NOTE: 目前只能单卡训, DDP下多卡训不会产生稀疏效果(TODO)
-    epochs=50, 
-    batch=10,
-    optimizer='SGD',
-    lr0=1e-3, 
-    patience=50 # 注意patience要比epochs大, 防止训练过早结束
-)
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[0]
+
+
+def parse_opt():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights", type=str, default="runs/train-normal/weights/best.pt", help="model weights path")
+    parser.add_argument("--data", type=str, default=str(ROOT / "coco-pose.yaml"), help="dataset yaml path")
+    parser.add_argument("--cfg", type=str, default="ultralytics/cfg/default.yaml", help="default cfg path")
+    parser.add_argument("--project", type=str, default=".", help="save project")
+    parser.add_argument("--name", type=str, default="runs/train-sparsity", help="run name")
+    parser.add_argument("--device", type=str, default="0", help="device ids, e.g. '0'")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch", type=int, default=10)
+    parser.add_argument("--optimizer", type=str, default="SGD")
+    parser.add_argument("--lr0", type=float, default=1e-3)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--sr", type=float, default=1e-3, help="sparsity regularization strength")
+    return parser.parse_args()
+
+
+def main(opt):
+    model = YOLO(opt.weights)
+    model.train(
+        sr=opt.sr,
+        data=opt.data,
+        cfg=opt.cfg,
+        project=opt.project,
+        name=opt.name,
+        device=opt.device,  # NOTE: currently intended for single-GPU sparsity training.
+        epochs=opt.epochs,
+        batch=opt.batch,
+        optimizer=opt.optimizer,
+        lr0=opt.lr0,
+        patience=opt.patience,
+    )
+
+
+if __name__ == "__main__":
+    main(parse_opt())
