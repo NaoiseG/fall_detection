@@ -10,7 +10,7 @@ ultralytics/nn/tasks_pruend.py: 新增DetectionModelPruned, parse_model_pruned
 Commands
 
 Prune YOLO11-pose checkpoint:
-python prune.py --weights weights/yolo11n-pose.pt --cfg ultralytics/cfg/models/11/yolo11-pose.yaml --model-size n --prune-ratio 0.2 --task auto --save-dir weights
+python prune.py --weights weights/yolo11n-pose.pt --cfg ultralytics/cfg/models/11/yolo11-pose.yaml --model-size n --prune-ratio 0.2 --task auto --save-dir runs/pruning
 Fine-tune pruned pose model:
 python finetune.py --weights weights/pruned.pt --task auto --data ultralytics/cfg/datasets/coco8-pose.yaml --device 0
 Validate pruned pose model:
@@ -75,6 +75,20 @@ def _count_params(m):
     return sum(x.numel() for x in m.parameters())
 
 
+def _resolve_output_stem(name):
+    p = Path(name).name
+    stem = Path(p).stem
+    return stem if stem else "pruned"
+
+
+def _resolve_save_dir(save_dir):
+    p = Path(save_dir)
+    # Backward-compat: old commands often passed '--save-dir weights'.
+    if p == Path("weights"):
+        p = ROOT / "runs/pruning"
+    return str(p)
+
+
 def _verify_head_input_channels(pruned_model, task):
     head = pruned_model.model[-1]
     for i in range(head.nl):
@@ -87,14 +101,19 @@ def _verify_head_input_channels(pruned_model, task):
 # =========================================helper=========================================
 
 def main(opt):
-    weights, prune_ratio, cfg, model_size, save_dir, task_arg = (
+    weights, prune_ratio, cfg, model_size, save_dir, task_arg, out_name = (
         opt.weights,
         opt.prune_ratio,
         opt.cfg,
         opt.model_size,
         opt.save_dir,
         opt.task,
+        opt.name,
     )
+    out_stem = _resolve_output_stem(out_name)
+    save_dir = _resolve_save_dir(save_dir)
+    print(colorstr('blue', f"Output dir: {save_dir}"))
+    print(colorstr('blue', f"Output name stem: {out_stem}"))
     model = AutoBackend(weights, fuse=False)
     model.eval()
     model_core = model.model
@@ -322,7 +341,7 @@ def main(opt):
     # """
     print(colorstr('blue', 'Exporting pruned model to onnx.....'))
     os.makedirs(save_dir, exist_ok=True)
-    f = os.path.join(save_dir, 'pruned.onnx')
+    f = os.path.join(save_dir, f'{out_stem}.onnx')
     pruned_model = pruned_model.cpu()
     for m in pruned_model.modules():
         if isinstance(m, (DetectPruned, Pose)):
@@ -463,7 +482,7 @@ def main(opt):
     if hasattr(pruned_model.model[-1], "shape"):
         pruned_model.model[-1].shape = None
     pruned_model.eval().cpu()
-    save_path = os.path.join(save_dir, "pruned.pt")
+    save_path = os.path.join(save_dir, f"{out_stem}.pt")
     torch.save(
         {
             "model": pruned_model,
@@ -487,7 +506,8 @@ def parse_opt():
     parser.add_argument('--cfg', type=str, default=ROOT / 'ultralytics/cfg/models/11/yolo11.yaml', help='model.yaml path')
     parser.add_argument('--model-size', type=str, default='l', help='(yolov11)n, s, m, l or x?')
     parser.add_argument('--prune-ratio', type=float, default=0.2, help='prune ratio, leave it -1 if you dont want to prune(for example, debug purpose)')
-    parser.add_argument('--save-dir', type=str, default=ROOT / 'weights', help='pruned model weight save dir')
+    parser.add_argument('--save-dir', type=str, default=ROOT / 'runs/pruning', help='pruned model weight save dir')
+    parser.add_argument('--name', type=str, default='pruned', help='output filename stem (e.g. pruned -> pruned.pt/.onnx)')
     parser.add_argument('--task', type=str, default='auto', choices=['auto', 'detect', 'pose'], help='task mode')
     opt = parser.parse_args()
     return opt
@@ -495,5 +515,3 @@ def parse_opt():
 if __name__ == "__main__":
     opt = parse_opt()
     main(opt)
-
-
