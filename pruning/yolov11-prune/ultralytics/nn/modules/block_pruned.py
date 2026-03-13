@@ -99,8 +99,8 @@ class C2fPruned(nn.Module):
                     )
                     self.c = inner_cv2outs[i]
         else:
-            self.cv2 = Conv(sum(self.cv1_split_sections) +
-                            c3k_cv3outs[-1], cv2out, 1)
+            # C3k2/C2f forward concatenates both cv1 splits plus every inner C3k output.
+            self.cv2 = Conv(sum(self.cv1_split_sections) + sum(c3k_cv3outs), cv2out, 1)
             self.m = nn.ModuleList()
 
     def forward(self, x):
