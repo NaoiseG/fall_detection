@@ -37,3 +37,4 @@ fall_models/Prototype/models/HAR-WISDM-Dataset/
 *.onnx
 *.cache
 *venv*/
+fall_models/Prototype/jetson_requirements.txt
