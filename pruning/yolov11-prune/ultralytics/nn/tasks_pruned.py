@@ -180,6 +180,9 @@ def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_ch
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
 
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+        if m is C3k2Pruned and scale in "mlx":
+            # Mirror Ultralytics parse_model(): YOLO11 m/l/x upgrades all C3k2 blocks to C3k-backed variants.
+            args[1] = True
         
         base_name = f'model.{i}'
         if m in [Conv]:
@@ -264,6 +267,7 @@ def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_ch
                     prev_bn_layer_names_for_last_cv2.append(inner_cv2_bn_layer_name)
                 current_to_prev[c2f_cv2_bn_layer_name] = prev_bn_layer_names_for_last_cv2
             else:
+                prev_bn_layer_names_for_last_cv2 = [c2f_cv1_bn_layer_name]
                 for i_inner in range(n):
                     inner_c3k_cv1_bn_layer_name = base_name + f'.m.{i_inner}.cv1.bn'
                     inner_c3k_cv2_bn_layer_name = base_name + f'.m.{i_inner}.cv2.bn'
@@ -278,9 +282,10 @@ def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_ch
                         current_to_prev[inner_c3k_bottle_cv2_bn_layer_name] = prev_bn_layer_name
                         prev_bn_layer_name = inner_c3k_bottle_cv2_bn_layer_name     
                     inner_c3k_cv3_bn_layer_name = base_name + f'.m.{i_inner}.cv3.bn' 
-                    current_to_prev[inner_c3k_cv3_bn_layer_name] = [inner_c3k_bottle_cv2_bn_layer_name, inner_c3k_cv2_bn_layer_name]              
+                    current_to_prev[inner_c3k_cv3_bn_layer_name] = [inner_c3k_bottle_cv2_bn_layer_name, inner_c3k_cv2_bn_layer_name]
+                    prev_bn_layer_names_for_last_cv2.append(inner_c3k_cv3_bn_layer_name)
                     prev_bn_layer_name = inner_c3k_cv3_bn_layer_name
-                current_to_prev[c2f_cv2_bn_layer_name] = [inner_c3k_cv3_bn_layer_name, c2f_cv1_bn_layer_name]
+                current_to_prev[c2f_cv2_bn_layer_name] = prev_bn_layer_names_for_last_cv2
             prev_bn_layer_name = c2f_cv2_bn_layer_name
             idx_to_bn_layer_name[i] = c2f_cv2_bn_layer_name
             # =============================================
@@ -305,9 +310,10 @@ def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_ch
             # =============================================
         elif m in [C2PSAPruned]:
             args.insert(2, n)
+            n_psa = n
             c1, c2 = ch[f], args[0]
             c2 = make_divisible(min(c2, max_channels) * width, 8)
-            inner_ffn_cv1_bn_layer_names = [base_name + f'.m.{i}.ffn.0.bn' for i in range(n)]
+            inner_ffn_cv1_bn_layer_names = [base_name + f'.m.{i}.ffn.0.bn' for i in range(n_psa)]
             inner_ffn_cv1_masks = [maskbndict[inner_ffn_cv1_bn_layer_name] for inner_ffn_cv1_bn_layer_name in inner_ffn_cv1_bn_layer_names]
             inner_ffn_cv1outs = [torch.sum(inner_ffn_cv1_mask).int().item() for inner_ffn_cv1_mask in inner_ffn_cv1_masks]
             c2f_cv2_bn_layer_name = base_name + '.cv2.bn'
@@ -321,7 +327,7 @@ def parse_model_pruned(maskbndict, d, ch, verbose=True):  # model_dict, input_ch
             c2f_cv1_bn_layer_name = base_name + '.cv1.bn'
             current_to_prev[c2f_cv1_bn_layer_name] = prev_bn_layer_name
             prev_bn_layer_name = c2f_cv1_bn_layer_name
-            for i_inner in range(n):
+            for i_inner in range(n_psa):
                 inner_attention_qkv_bn_layer_name = base_name + f'.m.{i_inner}.attn.qkv.bn' 
                 current_to_prev[inner_attention_qkv_bn_layer_name] = prev_bn_layer_name
                 inner_attention_pe_bn_layer_name = base_name + f'.m.{i_inner}.attn.pe.bn' 

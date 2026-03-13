@@ -231,6 +231,8 @@ def main(opt):
     pruned_yaml["nc"] = nc
     pruned_yaml["scales"] = model_yamls["scales"]
     pruned_yaml["scale"] = model_size
+    # Match Ultralytics parse_model(): YOLO11 m/l/x upgrades all C3k2 blocks to C3k-backed variants.
+    c3k_for_scale = model_size in {"m", "l", "x"}
     # =========================================task-aware head=========================================
     if is_pose:
         pruned_yaml["kpt_shape"] = list(original_kpt_shape)
@@ -243,9 +245,9 @@ def main(opt):
     pruned_yaml["backbone"] = [
         [-1, 1, Conv, [64, 3, 2]], # 0-P1/2
         [-1, 1, Conv, [128, 3, 2]], # 1-P2/4
-        [-1, 2, C3k2Pruned, [256, False, 0.25]],
+        [-1, 2, C3k2Pruned, [256, c3k_for_scale, 0.25]],
         [-1, 1, Conv, [256, 3, 2]], # 3-P3/8
-        [-1, 2, C3k2Pruned, [512, False, 0.25]],
+        [-1, 2, C3k2Pruned, [512, c3k_for_scale, 0.25]],
         [-1, 1, Conv, [512, 3, 2]], # 5-P4/16
         [-1, 2, C3k2Pruned, [512, True]],
         [-1, 1, Conv, [1024, 3, 2]], # 7-P5/32
@@ -256,15 +258,15 @@ def main(opt):
     pruned_yaml["head"] = [
         [-1, 1, nn.Upsample, [None, 2, "nearest"]],
         [[-1, 6], 1, Concat, [1]], # cat backbone P4
-        [-1, 2, C3k2Pruned, [512, False]], # 13
+        [-1, 2, C3k2Pruned, [512, c3k_for_scale]], # 13
         
         [-1, 1, nn.Upsample, [None, 2, "nearest"]],
         [[-1, 4], 1, Concat, [1]], # cat backbone P3
-        [-1, 2, C3k2Pruned, [256, False]], # 16 (P3/8-small)
+        [-1, 2, C3k2Pruned, [256, c3k_for_scale]], # 16 (P3/8-small)
         
         [-1, 1, Conv, [256, 3, 2]],
         [[-1, 13], 1, Concat, [1]], # cat head P4
-        [-1, 2, C3k2Pruned, [512, False]], # 19 (P4/16-medium)
+        [-1, 2, C3k2Pruned, [512, c3k_for_scale]], # 19 (P4/16-medium)
         
         [-1, 1, Conv, [512, 3, 2]],
         [[-1, 10], 1, Concat, [1]], # cat head P5
@@ -380,6 +382,7 @@ def main(opt):
         for prev_name in prev_names:
             assert prev_name in maskbndict.keys(), f"{current_name} -> {prev_name} not in maskbndict"
     changed = []
+    c3k_for_scale = model_size in {"m", "l", "x"}
     # 可匹配c3k2模块中的Bottleneck中的第一个卷积层(在不使用c3k的情况下) 以及 c3k2模块中的c3k中的cv1卷积层(在使用c3k的情况下)
     pattern_c3k2_general_cv1 = re.compile(r"model.\d+.m.0.cv1.bn")
     # 匹配c3k2模块中的c3k中的cv2卷积层(在使用c3k的情况下)
@@ -394,7 +397,10 @@ def main(opt):
             
         assert name_org == name_pruned, f"name_org: {name_org} != name_pruned: {name_pruned}"
         layer_index = None if 'model.' not in name_org else int(name_org.split('.')[1])
-        use_c3k = False if layer_index is None else 'C3k2' in model_yamls[layer_index] and 'True' in [str(model_yamls[layer_index][-1][i]) for i in range(len(model_yamls[layer_index][-1]))]
+        use_c3k = False
+        if layer_index is not None and 'C3k2' in model_yamls[layer_index]:
+            yaml_has_c3k = 'True' in [str(model_yamls[layer_index][-1][i]) for i in range(len(model_yamls[layer_index][-1]))]
+            use_c3k = yaml_has_c3k or c3k_for_scale
         
         # dfl conv has no pruning dependency and should be copied directly.
         if 'dfl' in name_org:
