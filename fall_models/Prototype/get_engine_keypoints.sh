@@ -60,7 +60,7 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p -- "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/upfall_keypoints_$(date +%Y%m%d_%H%M%S).log"
 
-SSH_CONTROL_DIR="${SCRIPT_DIR}/.ssh-control"
+SSH_CONTROL_DIR="${TMPDIR:-/tmp}/gk-ssh-${USER:-user}"
 SSH_CONTROL_PATH="${SSH_CONTROL_DIR}/%C"
 
 SSH_COMMON_OPTS=(
