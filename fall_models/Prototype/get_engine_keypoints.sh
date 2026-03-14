@@ -60,6 +60,28 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p -- "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/upfall_keypoints_$(date +%Y%m%d_%H%M%S).log"
 
+SSH_CONTROL_DIR="${SCRIPT_DIR}/.ssh-control"
+SSH_CONTROL_PATH="${SSH_CONTROL_DIR}/%C"
+
+SSH_COMMON_OPTS=(
+  -o "ControlPath=${SSH_CONTROL_PATH}"
+  -o "ServerAliveInterval=30"
+  -o "ServerAliveCountMax=3"
+  -o "ConnectTimeout=20"
+)
+
+SSH_MASTER_OPTS=(
+  "${SSH_COMMON_OPTS[@]}"
+  -o "ControlMaster=yes"
+  -o "ControlPersist=yes"
+)
+
+SSH_CLIENT_OPTS=(
+  "${SSH_COMMON_OPTS[@]}"
+  -o "ControlMaster=auto"
+  -o "ControlPersist=yes"
+)
+
 # Summary buckets
 SKIPPED_REMOTE=()
 TRANSFERRED_LOCAL=()
@@ -88,6 +110,74 @@ quote_cmd() {
   done
   local IFS=' '
   printf '%s' "${parts[*]}"
+}
+
+ensure_ssh_control_dir() {
+  if [[ -d "$SSH_CONTROL_DIR" ]]; then
+    return 0
+  fi
+
+  mkdir -p -- "$SSH_CONTROL_DIR" || {
+    log "ERROR: Failed to create SSH control directory: \"$SSH_CONTROL_DIR\""
+    return 1
+  }
+
+  chmod 700 "$SSH_CONTROL_DIR" 2>/dev/null || true
+}
+
+ssh_master_is_running() {
+  ssh "${SSH_CLIENT_OPTS[@]}" -O check "$SSH_TARGET" >/dev/null 2>&1
+}
+
+open_ssh_master() {
+  if ssh_master_is_running; then
+    return 0
+  fi
+
+  ensure_ssh_control_dir || return 1
+
+  log "Opening shared SSH connection to $SSH_TARGET."
+  if ! run_and_log ssh -fN "${SSH_MASTER_OPTS[@]}" "$SSH_TARGET"; then
+    log "ERROR: Failed to open shared SSH connection."
+    return 1
+  fi
+
+  if ! ssh_master_is_running; then
+    log "ERROR: Shared SSH connection was not ready after startup."
+    return 1
+  fi
+
+  return 0
+}
+
+close_ssh_master() {
+  if ssh_master_is_running; then
+    log "Closing shared SSH connection."
+    ssh "${SSH_CLIENT_OPTS[@]}" -O exit "$SSH_TARGET" >/dev/null 2>&1 || true
+  fi
+
+  rmdir "$SSH_CONTROL_DIR" 2>/dev/null || true
+}
+
+run_remote_command() {
+  local remote_cmd="$1"
+
+  open_ssh_master || return 255
+  run_and_log ssh "${SSH_CLIENT_OPTS[@]}" "$SSH_TARGET" "$remote_cmd"
+}
+
+build_rsync_rsh() {
+  quote_cmd ssh "${SSH_CLIENT_OPTS[@]}"
+}
+
+ensure_remote_root() {
+  log "Ensuring remote base directory exists."
+  if ! run_remote_command "mkdir -p \"$REMOTE_ROOT_HOME\""; then
+    log "ERROR: Failed to create remote base directory: \"$REMOTE_ROOT_HOME\""
+    return 1
+  fi
+
+  return 0
 }
 
 build_model_path() {
@@ -145,10 +235,8 @@ remote_has_files() {
   local remote_cmd
   remote_cmd="if [ -d \"$remote_dir_home\" ] && find \"$remote_dir_home\" -type f -name '*.npz' -print -quit 2>/dev/null | grep -q .; then exit 0; else exit 1; fi"
 
-  log "CMD: $(quote_cmd ssh "$SSH_TARGET" "$remote_cmd")"
-  ssh "$SSH_TARGET" "$remote_cmd" 2>&1 | tee -a "$LOG_FILE"
-  local rc=${PIPESTATUS[0]}
-  log "CMD EXIT: $rc"
+  run_remote_command "$remote_cmd"
+  local rc=$?
 
   case "$rc" in
     0) return 0 ;;
@@ -207,9 +295,10 @@ sync_to_remote() {
   local local_root="$1"
   local remote_dir_home="$2"
   local remote_dest="$3"
+  local rsync_rsh
 
   log "Ensuring remote destination directory exists."
-  if ! run_and_log ssh "$SSH_TARGET" "mkdir -p \"$remote_dir_home\""; then
+  if ! run_remote_command "mkdir -p \"$remote_dir_home\""; then
     log "ERROR: Failed to create remote directory."
     return 1
   fi
@@ -219,8 +308,10 @@ sync_to_remote() {
     rsync_opts+=(--dry-run)
   fi
 
+  rsync_rsh="$(build_rsync_rsh)"
+
   log "Starting rsync transfer."
-  run_and_log rsync "${rsync_opts[@]}" -- "${local_root}/" "$remote_dest"
+  run_and_log rsync "${rsync_opts[@]}" -e "$rsync_rsh" -- "${local_root}/" "$remote_dest"
 }
 
 cleanup_local() {
@@ -266,10 +357,22 @@ print_summary_section() {
 # Main processing loop
 ###############################################################################
 
+trap close_ssh_master EXIT
+
 log "Starting UP-Fall keypoint generation/sync batch."
 log "Working directory: \"$PWD\""
 log "Log file: \"$LOG_FILE\""
 log "Dry-run mode: $DRY_RUN"
+
+if ! open_ssh_master; then
+  log "ERROR: Could not establish shared SSH connection to $SSH_TARGET. Aborting."
+  exit 1
+fi
+
+if ! ensure_remote_root; then
+  log "ERROR: Could not prepare the remote base directory. Aborting."
+  exit 1
+fi
 
 for size in "${SIZES[@]}"; do
   for precision in "${PRECISIONS[@]}"; do
