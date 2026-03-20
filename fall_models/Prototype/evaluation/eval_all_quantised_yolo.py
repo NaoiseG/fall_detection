@@ -28,7 +28,7 @@ DEFAULT_OUTPUT_ROOT = Path("/home/people/21376026/scratch/evaluations")
 DEFAULT_MOTIONBERT_PKL_ROOT = Path("/home/people/21376026/scratch/MotionBERT_pkls")
 
 TEST_SUBJECTS = "16-17"
-TRAIN_SUBJECTS = "1-12"
+TRAIN_SUBJECTS = TEST_SUBJECTS
 VAL_SUBJECTS = "13-15"
 CAMERAS: Tuple[int, ...] = (1, 2)
 WINDOW_T = 64
@@ -99,6 +99,7 @@ class SweepPaths:
     eval_dir: Path
     repo_root: Path
     prepare_motionbert_script: Path
+    motionbert_code_root: Path
     keypoints_root: Path
     classification_root: Path
     output_root: Path
@@ -161,6 +162,20 @@ def read_json(path: Path) -> Optional[Dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def read_log_tail(path: Path, max_lines: int = 40, max_chars: int = 4000) -> str:
+    if not path.exists():
+        return ""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return ""
+    tail = "".join(lines[-max_lines:]).strip()
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
 
 
 def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
@@ -228,6 +243,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MOTIONBERT_PKL_ROOT,
         help=f"Shared MotionBERT PKL root (default: {DEFAULT_MOTIONBERT_PKL_ROOT.as_posix()})",
     )
+    parser.add_argument(
+        "--motionbert-code-root",
+        type=Path,
+        default=None,
+        help="Shared MotionBERT code root. Defaults to <repo_root>/models/MotionBERT.",
+    )
     return parser.parse_args()
 
 
@@ -282,8 +303,6 @@ def get_checkpoint_path(paths: SweepPaths, classifier_model: str, pose_size: str
             paths.classification_root
             / "MotionBERT"
             / f"{pose_size}-pose"
-            / "checkpoint"
-            / "action"
             / "FT_MB_release_MB_ft_UPFall_xsub"
             / "best_epoch.bin"
         )
@@ -291,7 +310,8 @@ def get_checkpoint_path(paths: SweepPaths, classifier_model: str, pose_size: str
 
 
 def get_motionbert_repo_root(paths: SweepPaths, pose_size: str) -> Path:
-    return paths.classification_root / "MotionBERT" / f"{pose_size}-pose"
+    _ = pose_size
+    return paths.motionbert_code_root
 
 
 def get_run_dir(paths: SweepPaths, classifier_model: str, pose_size: str, precision: str) -> Path:
@@ -430,6 +450,7 @@ def write_master_json(
         "updated_at": now_iso(),
         "script_path": paths.script_path.as_posix(),
         "repo_root": paths.repo_root.as_posix(),
+        "motionbert_code_root": paths.motionbert_code_root.as_posix(),
         "output_root": paths.output_root.as_posix(),
         "motionbert_pkl_root": paths.motionbert_pkl_root.as_posix(),
         "total_runs": len(ordered_entries),
@@ -439,8 +460,17 @@ def write_master_json(
     write_json_atomic(master_json_path, payload)
 
 
-def build_eval_models_command(run: RunSpec) -> List[str]:
-    return [
+def eval_models_supports_weights_path(paths: SweepPaths) -> bool:
+    eval_models_path = paths.repo_root / "evaluation" / "eval_models.py"
+    try:
+        text = eval_models_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "--weights-path" in text
+
+
+def build_eval_models_command(paths: SweepPaths, run: RunSpec) -> List[str]:
+    command = [
         sys.executable,
         "-m",
         "evaluation.eval_models",
@@ -476,11 +506,28 @@ def build_eval_models_command(run: RunSpec) -> List[str]:
         "paper_group_linear",
         "--interp-group",
         "100",
-        "--weights-path",
-        run.checkpoint_path.as_posix(),
         "--out-dir",
         run.run_dir.as_posix(),
     ]
+    if eval_models_supports_weights_path(paths):
+        command.extend(
+            [
+                "--weights-path",
+                run.checkpoint_path.as_posix(),
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "--ckpt-root",
+                paths.classification_root.as_posix(),
+                "--ckpt",
+                f"{run.classifier_model}={run.checkpoint_path.parent.name}",
+                "--weights-name",
+                run.checkpoint_path.name,
+            ]
+        )
+    return command
 
 
 def build_motionbert_prepare_command(paths: SweepPaths, run: RunSpec) -> List[str]:
@@ -542,6 +589,9 @@ def build_motionbert_eval_command(run: RunSpec) -> List[str]:
         "0",
         "--fall-class-ids",
         "0",
+        "--split-base",
+        "xsub_train",
+        "--no-class-weights",
         "--data-pkl",
         run.motionbert_pkl_path.as_posix(),
     ]
@@ -909,7 +959,7 @@ def execute_run(paths: SweepPaths, run: RunSpec) -> Dict[str, Any]:
     started_at = now_iso()
 
     if run.classifier_model in ("cnnlstm", "stgcn"):
-        command = build_eval_models_command(run)
+        command = build_eval_models_command(paths, run)
         command_cwd = paths.repo_root
         prepare_command: Optional[List[str]] = None
     else:
@@ -962,8 +1012,11 @@ def execute_run(paths: SweepPaths, run: RunSpec) -> Dict[str, Any]:
                         title="prepare_motionbert_dataset",
                     )
                     if prepare_return_code != 0:
+                        stderr_tail = read_log_tail(run.stderr_log_path)
+                        tail_suffix = "" if not stderr_tail else f" Last stderr lines:\n{stderr_tail}"
                         raise RuntimeError(
                             f"MotionBERT dataset preparation failed with return code {prepare_return_code}."
+                            f"{tail_suffix}"
                         )
                     if not valid_motionbert_pkl(run.motionbert_pkl_path, run.motionbert_label_map_path):
                         raise RuntimeError(
@@ -995,7 +1048,12 @@ def execute_run(paths: SweepPaths, run: RunSpec) -> Dict[str, Any]:
     else:
         if error_message is None:
             if return_code != 0:
-                error_message = f"Evaluation subprocess failed with return code {return_code}."
+                stderr_tail = read_log_tail(run.stderr_log_path)
+                tail_suffix = "" if not stderr_tail else f" Last stderr lines:\n{stderr_tail}"
+                error_message = (
+                    f"Evaluation subprocess failed with return code {return_code}."
+                    f"{tail_suffix}"
+                )
             else:
                 error_message = (
                     "Evaluation subprocess finished without a new complete evaluator output directory "
@@ -1072,6 +1130,11 @@ def main() -> int:
         eval_dir=eval_dir,
         repo_root=repo_root,
         prepare_motionbert_script=(repo_root / "dataset_helpers" / "prepare_motionbert_dataset.py").resolve(),
+        motionbert_code_root=(
+            args.motionbert_code_root.expanduser().resolve()
+            if args.motionbert_code_root is not None
+            else (repo_root / "models" / "MotionBERT").resolve()
+        ),
         keypoints_root=args.keypoints_root.expanduser(),
         classification_root=args.classification_root.expanduser(),
         output_root=args.output_root.expanduser(),
@@ -1130,7 +1193,7 @@ def main() -> int:
 
         if args.dry_run:
             if run.classifier_model in ("cnnlstm", "stgcn"):
-                command = build_eval_models_command(run)
+                command = build_eval_models_command(paths, run)
                 command_cwd = paths.repo_root
                 prepare_command = None
             else:
