@@ -13,6 +13,7 @@ Options:
                                 an exact ONNX path is not provided.
   --fastpose-onnx PATH          Exact FastPose ONNX path.
   --yolo-onnx PATH              Exact YOLOv3-SPP ONNX path.
+  --models LIST                 yolo | fastpose | both. Default: both
   --engine-dir DIR              Output directory for .engine files. Required.
   --precision MODE              fp32 | fp16 | both. Default: both
   --trtexec PATH                trtexec binary. Default: auto-detect.
@@ -55,6 +56,7 @@ ONNX_DIR=""
 FASTPOSE_ONNX=""
 YOLO_ONNX=""
 ENGINE_DIR=""
+MODELS="both"
 PRECISION="both"
 TRTEXEC=""
 WORKSPACE_MB="2048"
@@ -84,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --engine-dir)
             ENGINE_DIR="$2"
+            shift 2
+            ;;
+        --models|--model)
+            MODELS="$2"
             shift 2
             ;;
         --precision)
@@ -154,10 +160,20 @@ if [[ -z "$YOLO_ONNX" && -n "$ONNX_DIR" ]]; then
     YOLO_ONNX="$ONNX_DIR/yolov3_spp.onnx"
 fi
 
-[[ -n "$FASTPOSE_ONNX" ]] || fail "Provide --fastpose-onnx or --onnx-dir"
-[[ -n "$YOLO_ONNX" ]] || fail "Provide --yolo-onnx or --onnx-dir"
-[[ -f "$FASTPOSE_ONNX" ]] || fail "FastPose ONNX not found: $FASTPOSE_ONNX"
-[[ -f "$YOLO_ONNX" ]] || fail "YOLO ONNX not found: $YOLO_ONNX"
+case "$MODELS" in
+    yolo|fastpose|both) ;;
+    *) fail "--models must be yolo, fastpose, or both" ;;
+esac
+
+if [[ "$MODELS" == "fastpose" || "$MODELS" == "both" ]]; then
+    [[ -n "$FASTPOSE_ONNX" ]] || fail "Provide --fastpose-onnx or --onnx-dir when building FastPose"
+    [[ -f "$FASTPOSE_ONNX" ]] || fail "FastPose ONNX not found: $FASTPOSE_ONNX"
+fi
+
+if [[ "$MODELS" == "yolo" || "$MODELS" == "both" ]]; then
+    [[ -n "$YOLO_ONNX" ]] || fail "Provide --yolo-onnx or --onnx-dir when building YOLO"
+    [[ -f "$YOLO_ONNX" ]] || fail "YOLO ONNX not found: $YOLO_ONNX"
+fi
 
 case "$PRECISION" in
     fp32|fp16|both) ;;
@@ -216,18 +232,27 @@ echo "  trtexec:        $TRTEXEC"
 echo "  fastpose onnx:  $FASTPOSE_ONNX"
 echo "  yolo onnx:      $YOLO_ONNX"
 echo "  engine dir:     $ENGINE_DIR"
+echo "  models:         $MODELS"
 echo "  precision:      $PRECISION"
 echo "  workspace MiB:  $WORKSPACE_MB"
 echo "  fastpose dyn:   $FASTPOSE_DYNAMIC"
 
 if [[ "$PRECISION" == "fp32" || "$PRECISION" == "both" ]]; then
-    build_one "$YOLO_ONNX" "$ENGINE_DIR/yolov3_spp_fp32.engine" fp32
-    build_one "$FASTPOSE_ONNX" "$ENGINE_DIR/fastpose_fp32.engine" fp32 "${FASTPOSE_PROFILE_ARGS[@]}"
+    if [[ "$MODELS" == "yolo" || "$MODELS" == "both" ]]; then
+        build_one "$YOLO_ONNX" "$ENGINE_DIR/yolov3_spp_fp32.engine" fp32
+    fi
+    if [[ "$MODELS" == "fastpose" || "$MODELS" == "both" ]]; then
+        build_one "$FASTPOSE_ONNX" "$ENGINE_DIR/fastpose_fp32.engine" fp32 "${FASTPOSE_PROFILE_ARGS[@]}"
+    fi
 fi
 
 if [[ "$PRECISION" == "fp16" || "$PRECISION" == "both" ]]; then
-    build_one "$YOLO_ONNX" "$ENGINE_DIR/yolov3_spp_fp16.engine" fp16
-    build_one "$FASTPOSE_ONNX" "$ENGINE_DIR/fastpose_fp16.engine" fp16 "${FASTPOSE_PROFILE_ARGS[@]}"
+    if [[ "$MODELS" == "yolo" || "$MODELS" == "both" ]]; then
+        build_one "$YOLO_ONNX" "$ENGINE_DIR/yolov3_spp_fp16.engine" fp16
+    fi
+    if [[ "$MODELS" == "fastpose" || "$MODELS" == "both" ]]; then
+        build_one "$FASTPOSE_ONNX" "$ENGINE_DIR/fastpose_fp16.engine" fp16 "${FASTPOSE_PROFILE_ARGS[@]}"
+    fi
 fi
 
 echo
