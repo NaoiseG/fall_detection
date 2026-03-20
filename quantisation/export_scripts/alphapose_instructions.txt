@@ -1,0 +1,60 @@
+cd ~/AlphaPose
+cp /path/to/export_fastpose_to_onnx.py .
+cp /path/to/export_yolov3_spp_to_onnx.py .
+cp /path/to/build_engines.sh .
+chmod +x build_engines.sh
+
+python3 -m pip install onnx polygraphy easydict pyyaml
+
+python3 export_fastpose_to_onnx.py \
+  --cfg configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml \
+  --checkpoint pretrained_models/fast_res50_256x192.pth \
+  --output onnx/fastpose.onnx \
+  --opset 13 \
+  --dynamic-batch \
+  --min-batch 1 \
+  --opt-batch 8 \
+  --max-batch 32
+
+python3 export_yolov3_spp_to_onnx.py \
+  --cfg detector/yolo/cfg/yolov3-spp.cfg \
+  --weights detector/yolo/data/yolov3-spp.weights \
+  --output onnx/yolov3_spp.onnx \
+  --opset 13 \
+  --input-size 608
+
+============================
+
+Optional sanitize step only if TensorRT parsing of the YOLO ONNX fails:
+
+polygraphy surgeon sanitize onnx/yolov3_spp.onnx \
+  --fold-constants \
+  --output onnx/yolov3_spp_sanitized.onnx
+
+============================
+
+Build all four engines:
+
+bash build_engines.sh \
+  --fastpose-onnx onnx/fastpose.onnx \
+  --yolo-onnx onnx/yolov3_spp.onnx \
+  --engine-dir engines \
+  --precision both \
+  --fastpose-dynamic \
+  --fastpose-min-batch 1 \
+  --fastpose-opt-batch 8 \
+  --fastpose-max-batch 32 \
+  --workspace-mb 2048 \
+  --verbose
+
+If you used the sanitized detector ONNX:
+
+bash build_engines.sh \
+  --fastpose-onnx onnx/fastpose.onnx \
+  --yolo-onnx onnx/yolov3_spp_sanitized.onnx \
+  --engine-dir engines \
+  --precision both \
+  --fastpose-dynamic \
+  --fastpose-min-batch 1 \
+  --fastpose-opt-batch 8 \
+  --fastpose-max-batch 32
