@@ -42,6 +42,45 @@ class PoseExportConfig:
     draw_no_target_text: bool = True
 
 
+POSE_LOCK_SETTINGS_PRESETS: Dict[str, Dict[str, Any]] = {
+    # Uses PoseExportConfig defaults.
+    "default": {},
+    # Preserves the settings that were previously hard-coded in
+    # dataset_helpers/get_keypoints_files.py.
+    "strict_lock": {
+        "conf_thres": 0.01,
+        "conf_min": 0.01,
+        "detector_max_det": 10,
+        "max_jump_px": None,
+        "max_jump_diag_frac": 0.12,
+        "max_lost": 60,
+        "switch_margin_px": 9999.0,
+        "reset_on_max_lost": False,
+        "lock_first_target": True,
+        "strict_reacquire": True,
+        "min_iou_same_track": 0.05,
+        "max_box_area_ratio": 2.5,
+        "target_x_frac": 0.5,
+        "target_y_frac": 0.5,
+    },
+}
+
+
+def pose_lock_settings_choices() -> Tuple[str, ...]:
+    return tuple(sorted(POSE_LOCK_SETTINGS_PRESETS))
+
+
+def apply_pose_lock_settings(config: PoseExportConfig, preset_name: str) -> PoseExportConfig:
+    preset_key = str(preset_name).strip().lower()
+    if preset_key not in POSE_LOCK_SETTINGS_PRESETS:
+        choices = ", ".join(sorted(POSE_LOCK_SETTINGS_PRESETS))
+        raise ValueError(f"Unknown pose lock settings preset '{preset_name}'. Choices: {choices}")
+
+    for field_name, value in POSE_LOCK_SETTINGS_PRESETS[preset_key].items():
+        setattr(config, field_name, value)
+    return config
+
+
 # ----------------------------- SORTING -----------------------------
 
 def frame_time_key(path: str) -> pd.Timestamp:
