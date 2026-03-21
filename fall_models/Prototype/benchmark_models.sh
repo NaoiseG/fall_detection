@@ -35,6 +35,19 @@ VERSIONS=(
   "int8"
 )
 
+ALPHAPOSE_POSE_MODEL="alphapose"
+ALPHAPOSE_ROOT="pose_models/AlphaPose"
+ALPHAPOSE_CFG="configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml"
+ALPHAPOSE_DETECTOR_CFG="detector/yolo/cfg/yolov3-spp.cfg"
+
+ALPHAPOSE_VERSIONS=(
+  "original"
+  "fp32_fp32"
+  "fp16det_fp32pose"
+  "fp16_fp16"
+  "int8det_fp16pose"
+)
+
 CLASSIFIERS=(
   "cnnlstm"
   "stgcn"
@@ -46,7 +59,10 @@ CNNLSTM_WEIGHT="../../web_app/models/classification/cnnlstm/yolo11l-pose/cnnlstm
 STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/stgcn_best.pt"
 MOTIONBERT_WEIGHT="../../web_app/models/classification/MotionBERT/yolo11l-pose/checkpoint/action/FT_MB_release_MB_ft_UPFall_xsub/best_epoch.bin"
 
-TOTAL_RUNS=$(( ${#POSE_MODELS[@]} * ${#VERSIONS[@]} * ${#CLASSIFIERS[@]} ))
+TOTAL_RUNS=$(( \
+  ${#POSE_MODELS[@]} * ${#VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
+  ${#ALPHAPOSE_VERSIONS[@]} * ${#CLASSIFIERS[@]} \
+))
 
 ###############################################################################
 # Helpers
@@ -122,6 +138,54 @@ half_flag_for_version() {
   esac
 }
 
+alphapose_detector_weights_for_version() {
+  local version="$1"
+
+  case "$version" in
+    original)          printf '%s' "detector/yolo/data/yolov3-spp.weights" ;;
+    fp32_fp32)         printf '%s' "../../quantisation/models/alphapose/yolov3_spp_fp32.engine" ;;
+    fp16det_fp32pose)  printf '%s' "../../quantisation/models/alphapose/yolov3_spp_fp16.engine" ;;
+    fp16_fp16)         printf '%s' "../../quantisation/models/alphapose/yolov3_spp_fp16.engine" ;;
+    int8det_fp16pose)  printf '%s' "../../quantisation/models/alphapose/yolov3_spp_int8.engine" ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+alphapose_checkpoint_for_version() {
+  local version="$1"
+
+  case "$version" in
+    original)          printf '%s' "pretrained_models/fast_res50_256x192.pth" ;;
+    fp32_fp32)         printf '%s' "../../quantisation/models/alphapose/fastpose_fp32.engine" ;;
+    fp16det_fp32pose)  printf '%s' "../../quantisation/models/alphapose/fastpose_fp32.engine" ;;
+    fp16_fp16)         printf '%s' "../../quantisation/models/alphapose/fastpose_fp16.engine" ;;
+    int8det_fp16pose)  printf '%s' "../../quantisation/models/alphapose/fastpose_fp16.engine" ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+resolve_alphapose_check_path() {
+  local alphapose_root="$1"
+  local path_arg="$2"
+
+  case "$path_arg" in
+    /*|./*|../*)
+      printf '%s' "${path_arg}"
+      ;;
+    *)
+      if [[ -e "${path_arg}" ]]; then
+        printf '%s' "${path_arg}"
+      else
+        printf '%s/%s' "${alphapose_root%/}" "${path_arg}"
+      fi
+      ;;
+  esac
+}
+
 snapshot_top_level_dirs() {
   # Print absolute paths of immediate subdirectories inside benchmarks, sorted.
   # This includes both structured destination dirs and run dirs.
@@ -174,12 +238,12 @@ require_file_or_log() {
 combination_already_done() {
   local pose_model="$1"
   local version="$2"
-  local classifier="$3"
+  local run_model_tag="$3"
   local dest_dir="${BENCH_DIR}/${pose_model}/${version}"
 
   [[ -d "${dest_dir}" ]] || return 1
 
-  find "${dest_dir}" -mindepth 1 -maxdepth 1 -type d -name "*__model_${classifier}__*" -print -quit 2>/dev/null | grep -q .
+  find "${dest_dir}" -mindepth 1 -maxdepth 1 -type d -name "*__model_${run_model_tag}__*" -print -quit 2>/dev/null | grep -q .
 }
 
 build_command() {
@@ -219,6 +283,53 @@ build_command() {
       --device cuda \
       --half "${half_flag}" \
       --max-people 10 \
+      --max-det 10 \
+      --warmup-frames 0 \
+      --warmup-windows 0 \
+      --benchmark 1 \
+      --profile-out "${BENCH_DIR}" \
+      --no-display 1
+  fi
+}
+
+build_alphapose_command() {
+  local classifier="$1"
+  local cls_weight="$2"
+  local alphapose_checkpoint="$3"
+  local alphapose_detector_weights="$4"
+
+  if [[ "$classifier" == "motionbert" ]]; then
+    printf '%s\0' \
+      python -m inference.infer_motionbert_video_alphapose \
+      --video "${VIDEO_PATH}" \
+      --model "${cls_weight}" \
+      --config "${MOTIONBERT_CONFIG}" \
+      --alphapose-root "${ALPHAPOSE_ROOT}" \
+      --alphapose-cfg "${ALPHAPOSE_CFG}" \
+      --alphapose-detector-cfg "${ALPHAPOSE_DETECTOR_CFG}" \
+      --alphapose-checkpoint "${alphapose_checkpoint}" \
+      --alphapose-detector-weights "${alphapose_detector_weights}" \
+      --device cuda \
+      --max-det 10 \
+      --warmup-frames 0 \
+      --warmup-windows 0 \
+      --benchmark 1 \
+      --profile-out "${BENCH_DIR}" \
+      --no-display 1 \
+      --out-csv "" \
+      --out-pkl ""
+  else
+    printf '%s\0' \
+      python -m inference.inference_on_video_alphapose \
+      --video "${VIDEO_PATH}" \
+      --model "${cls_weight}" \
+      --arch "${classifier}" \
+      --alphapose-root "${ALPHAPOSE_ROOT}" \
+      --alphapose-cfg "${ALPHAPOSE_CFG}" \
+      --alphapose-detector-cfg "${ALPHAPOSE_DETECTOR_CFG}" \
+      --alphapose-checkpoint "${alphapose_checkpoint}" \
+      --alphapose-detector-weights "${alphapose_detector_weights}" \
+      --device cuda \
       --max-det 10 \
       --warmup-frames 0 \
       --warmup-windows 0 \
@@ -330,6 +441,126 @@ run_one_benchmark() {
   fi
 }
 
+run_one_alphapose_benchmark() {
+  local run_idx="$1"
+  local version="$2"
+  local classifier="$3"
+
+  local alphapose_detector_weights
+  local alphapose_checkpoint
+  local cls_weight
+  local dest_dir
+  local cmd_str
+  local rc=0
+  local detector_cfg_path
+  local detector_weights_path
+  local checkpoint_path
+  local run_model_tag
+
+  alphapose_detector_weights="$(alphapose_detector_weights_for_version "${version}")" || {
+    log_failure \
+      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=internal_error reason=invalid_alphapose_detector_mapping"
+    return 1
+  }
+
+  alphapose_checkpoint="$(alphapose_checkpoint_for_version "${version}")" || {
+    log_failure \
+      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=internal_error reason=invalid_alphapose_checkpoint_mapping"
+    return 1
+  }
+
+  cls_weight="$(classifier_weight_for_arch "${classifier}")" || {
+    log_failure \
+      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=internal_error reason=invalid_classifier_mapping"
+    return 1
+  }
+
+  dest_dir="${BENCH_DIR}/${ALPHAPOSE_POSE_MODEL}/${version}"
+  mkdir -p "${dest_dir}"
+
+  run_model_tag="${classifier}_alphapose"
+  if combination_already_done "${ALPHAPOSE_POSE_MODEL}" "${version}" "${run_model_tag}"; then
+    printf '[%d/%d] Skipping %s %s + %s (already benchmarked)\n' \
+      "${run_idx}" "${TOTAL_RUNS}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}"
+
+    log_skip \
+      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=skipped reason=already_benchmarked dest_dir=${dest_dir}"
+    return 2
+  fi
+
+  local cmd=()
+  while IFS= read -r -d '' token; do
+    cmd+=("$token")
+  done < <(build_alphapose_command "${classifier}" "${cls_weight}" "${alphapose_checkpoint}" "${alphapose_detector_weights}")
+
+  cmd_str="$(join_cmd "${cmd[@]}")"
+
+  printf '[%d/%d] Running %s %s + %s\n' \
+    "${run_idx}" "${TOTAL_RUNS}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}"
+
+  detector_cfg_path="$(resolve_alphapose_check_path "${ALPHAPOSE_ROOT}" "${ALPHAPOSE_DETECTOR_CFG}")"
+  detector_weights_path="$(resolve_alphapose_check_path "${ALPHAPOSE_ROOT}" "${alphapose_detector_weights}")"
+  checkpoint_path="$(resolve_alphapose_check_path "${ALPHAPOSE_ROOT}" "${alphapose_checkpoint}")"
+
+  # Pre-flight checks
+  require_file_or_log "${VIDEO_PATH}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "video" "${cmd_str}" || return 1
+  require_file_or_log "${cls_weight}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" || return 1
+  require_file_or_log "${detector_cfg_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_detector_cfg" "${cmd_str}" || return 1
+  require_file_or_log "${detector_weights_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_detector_weights" "${cmd_str}" || return 1
+  require_file_or_log "${checkpoint_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_fastpose_checkpoint" "${cmd_str}" || return 1
+
+  if [[ "${classifier}" == "motionbert" ]]; then
+    require_file_or_log "${MOTIONBERT_CONFIG}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" || return 1
+  fi
+
+  local before_file after_file new_run_dir
+  before_file="$(mktemp)"
+  after_file="$(mktemp)"
+
+  snapshot_top_level_dirs > "${before_file}"
+
+  "${cmd[@]}"
+  rc=$?
+
+  snapshot_top_level_dirs > "${after_file}"
+
+  if [[ "${rc}" -ne 0 ]]; then
+    log_failure \
+      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    rm -f "${before_file}" "${after_file}"
+    return 1
+  fi
+
+  if new_run_dir="$(find_new_run_dir "${before_file}" "${after_file}")"; then
+    if [[ -d "${new_run_dir}" ]]; then
+      local run_basename
+      run_basename="$(basename "${new_run_dir}")"
+
+      if mv "${new_run_dir}" "${dest_dir}/"; then
+        log_success \
+          "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
+        rm -f "${before_file}" "${after_file}"
+        return 0
+      else
+        log_failure \
+          "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
+        rm -f "${before_file}" "${after_file}"
+        return 1
+      fi
+    else
+      log_failure \
+        "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_new_directory_found reason=diff_returned_non_directory path=${new_run_dir} cmd=\"${cmd_str}\""
+      rm -f "${before_file}" "${after_file}"
+      return 1
+    fi
+  else
+    log_failure \
+      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_unique_new_directory_found cmd=\"${cmd_str}\""
+    rm -f "${before_file}" "${after_file}"
+    return 1
+  fi
+}
+
 ###############################################################################
 # Main
 ###############################################################################
@@ -357,6 +588,10 @@ for pose_model in "${POSE_MODELS[@]}"; do
   done
 done
 
+for version in "${ALPHAPOSE_VERSIONS[@]}"; do
+  mkdir -p "${BENCH_DIR}/${ALPHAPOSE_POSE_MODEL}/${version}"
+done
+
 run_idx=0
 success_count=0
 failure_count=0
@@ -378,6 +613,23 @@ for pose_model in "${POSE_MODELS[@]}"; do
         failure_count=$((failure_count + 1))
       fi
     done
+  done
+done
+
+for version in "${ALPHAPOSE_VERSIONS[@]}"; do
+  for classifier in "${CLASSIFIERS[@]}"; do
+    run_idx=$((run_idx + 1))
+
+    run_one_alphapose_benchmark "${run_idx}" "${version}" "${classifier}"
+    rc=$?
+
+    if [[ "${rc}" -eq 0 ]]; then
+      success_count=$((success_count + 1))
+    elif [[ "${rc}" -eq 2 ]]; then
+      skip_count=$((skip_count + 1))
+    else
+      failure_count=$((failure_count + 1))
+    fi
   done
 done
 
