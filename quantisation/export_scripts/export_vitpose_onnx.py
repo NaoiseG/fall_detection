@@ -37,7 +37,7 @@ from typing import Any
 import onnx
 import torch
 from torch import nn
-from transformers import AutoProcessor, RTDetrForObjectDetection, VitPoseForPoseEstimation
+from transformers import RTDetrForObjectDetection, VitPoseForPoseEstimation
 
 
 DEFAULT_DETECTOR_MODEL = "PekingU/rtdetr_r50vd_coco_o365"
@@ -128,15 +128,6 @@ def resolve_device(requested: str) -> torch.device:
             raise RuntimeError("CUDA was requested for export, but torch.cuda.is_available() is False.")
         return torch.device("cuda")
     return torch.device("cpu")
-
-
-def resolve_processor_hw(size_obj: Any, fallback: tuple[int, int]) -> tuple[int, int]:
-    if isinstance(size_obj, dict):
-        height = size_obj.get("height")
-        width = size_obj.get("width")
-        if isinstance(height, int) and isinstance(width, int):
-            return height, width
-    return fallback
 
 
 def resolve_pose_hw_from_model(model: VitPoseForPoseEstimation, fallback: tuple[int, int]) -> tuple[int, int]:
@@ -251,37 +242,23 @@ def main() -> int:
     onnx_dir = output_root / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
 
-    detector_processor = AutoProcessor.from_pretrained(
-        args.detector_model,
-        local_files_only=args.local_files_only,
-    )
     detector_model = RTDetrForObjectDetection.from_pretrained(
         args.detector_model,
         local_files_only=args.local_files_only,
     ).to(device).eval()
 
-    pose_processor = AutoProcessor.from_pretrained(
-        args.pose_model,
-        local_files_only=args.local_files_only,
-    )
     pose_model = VitPoseForPoseEstimation.from_pretrained(
         args.pose_model,
         local_files_only=args.local_files_only,
     ).to(device).eval()
 
-    detector_hw = resolve_processor_hw(
-        getattr(detector_processor, "size", None),
-        fallback=DEFAULT_DETECTOR_HW,
-    )
+    detector_hw = DEFAULT_DETECTOR_HW
     if args.detector_height is not None and args.detector_width is not None:
         detector_hw = (args.detector_height, args.detector_width)
     elif args.detector_height is not None or args.detector_width is not None:
         raise ValueError("Override both --detector-height and --detector-width together.")
 
-    pose_hw = resolve_processor_hw(
-        getattr(pose_processor, "size", None),
-        fallback=resolve_pose_hw_from_model(pose_model, fallback=DEFAULT_POSE_HW),
-    )
+    pose_hw = resolve_pose_hw_from_model(pose_model, fallback=DEFAULT_POSE_HW)
     if args.pose_height is not None and args.pose_width is not None:
         pose_hw = (args.pose_height, args.pose_width)
     elif args.pose_height is not None or args.pose_width is not None:
