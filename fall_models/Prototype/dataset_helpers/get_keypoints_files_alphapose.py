@@ -96,6 +96,36 @@ def main():
         default=Path("../../Datasets/UPFall_keypoints_alpha/outputs_npz"),
         help="Root where outputs are written (default: ../../Datasets/UPFall_keypoints_alpha/outputs_npz).",
     )
+    ap.add_argument(
+        "--alphapose-root",
+        type=Path,
+        default=Path("pose_models/AlphaPose"),
+        help="Path to the AlphaPose repo root (default: pose_models/AlphaPose).",
+    )
+    ap.add_argument(
+        "--cfg-path",
+        type=Path,
+        default=Path("configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml"),
+        help="AlphaPose config path, absolute or relative to --alphapose-root.",
+    )
+    ap.add_argument(
+        "--fastpose-weights",
+        type=Path,
+        default=Path("pretrained_models/fast_res50_256x192.pth"),
+        help="FastPose weights path (.pth or TensorRT .engine), absolute or relative to --alphapose-root.",
+    )
+    ap.add_argument(
+        "--detector-cfg",
+        type=Path,
+        default=Path("detector/yolo/cfg/yolov3-spp.cfg"),
+        help="YOLOv3-SPP detector cfg path, absolute or relative to --alphapose-root.",
+    )
+    ap.add_argument(
+        "--detector-weights",
+        type=Path,
+        default=Path("detector/yolo/data/yolov3-spp.weights"),
+        help="YOLOv3-SPP detector weights path (.weights or TensorRT .engine), absolute or relative to --alphapose-root.",
+    )
     args = ap.parse_args()
 
     upfall_root = args.upfall_root.expanduser().resolve()
@@ -110,11 +140,11 @@ def main():
         from pose_alphapose import AlphaPoseExportConfig, AlphaPoseRunner, run_pose_on_frames_alphapose
 
     cfg = AlphaPoseExportConfig(
-        alphapose_root="pose_models/AlphaPose",
-        cfg_path="configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml",
-        checkpoint="pretrained_models/fast_res50_256x192.pth",
-        detector_cfg="detector/yolo/cfg/yolov3-spp.cfg",
-        detector_weights="detector/yolo/data/yolov3-spp.weights",
+        alphapose_root=str(args.alphapose_root),
+        cfg_path=str(args.cfg_path),
+        checkpoint=str(args.fastpose_weights),
+        detector_cfg=str(args.detector_cfg),
+        detector_weights=str(args.detector_weights),
         conf_thres=0.01,
         conf_min=0.01,
         nms_thres=0.6,
@@ -142,6 +172,9 @@ def main():
 
     print(f"UP-Fall root: {upfall_root}")
     print(f"Output root: {output_root}")
+    print(f"AlphaPose root: {args.alphapose_root}")
+    print(f"FastPose weights: {args.fastpose_weights}")
+    print(f"Detector weights: {args.detector_weights}")
     print(f"Subjects: {args.subjects}")
     print("Camera folders found:", len(camera_folders))
     total = len(camera_folders)

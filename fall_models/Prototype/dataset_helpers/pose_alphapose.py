@@ -1,5 +1,7 @@
+import json
 import glob
 import os
+import platform
 import re
 import sys
 from dataclasses import dataclass
@@ -19,11 +21,11 @@ class AlphaPoseExportConfig:
     # AlphaPose repo root (relative to project root by default)
     alphapose_root: str = "pose_models/AlphaPose"
 
-    # FastPose COCO-17 config + checkpoint
+    # FastPose COCO-17 config + checkpoint/engine
     cfg_path: str = "configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml"
     checkpoint: str = "pretrained_models/fast_res50_256x192.pth"
 
-    # YOLOv3-SPP detector files
+    # YOLOv3-SPP detector cfg + weights/engine
     detector_cfg: str = "detector/yolo/cfg/yolov3-spp.cfg"
     detector_weights: str = "detector/yolo/data/yolov3-spp.weights"
 
@@ -94,6 +96,353 @@ def make_video_writer(out_path: str, fps: int, frame_size: Tuple[int, int], code
     fourcc = cv2.VideoWriter_fourcc(*codec)
     w, h = frame_size
     return cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+
+
+def is_engine_weights_path(weights_path: str) -> bool:
+    return Path(weights_path).suffix.lower() == ".engine"
+
+
+def _strip_tensorrt_engine_header(raw: bytes) -> Optional[bytes]:
+    """
+    Some exporters prepend serialized engines with:
+      [4-byte metadata length][JSON metadata][engine bytes]
+    Strip that wrapper if present.
+    """
+    if len(raw) <= 4:
+        return None
+
+    meta_len = int.from_bytes(raw[:4], byteorder="little", signed=False)
+    max_reasonable = min(len(raw) - 4, 8 * 1024 * 1024)
+    if meta_len <= 0 or meta_len > int(max_reasonable):
+        return None
+
+    meta_raw = raw[4 : 4 + meta_len]
+    try:
+        meta = json.loads(meta_raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    return raw[4 + meta_len :]
+
+
+def _torch_dtype_from_numpy(np_dtype: np.dtype) -> torch.dtype:
+    d = np.dtype(np_dtype)
+    if d == np.float16:
+        return torch.float16
+    if d == np.float32:
+        return torch.float32
+    if d == np.float64:
+        return torch.float64
+    if d == np.int8:
+        return torch.int8
+    if d == np.int16:
+        return torch.int16
+    if d == np.int32:
+        return torch.int32
+    if d == np.int64:
+        return torch.int64
+    if d == np.uint8:
+        return torch.uint8
+    if d == np.bool_:
+        return torch.bool
+    raise TypeError(f"Unsupported numpy dtype for TensorRT tensor IO: {d}")
+
+
+class TensorRTEngineRunner:
+    """
+    Minimal TensorRT runtime wrapper for CUDA inference on numpy batches.
+    Supports both legacy binding APIs and newer name-based TensorRT APIs.
+    """
+
+    def __init__(self, engine_path: Path, device: str = "cuda"):
+        self.engine_path = Path(engine_path)
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"TensorRT .engine requires CUDA, but CUDA is unavailable. Cannot load: {self.engine_path}"
+            )
+
+        device_str = str(device).strip().lower()
+        if not device_str.startswith("cuda"):
+            raise RuntimeError(
+                f"TensorRT .engine requires a CUDA device, but got {device!r} for {self.engine_path}."
+            )
+        self.device = torch.device(device)
+
+        try:
+            import tensorrt as trt  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "TensorRT python package is required for .engine inference. "
+                "Install the matching `tensorrt` wheel for your CUDA/TensorRT stack."
+            ) from exc
+
+        self.trt = trt
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.runtime = trt.Runtime(self.logger)
+
+        raw = self.engine_path.read_bytes()
+        self.engine = self.runtime.deserialize_cuda_engine(raw)
+        if self.engine is None:
+            stripped = _strip_tensorrt_engine_header(raw)
+            if stripped is not None:
+                self.engine = self.runtime.deserialize_cuda_engine(stripped)
+        if self.engine is None:
+            raise RuntimeError(
+                f"Failed to deserialize TensorRT engine: {self.engine_path}. "
+                "Check that the engine matches this TensorRT runtime."
+            )
+
+        self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError(f"Failed to create TensorRT execution context for {self.engine_path}")
+
+        self._name_api = hasattr(self.engine, "num_io_tensors") and hasattr(self.engine, "get_tensor_name")
+
+        self.input_name: str
+        self.input_index: Optional[int]
+        self.input_shape_template: Tuple[int, ...]
+        self.input_np_dtype: np.dtype
+        self.output_names: List[str] = []
+        self.output_indices: List[int] = []
+
+        if self._name_api:
+            n_io = int(self.engine.num_io_tensors)
+            input_names: List[str] = []
+            output_names: List[str] = []
+            for i in range(n_io):
+                name = str(self.engine.get_tensor_name(i))
+                mode = self.engine.get_tensor_mode(name)
+                if mode == self.trt.TensorIOMode.INPUT:
+                    input_names.append(name)
+                elif mode == self.trt.TensorIOMode.OUTPUT:
+                    output_names.append(name)
+
+            if len(input_names) != 1:
+                raise RuntimeError(
+                    f"Expected exactly 1 TensorRT input tensor, found {len(input_names)} in {self.engine_path}"
+                )
+            if not output_names:
+                raise RuntimeError(f"No TensorRT output tensors found in {self.engine_path}")
+
+            self.input_name = input_names[0]
+            self.input_index = None
+            self.output_names = output_names
+            self.input_shape_template = tuple(int(v) for v in self.engine.get_tensor_shape(self.input_name))
+            self.input_np_dtype = self._trt_dtype_to_numpy(self.engine.get_tensor_dtype(self.input_name))
+        else:
+            n_bindings = int(self.engine.num_bindings)
+            input_indices = [i for i in range(n_bindings) if bool(self.engine.binding_is_input(i))]
+            output_indices = [i for i in range(n_bindings) if not bool(self.engine.binding_is_input(i))]
+            if len(input_indices) != 1:
+                raise RuntimeError(
+                    f"Expected exactly 1 TensorRT input binding, found {len(input_indices)} in {self.engine_path}"
+                )
+            if not output_indices:
+                raise RuntimeError(f"No TensorRT output bindings found in {self.engine_path}")
+
+            self.input_index = int(input_indices[0])
+            self.output_indices = [int(i) for i in output_indices]
+            self.input_name = str(self.engine.get_binding_name(self.input_index))
+            self.output_names = [str(self.engine.get_binding_name(i)) for i in self.output_indices]
+            self.input_shape_template = tuple(int(v) for v in self.engine.get_binding_shape(self.input_index))
+            self.input_np_dtype = self._trt_dtype_to_numpy(self.engine.get_binding_dtype(self.input_index))
+
+        self.static_batch_size: Optional[int]
+        if self.input_shape_template and int(self.input_shape_template[0]) > 0:
+            self.static_batch_size = int(self.input_shape_template[0])
+        else:
+            self.static_batch_size = None
+
+    def _trt_dtype_to_numpy(self, trt_dtype) -> np.dtype:
+        try:
+            return np.dtype(self.trt.nptype(trt_dtype))
+        except Exception:
+            s = str(trt_dtype).lower()
+            if "float16" in s or "half" in s:
+                return np.dtype(np.float16)
+            if "float32" in s:
+                return np.dtype(np.float32)
+            if "int8" in s:
+                return np.dtype(np.int8)
+            if "int32" in s:
+                return np.dtype(np.int32)
+            if "bool" in s:
+                return np.dtype(np.bool_)
+            return np.dtype(np.float32)
+
+    def _set_input_shape_if_needed(self, shape: Tuple[int, ...]) -> None:
+        shape_t = tuple(int(v) for v in shape)
+        if len(shape_t) != len(self.input_shape_template):
+            raise ValueError(
+                f"TensorRT input rank mismatch for {self.engine_path}: "
+                f"expected rank={len(self.input_shape_template)}, got shape={shape_t}"
+            )
+
+        for dim_i, (expect, got) in enumerate(zip(self.input_shape_template, shape_t)):
+            if int(expect) >= 0 and int(expect) != int(got):
+                raise ValueError(
+                    f"Input shape mismatch at dim={dim_i} for {self.engine_path}: "
+                    f"engine expects {self.input_shape_template}, got {shape_t}"
+                )
+
+        if any(int(v) < 0 for v in self.input_shape_template):
+            if self._name_api and hasattr(self.context, "set_input_shape"):
+                ok = self.context.set_input_shape(self.input_name, shape_t)
+                if ok is False:
+                    raise RuntimeError(
+                        f"Failed to set TensorRT dynamic input shape {shape_t} on tensor '{self.input_name}'"
+                    )
+            elif self.input_index is not None and hasattr(self.context, "set_binding_shape"):
+                ok = self.context.set_binding_shape(int(self.input_index), shape_t)
+                if ok is False:
+                    raise RuntimeError(
+                        f"Failed to set TensorRT dynamic input shape {shape_t} on binding index {self.input_index}"
+                    )
+            else:
+                raise RuntimeError(
+                    "TensorRT engine uses dynamic shapes, but this runtime/context does not expose "
+                    "set_input_shape or set_binding_shape."
+                )
+
+    def infer(self, x_batch: np.ndarray) -> List[np.ndarray]:
+        x_np = np.asarray(x_batch)
+        if x_np.ndim != len(self.input_shape_template):
+            raise ValueError(
+                f"TensorRT input rank mismatch for {self.engine_path}: "
+                f"expected rank={len(self.input_shape_template)}, got shape={tuple(x_np.shape)}"
+            )
+
+        if x_np.dtype != self.input_np_dtype:
+            x_np = x_np.astype(self.input_np_dtype, copy=False)
+        if not x_np.flags.c_contiguous:
+            x_np = np.ascontiguousarray(x_np)
+
+        x_t = torch.as_tensor(
+            x_np,
+            device=self.device,
+            dtype=_torch_dtype_from_numpy(self.input_np_dtype),
+        )
+        self._set_input_shape_if_needed(tuple(int(v) for v in x_t.shape))
+
+        if self._name_api and hasattr(self.context, "set_tensor_address"):
+            output_tensors: Dict[str, torch.Tensor] = {}
+            self.context.set_tensor_address(self.input_name, int(x_t.data_ptr()))
+            for out_name in self.output_names:
+                out_shape = tuple(int(v) for v in self.context.get_tensor_shape(out_name))
+                if any(int(v) < 0 for v in out_shape):
+                    raise RuntimeError(
+                        f"Unresolved dynamic output shape for tensor '{out_name}' in {self.engine_path}: {out_shape}"
+                    )
+                out_dtype = self._trt_dtype_to_numpy(self.engine.get_tensor_dtype(out_name))
+                out_t = torch.empty(
+                    out_shape,
+                    device=self.device,
+                    dtype=_torch_dtype_from_numpy(out_dtype),
+                )
+                self.context.set_tensor_address(out_name, int(out_t.data_ptr()))
+                output_tensors[out_name] = out_t
+
+            if hasattr(self.context, "execute_async_v3"):
+                stream = torch.cuda.current_stream(device=self.device)
+                ok = self.context.execute_async_v3(stream_handle=int(stream.cuda_stream))
+            elif hasattr(self.context, "execute_v3"):
+                ok = self.context.execute_v3()
+            else:
+                if not hasattr(self.engine, "num_bindings") or not hasattr(self.engine, "get_binding_index"):
+                    raise RuntimeError("TensorRT context lacks supported execution APIs.")
+                bindings = [0] * int(self.engine.num_bindings)
+                in_idx = int(self.engine.get_binding_index(self.input_name))
+                bindings[in_idx] = int(x_t.data_ptr())
+                for out_name, out_t in output_tensors.items():
+                    out_idx = int(self.engine.get_binding_index(out_name))
+                    bindings[out_idx] = int(out_t.data_ptr())
+                ok = self.context.execute_v2(bindings)
+
+            if not ok:
+                raise RuntimeError(f"TensorRT execution failed for {self.engine_path}")
+            torch.cuda.synchronize(self.device)
+            return [output_tensors[name].detach().cpu().numpy() for name in self.output_names]
+
+        if self.input_index is None or not hasattr(self.engine, "num_bindings"):
+            raise RuntimeError("TensorRT runtime does not expose supported tensor-address or binding APIs.")
+
+        n_bindings = int(self.engine.num_bindings)
+        bindings = [0] * n_bindings
+        bindings[int(self.input_index)] = int(x_t.data_ptr())
+
+        out_tensors: List[torch.Tensor] = []
+        for out_idx in self.output_indices:
+            out_shape = tuple(int(v) for v in self.context.get_binding_shape(int(out_idx)))
+            if any(int(v) < 0 for v in out_shape):
+                raise RuntimeError(
+                    f"Unresolved dynamic output shape for binding index {out_idx} in {self.engine_path}: {out_shape}"
+                )
+            out_dtype = self._trt_dtype_to_numpy(self.engine.get_binding_dtype(int(out_idx)))
+            out_t = torch.empty(
+                out_shape,
+                device=self.device,
+                dtype=_torch_dtype_from_numpy(out_dtype),
+            )
+            bindings[int(out_idx)] = int(out_t.data_ptr())
+            out_tensors.append(out_t)
+
+        ok = self.context.execute_v2(bindings)
+        if not ok:
+            raise RuntimeError(f"TensorRT execution failed for {self.engine_path}")
+        torch.cuda.synchronize(self.device)
+        return [t.detach().cpu().numpy() for t in out_tensors]
+
+
+def _infer_engine_outputs_batched(engine_runner: TensorRTEngineRunner, x_batch: np.ndarray) -> List[np.ndarray]:
+    x_np = np.asarray(x_batch)
+    if x_np.ndim < 1:
+        raise ValueError("TensorRT inference batch must have at least one dimension.")
+
+    static_bs = engine_runner.static_batch_size
+    batch_size = int(x_np.shape[0])
+    if static_bs is None or static_bs <= 0 or batch_size == static_bs:
+        return engine_runner.infer(x_np)
+
+    out_parts: Optional[List[List[np.ndarray]]] = None
+    start = 0
+    while start < batch_size:
+        end = min(start + int(static_bs), batch_size)
+        chunk = x_np[start:end]
+        chunk_len = int(end - start)
+        if chunk_len < int(static_bs):
+            pad_shape = (int(static_bs) - chunk_len, *chunk.shape[1:])
+            pad = np.zeros(pad_shape, dtype=chunk.dtype)
+            chunk = np.concatenate((chunk, pad), axis=0)
+
+        chunk_outputs = engine_runner.infer(chunk)
+        if out_parts is None:
+            out_parts = [[] for _ in chunk_outputs]
+        elif len(chunk_outputs) != len(out_parts):
+            raise RuntimeError("TensorRT engine returned an inconsistent number of outputs across batches.")
+
+        for out_idx, arr in enumerate(chunk_outputs):
+            arr_np = np.asarray(arr)
+            if arr_np.ndim >= 1 and arr_np.shape[0] == int(static_bs):
+                arr_np = arr_np[:chunk_len]
+            elif arr_np.ndim == 0 and chunk_len != 1:
+                raise RuntimeError(
+                    f"TensorRT engine output shape {arr_np.shape} cannot be split into batch chunks."
+                )
+            out_parts[out_idx].append(arr_np)
+        start = end
+
+    if out_parts is None:
+        return []
+
+    merged: List[np.ndarray] = []
+    for parts in out_parts:
+        first = np.asarray(parts[0])
+        if first.ndim == 0:
+            merged.append(first)
+        else:
+            merged.append(np.concatenate(parts, axis=0))
+    return merged
 
 
 def _coerce_int_id(value: Any) -> int:
@@ -417,6 +766,228 @@ def draw_selected_pose(
     return out
 
 
+class TensorRTYOLODetector:
+    """
+    TensorRT-backed replacement for AlphaPose's YOLOv3 detector.
+    Assumes the engine preserves Darknet YOLOv3-SPP input preprocessing and either:
+      - returns a single transformed detection tensor shaped like (B, N, 5 + num_classes), or
+      - returns one raw YOLO head tensor per detection scale.
+    """
+
+    def __init__(self, model_cfg: str, engine_path: str, opt: "_Opt", confidence: float, nms_thres: float):
+        from detector.yolo.bbox import bbox_iou
+        from detector.yolo.darknet import Darknet
+        from detector.yolo.preprocess import prep_frame, prep_image
+        from detector.yolo.util import predict_transform
+
+        self.model_cfg = str(model_cfg)
+        self.model_weights = str(engine_path)
+        self.detector_opt = opt
+        self.confidence = float(confidence)
+        self.nms_thres = float(nms_thres)
+        self.model = None
+
+        darknet = Darknet(self.model_cfg)
+        net_info = getattr(darknet, "net_info", {})
+        self.inp_dim = int(net_info.get("height", 608))
+        self.num_classes = self._extract_num_classes(getattr(darknet, "blocks", []))
+        self.yolo_anchors = self._extract_yolo_anchors(darknet)
+        del darknet
+
+        self._bbox_iou = bbox_iou
+        self._predict_transform = predict_transform
+        self._prep_frame = prep_frame
+        self._prep_image = prep_image
+        self._nms_wrapper = None
+        if platform.system() != "Windows":
+            try:
+                from detector.nms import nms_wrapper
+                self._nms_wrapper = nms_wrapper
+            except Exception:
+                self._nms_wrapper = None
+
+        self._engine_runner = TensorRTEngineRunner(Path(self.model_weights), device=str(opt.device))
+
+    def _extract_num_classes(self, blocks: List[Dict[str, Any]]) -> int:
+        for block in reversed(blocks):
+            if str(block.get("type", "")).lower() == "yolo" and "classes" in block:
+                return int(block["classes"])
+        return 80
+
+    def _extract_yolo_anchors(self, darknet) -> List[List[Tuple[float, float]]]:
+        anchors: List[List[Tuple[float, float]]] = []
+        for module in getattr(darknet, "module_list", []):
+            if len(module) > 0 and hasattr(module[0], "anchors"):
+                anchors.append(list(module[0].anchors))
+        return anchors
+
+    def image_preprocess(self, img_source):
+        if isinstance(img_source, str):
+            img, _, _ = self._prep_image(img_source, self.inp_dim)
+            return img
+        if isinstance(img_source, (torch.Tensor, np.ndarray)):
+            img, _, _ = self._prep_frame(img_source, self.inp_dim)
+            return img
+        raise IOError(f"Unknown image source type: {type(img_source)}")
+
+    def _outputs_to_prediction(self, outputs: List[np.ndarray], batch_size: int) -> torch.Tensor:
+        expected_attrs = 5 + int(self.num_classes)
+
+        for out in outputs:
+            arr = np.asarray(out)
+            if arr.ndim == 2 and batch_size == 1 and arr.shape[-1] >= expected_attrs:
+                arr = arr[np.newaxis, ...]
+            if arr.ndim == 3 and arr.shape[0] == batch_size and arr.shape[-1] >= expected_attrs:
+                return torch.as_tensor(arr, device=self.detector_opt.device)
+
+        four_d = [np.asarray(out) for out in outputs if np.asarray(out).ndim == 4]
+        if four_d and len(four_d) == len(self.yolo_anchors):
+            pred_parts: List[torch.Tensor] = []
+            for out_arr, anchors in zip(sorted(four_d, key=lambda a: int(a.shape[2])), self.yolo_anchors):
+                raw = torch.as_tensor(out_arr, device=self.detector_opt.device)
+                pred_parts.append(
+                    self._predict_transform(
+                        raw,
+                        self.inp_dim,
+                        anchors,
+                        self.num_classes,
+                        self.detector_opt,
+                    )
+                )
+            return torch.cat(pred_parts, dim=1)
+
+        output_shapes = ", ".join(str(tuple(np.asarray(out).shape)) for out in outputs)
+        raise RuntimeError(
+            "Unsupported TensorRT detector outputs for AlphaPose YOLOv3-SPP. "
+            f"Expected one transformed output or {len(self.yolo_anchors)} raw YOLO heads, got: {output_shapes}"
+        )
+
+    def images_detection(self, imgs, orig_dim_list):
+        args = self.detector_opt
+        if isinstance(imgs, torch.Tensor):
+            x_batch = imgs.detach().cpu().numpy()
+        else:
+            x_batch = np.asarray(imgs)
+        if x_batch.ndim == 3:
+            x_batch = np.expand_dims(x_batch, axis=0)
+
+        outputs = _infer_engine_outputs_batched(self._engine_runner, x_batch)
+        prediction = self._outputs_to_prediction(outputs, batch_size=int(x_batch.shape[0]))
+
+        dets = self.dynamic_write_results(
+            prediction,
+            self.confidence,
+            self.num_classes,
+            nms=True,
+            nms_conf=self.nms_thres,
+        )
+        if isinstance(dets, int) or dets.shape[0] == 0:
+            return 0
+
+        dets = dets.cpu()
+        orig_dim_list = torch.index_select(orig_dim_list, 0, dets[:, 0].long())
+        scaling_factor = torch.min(self.inp_dim / orig_dim_list, 1)[0].view(-1, 1)
+        dets[:, [1, 3]] -= (self.inp_dim - scaling_factor * orig_dim_list[:, 0].view(-1, 1)) / 2
+        dets[:, [2, 4]] -= (self.inp_dim - scaling_factor * orig_dim_list[:, 1].view(-1, 1)) / 2
+        dets[:, 1:5] /= scaling_factor
+        for i in range(dets.shape[0]):
+            dets[i, [1, 3]] = torch.clamp(dets[i, [1, 3]], 0.0, orig_dim_list[i, 0])
+            dets[i, [2, 4]] = torch.clamp(dets[i, [2, 4]], 0.0, orig_dim_list[i, 1])
+
+        return dets
+
+    def dynamic_write_results(self, prediction, confidence, num_classes, nms=True, nms_conf=0.4):
+        prediction_bak = prediction.clone()
+        dets = self.write_results(prediction.clone(), confidence, num_classes, nms, nms_conf)
+        if isinstance(dets, int):
+            return dets
+
+        if dets.shape[0] > 100:
+            nms_conf -= 0.05
+            dets = self.write_results(prediction_bak.clone(), confidence, num_classes, nms, nms_conf)
+
+        return dets
+
+    def write_results(self, prediction, confidence, num_classes, nms=True, nms_conf=0.4):
+        args = self.detector_opt
+        conf_mask = (prediction[:, :, 4] > confidence).float().unsqueeze(2)
+        prediction = prediction * conf_mask
+
+        try:
+            torch.nonzero(prediction[:, :, 4]).transpose(0, 1).contiguous()
+        except Exception:
+            return 0
+
+        box_a = prediction.new(prediction.shape)
+        box_a[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2
+        box_a[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2
+        box_a[:, :, 2] = prediction[:, :, 0] + prediction[:, :, 2] / 2
+        box_a[:, :, 3] = prediction[:, :, 1] + prediction[:, :, 3] / 2
+        prediction[:, :, :4] = box_a[:, :, :4]
+
+        batch_size = prediction.size(0)
+        output = prediction.new(1, prediction.size(2) + 1)
+        write = False
+        num = 0
+        for ind in range(batch_size):
+            image_pred = prediction[ind]
+
+            max_conf, max_conf_score = torch.max(image_pred[:, 5 : 5 + num_classes], 1)
+            max_conf = max_conf.float().unsqueeze(1)
+            max_conf_score = max_conf_score.float().unsqueeze(1)
+            image_pred = torch.cat((image_pred[:, :5], max_conf, max_conf_score), 1)
+
+            non_zero_ind = torch.nonzero(image_pred[:, 4])
+            image_pred_ = image_pred[non_zero_ind.squeeze(), :].view(-1, 7)
+
+            try:
+                img_classes = torch.unique(image_pred_[:, -1])
+            except Exception:
+                continue
+
+            for cls in img_classes:
+                if cls != 0:
+                    continue
+
+                cls_mask = image_pred_ * (image_pred_[:, -1] == cls).float().unsqueeze(1)
+                class_mask_ind = torch.nonzero(cls_mask[:, -2]).squeeze()
+                image_pred_class = image_pred_[class_mask_ind].view(-1, 7)
+
+                conf_sort_index = torch.sort(image_pred_class[:, 4], descending=True)[1]
+                image_pred_class = image_pred_class[conf_sort_index]
+
+                if nms:
+                    if self._nms_wrapper is not None:
+                        _, inds = self._nms_wrapper.nms(image_pred_class[:, :5], nms_conf)
+                        image_pred_class = image_pred_class[inds]
+                    else:
+                        max_detections = []
+                        while image_pred_class.size(0):
+                            max_detections.append(image_pred_class[0].unsqueeze(0))
+                            if len(image_pred_class) == 1:
+                                break
+                            ious = self._bbox_iou(max_detections[-1], image_pred_class[1:], args)
+                            image_pred_class = image_pred_class[1:][ious < nms_conf]
+                        image_pred_class = torch.cat(max_detections).data
+
+                batch_ind = image_pred_class.new(image_pred_class.size(0), 1).fill_(ind)
+                seq = batch_ind, image_pred_class
+                if not write:
+                    output = torch.cat(seq, 1)
+                    write = True
+                else:
+                    out = torch.cat(seq, 1)
+                    output = torch.cat((output, out))
+                num += 1
+
+        if not num:
+            return 0
+        return output
+
+    def detect_one_img(self, img_name):
+        raise NotImplementedError("TensorRTYOLODetector.detect_one_img is not used by this pipeline.")
+
+
 # ----------------------------- ALPHAPOSE WRAPPER -----------------------------
 
 class AlphaPoseRunner:
@@ -434,6 +1005,8 @@ class AlphaPoseRunner:
         self.checkpoint_path = self._resolve_path(config.checkpoint)
         self.detector_cfg_path = self._resolve_path(config.detector_cfg)
         self.detector_weights_path = self._resolve_path(config.detector_weights)
+        self.pose_is_engine = is_engine_weights_path(self.checkpoint_path)
+        self.detector_is_engine = is_engine_weights_path(self.detector_weights_path)
 
         if not Path(self.cfg_path).exists():
             raise FileNotFoundError(f"AlphaPose cfg not found: {self.cfg_path}")
@@ -443,8 +1016,7 @@ class AlphaPoseRunner:
             raise FileNotFoundError(f"YOLOv3-SPP cfg not found: {self.detector_cfg_path}")
         if not Path(self.detector_weights_path).exists():
             raise FileNotFoundError(
-                f"YOLOv3-SPP weights not found: {self.detector_weights_path}. "
-                "Download yolov3-spp.weights and place it at that path."
+                f"YOLOv3-SPP weights/engine not found: {self.detector_weights_path}."
             )
 
         from alphapose.utils.config import update_config
@@ -452,8 +1024,9 @@ class AlphaPoseRunner:
         from alphapose.utils.transforms import flip, flip_heatmap, get_func_heatmap_to_coord
         from alphapose.utils.pPose_nms import pose_nms
         from alphapose.utils.presets import SimpleTransform
-        from detector.apis import get_detector
-        from detector import yolo_cfg as yolo_cfg_mod
+        if not self.detector_is_engine:
+            from detector.apis import get_detector
+            from detector import yolo_cfg as yolo_cfg_mod
 
         self.flip = flip
         self.flip_heatmap = flip_heatmap
@@ -462,22 +1035,31 @@ class AlphaPoseRunner:
 
         self.cfg = update_config(self.cfg_path)
 
-        # Override detector cfg to absolute paths and requested thresholds
-        yolo_cfg_mod.cfg.CONFIG = self.detector_cfg_path
-        yolo_cfg_mod.cfg.WEIGHTS = self.detector_weights_path
-        yolo_cfg_mod.cfg.CONFIDENCE = float(config.conf_thres)
-        yolo_cfg_mod.cfg.NMS_THRES = float(config.nms_thres)
-
         # Device selection
         if config.device is None:
-            use_cuda = torch.cuda.is_available()
+            requested_device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
-            use_cuda = config.device.lower() == "cuda"
+            requested_device = str(config.device).strip().lower()
+        use_cuda = requested_device.startswith("cuda")
         if use_cuda and not torch.cuda.is_available():
             use_cuda = False
+            requested_device = "cpu"
+        if (self.pose_is_engine or self.detector_is_engine) and not use_cuda:
+            raise RuntimeError(
+                "TensorRT .engine weights require CUDA. "
+                f"Resolved device: {requested_device!r}, "
+                f"pose_engine={self.pose_is_engine}, detector_engine={self.detector_is_engine}"
+            )
 
-        gpus = [0] if use_cuda else [-1]
-        device = torch.device(f"cuda:{gpus[0]}" if gpus[0] >= 0 else "cpu")
+        gpu_index = 0
+        if use_cuda and requested_device.startswith("cuda:"):
+            maybe_idx = requested_device.split(":", 1)[1].strip()
+            if maybe_idx.isdigit():
+                gpu_index = int(maybe_idx)
+
+        gpus = [gpu_index] if use_cuda else [-1]
+        device = torch.device(f"cuda:{gpu_index}" if gpus[0] >= 0 else "cpu")
+        self.device = device
 
         # Minimal opt namespace required by AlphaPose detector/vis
         self.opt = _Opt(
@@ -493,11 +1075,32 @@ class AlphaPoseRunner:
             showbox=False,
         )
 
-        # Build detector + pose model
-        self.detector = get_detector(self.opt)
-        self.pose_model = builder.build_sppe(self.cfg.MODEL, preset_cfg=self.cfg.DATA_PRESET)
-        self.pose_model.load_state_dict(torch.load(self.checkpoint_path, map_location=device))
-        self.pose_model.to(device).eval()
+        # Build detector backend
+        if self.detector_is_engine:
+            self.detector = TensorRTYOLODetector(
+                model_cfg=self.detector_cfg_path,
+                engine_path=self.detector_weights_path,
+                opt=self.opt,
+                confidence=float(config.conf_thres),
+                nms_thres=float(config.nms_thres),
+            )
+        else:
+            # Override detector cfg to absolute paths and requested thresholds.
+            yolo_cfg_mod.cfg.CONFIG = self.detector_cfg_path
+            yolo_cfg_mod.cfg.WEIGHTS = self.detector_weights_path
+            yolo_cfg_mod.cfg.CONFIDENCE = float(config.conf_thres)
+            yolo_cfg_mod.cfg.NMS_THRES = float(config.nms_thres)
+            self.detector = get_detector(self.opt)
+
+        # Build pose backend
+        self.pose_engine_runner: Optional[TensorRTEngineRunner] = None
+        self.pose_model = None
+        if self.pose_is_engine:
+            self.pose_engine_runner = TensorRTEngineRunner(Path(self.checkpoint_path), device=str(device))
+        else:
+            self.pose_model = builder.build_sppe(self.cfg.MODEL, preset_cfg=self.cfg.DATA_PRESET)
+            self.pose_model.load_state_dict(torch.load(self.checkpoint_path, map_location=device))
+            self.pose_model.to(device).eval()
 
         self.pose_dataset = builder.retrieve_dataset(self.cfg.DATASET.TRAIN)
         self.heatmap_to_coord = get_func_heatmap_to_coord(self.cfg)
@@ -541,10 +1144,43 @@ class AlphaPoseRunner:
         self.use_heatmap_loss = (loss_type == "MSELoss")
 
     def _resolve_path(self, p: str) -> str:
-        path = Path(p)
+        path = Path(p).expanduser()
         if path.is_absolute():
-            return str(path)
-        return str(self.root / path)
+            return str(path.resolve())
+
+        cwd_path = (Path.cwd() / path).resolve()
+        if cwd_path.exists():
+            return str(cwd_path)
+
+        return str((self.root / path).resolve())
+
+    def _infer_pose_engine(self, inps: torch.Tensor) -> torch.Tensor:
+        if self.pose_engine_runner is None:
+            raise RuntimeError("Pose engine runner is not initialised.")
+
+        x_batch = inps.detach().cpu().numpy()
+        outputs = _infer_engine_outputs_batched(self.pose_engine_runner, x_batch)
+        if not outputs:
+            raise RuntimeError("TensorRT pose engine returned no outputs.")
+
+        arr: Optional[np.ndarray] = None
+        for out in outputs:
+            out_np = np.asarray(out)
+            if out_np.ndim >= 3 and out_np.shape[0] == int(x_batch.shape[0]):
+                arr = out_np
+                break
+        if arr is None:
+            arr = np.asarray(outputs[0])
+
+        if arr.ndim == 3 and int(x_batch.shape[0]) == 1:
+            arr = arr[np.newaxis, ...]
+        if arr.ndim < 3:
+            raise RuntimeError(
+                "Unsupported TensorRT FastPose output. "
+                f"Expected rank >= 3, got shape={tuple(arr.shape)} from {self.checkpoint_path}"
+            )
+
+        return torch.from_numpy(np.ascontiguousarray(arr))
 
     def infer(self, image_rgb: np.ndarray, image_name: str) -> Dict[str, Any]:
         """
@@ -593,7 +1229,12 @@ class AlphaPoseRunner:
             if self.config.flip:
                 inps = torch.cat((inps, self.flip(inps)))
 
-            hm = self.pose_model(inps)
+            if self.pose_engine_runner is not None:
+                hm = self._infer_pose_engine(inps)
+            else:
+                if self.pose_model is None:
+                    raise RuntimeError("Pose backend is not initialised.")
+                hm = self.pose_model(inps)
             if self.config.flip:
                 hm_flip = self.flip_heatmap(hm[int(len(hm) / 2):], self.pose_dataset.joint_pairs, shift=True)
                 hm = (hm[0:int(len(hm) / 2)] + hm_flip) / 2
