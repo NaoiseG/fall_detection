@@ -26,11 +26,21 @@ CLASSIFIER_MAP = {
     "stgcn": "ST-GCN",
 }
 
+ARCHITECTURE_MAP = {
+    "alphapose": "Alphapose",
+    "alpha_pose": "Alphapose",
+}
+
 VERSION_MAP = {
     "base": "Base",
     "fp32": "FP32",
     "fp16": "FP16",
     "int8": "INT8",
+    "original": "Base",
+    "fp32_fp32": "FP32",
+    "fp16det_fp32pose": "FP32",
+    "fp16_fp16": "FP16",
+    "int8det_fp16pose": "INT8",
 }
 
 
@@ -40,7 +50,8 @@ VERSION_MAP = {
 
 @dataclass
 class BenchmarkRecord:
-    architecture: str
+    architecture_raw: str
+    architecture_excel: str
     version_folder: str
     version_excel: str
     classifier_raw: str
@@ -260,6 +271,12 @@ def parse_classifier(run_dir_name: str) -> Optional[str]:
     return None
 
 
+def map_architecture(architecture_dir_name: str) -> str:
+    normalized = architecture_dir_name.strip()
+    lowered = normalized.lower()
+    return ARCHITECTURE_MAP.get(lowered, normalized)
+
+
 def map_version(version_folder_name: str) -> Optional[str]:
     return VERSION_MAP.get(version_folder_name.strip().lower())
 
@@ -273,7 +290,8 @@ def scan_benchmark_records(benchmark_root: Path, stats: Stats) -> List[Benchmark
         raise NotADirectoryError(f"Benchmark root is not a directory: {benchmark_root}")
 
     for architecture_dir in sorted(p for p in benchmark_root.iterdir() if p.is_dir()):
-        architecture = architecture_dir.name
+        architecture_raw = architecture_dir.name
+        architecture_excel = map_architecture(architecture_raw)
 
         for version_dir in sorted(p for p in architecture_dir.iterdir() if p.is_dir()):
             version_folder = version_dir.name
@@ -307,7 +325,8 @@ def scan_benchmark_records(benchmark_root: Path, stats: Stats) -> List[Benchmark
 
                 records.append(
                     BenchmarkRecord(
-                        architecture=architecture,
+                        architecture_raw=architecture_raw,
+                        architecture_excel=architecture_excel,
                         version_folder=version_folder,
                         version_excel=version_excel,
                         classifier_raw=classifier_raw,
@@ -480,7 +499,7 @@ def update_workbook(benchmark_root: Path, workbook_path: Path) -> Stats:
 
         row_number = find_matching_row(
             row_index=row_index,
-            architecture=record.architecture,
+            architecture=record.architecture_excel,
             version_excel=record.version_excel,
             classifier_excel=record.classifier_excel,
         )
@@ -488,8 +507,10 @@ def update_workbook(benchmark_root: Path, workbook_path: Path) -> Stats:
         if row_number is None:
             warn(
                 "No matching Excel row for "
-                f"architecture={record.architecture!r}, "
+                f"architecture={record.architecture_excel!r}, "
+                f"architecture_raw={record.architecture_raw!r}, "
                 f"version={record.version_excel!r}, "
+                f"version_folder={record.version_folder!r}, "
                 f"classifier={record.classifier_excel!r} "
                 f"(folder: {record.run_dir})"
             )
@@ -502,7 +523,7 @@ def update_workbook(benchmark_root: Path, workbook_path: Path) -> Stats:
             stats.rows_updated += 1
             info(
                 f"Updated row {row_number}: "
-                f"{record.architecture} | {record.version_excel} | {record.classifier_excel}"
+                f"{record.architecture_excel} | {record.version_excel} | {record.classifier_excel}"
             )
         except Exception as exc:
             warn(f"Failed to update workbook for {record.run_dir}: {exc}")

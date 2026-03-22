@@ -185,7 +185,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--benchmark", type=int, default=0, help="Legacy benchmark loop mode (duration-controlled).")
     ap.add_argument("--benchmark-mode", type=int, default=0, help="Headless thesis benchmark mode.")
-    ap.add_argument("--hw-sample-hz", type=float, default=1.0, help="Accepted for CLI compatibility (not used in shared core).")
+    ap.add_argument("--hw-sample-hz", type=float, default=1.0, help="Hardware metrics sample rate in Hz for benchmark/profile runs.")
     ap.add_argument("--no-display", type=int, default=0)
 
     ap.add_argument("--save", type=str, default=None)
@@ -293,6 +293,7 @@ def main() -> int:
         limit_frames=None if benchmark_loop else (int(args.limit_frames) if args.limit_frames is not None else None),
         pad_tail=bool(args.pad_tail),
         retain_window_payloads=bool(retain_payloads_in_primary_run),
+        hw_sample_hz=float(args.hw_sample_hz),
     )
 
     result = run_shared_benchmark(
@@ -337,6 +338,7 @@ def main() -> int:
                 limit_frames=None if benchmark_loop else (int(args.limit_frames) if args.limit_frames is not None else None),
                 pad_tail=bool(args.pad_tail),
                 retain_window_payloads=True,
+                hw_sample_hz=0.0,
             )
             export_result = run_shared_benchmark(
                 config=export_cfg,

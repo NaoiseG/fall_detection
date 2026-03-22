@@ -95,7 +95,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--benchmark", type=int, default=0, help="Legacy benchmark loop mode (duration-controlled).")
     ap.add_argument("--benchmark-mode", type=int, default=0, help="Headless thesis benchmarking mode.")
-    ap.add_argument("--hw-sample-hz", type=float, default=1.0, help="Accepted for CLI compatibility (not used in shared core).")
+    ap.add_argument("--hw-sample-hz", type=float, default=1.0, help="Hardware metrics sample rate in Hz for benchmark/profile runs.")
     ap.add_argument("--no-display", type=int, default=0)
 
     ap.add_argument("--warmup-frames", type=int, default=0)
@@ -206,6 +206,7 @@ def main() -> int:
         limit_frames=None,
         pad_tail=False,
         retain_window_payloads=False,
+        hw_sample_hz=float(args.hw_sample_hz),
     )
 
     result = run_shared_benchmark(

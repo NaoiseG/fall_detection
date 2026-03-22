@@ -3,6 +3,10 @@
 import csv
 import json
 import os
+import re
+import shutil
+import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -39,6 +43,16 @@ def _avg_valid(vals: List[float]) -> float:
     return float(np.mean(good))
 
 
+def _parse_first_number(v: Any) -> float:
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        m = re.search(r"[+-]?\d+(?:\.\d+)?", v)
+        if m:
+            return _safe_float(m.group(0))
+    return float("nan")
+
+
 def _percentile_valid(vals: List[float], q: float) -> float:
     good = [float(x) for x in vals if _is_finite(x)]
     if not good:
@@ -71,6 +85,338 @@ def _json_safe_number(v: Any) -> Optional[float]:
     if np.isfinite(fv):
         return float(fv)
     return None
+
+
+def _parse_tegrastats_line(line: str) -> Dict[str, float]:
+    sample = {
+        "ram_used_pct": float("nan"),
+        "cpu_pct": float("nan"),
+        "gpu_pct": float("nan"),
+        "cpu_temp_c": float("nan"),
+        "gpu_temp_c": float("nan"),
+        "power_w": float("nan"),
+    }
+
+    m_ram = re.search(r"\bRAM\s+(\d+)/(\d+)MB\b", line, flags=re.IGNORECASE)
+    if m_ram:
+        used = _safe_float(m_ram.group(1))
+        total = _safe_float(m_ram.group(2))
+        if total > 0.0:
+            sample["ram_used_pct"] = 100.0 * used / total
+
+    m_cpu = re.search(r"\bCPU\s+\[([^\]]+)\]", line, flags=re.IGNORECASE)
+    if m_cpu:
+        loads: List[float] = []
+        for tok in m_cpu.group(1).split(","):
+            m_pct = re.search(r"([+-]?\d+(?:\.\d+)?)%", tok)
+            if m_pct:
+                loads.append(_safe_float(m_pct.group(1)))
+        sample["cpu_pct"] = _avg_valid(loads)
+
+    m_gpu = re.search(r"\bGR3D(?:_FREQ)?\s+([+-]?\d+(?:\.\d+)?)%", line, flags=re.IGNORECASE)
+    if m_gpu:
+        sample["gpu_pct"] = _safe_float(m_gpu.group(1))
+
+    m_cpu_t = re.search(r"\bCPU@([+-]?\d+(?:\.\d+)?)C\b", line, flags=re.IGNORECASE)
+    if m_cpu_t:
+        sample["cpu_temp_c"] = _safe_float(m_cpu_t.group(1))
+
+    m_gpu_t = re.search(r"\bGPU@([+-]?\d+(?:\.\d+)?)C\b", line, flags=re.IGNORECASE)
+    if m_gpu_t:
+        sample["gpu_temp_c"] = _safe_float(m_gpu_t.group(1))
+
+    power_patterns = [
+        r"\bPOM_5V_IN\s+([+-]?\d+(?:\.\d+)?)(m?W)?(?:/([+-]?\d+(?:\.\d+)?)(m?W)?)?",
+        r"\bVDD_IN\s+([+-]?\d+(?:\.\d+)?)(m?W|W)?(?:/([+-]?\d+(?:\.\d+)?)(m?W|W)?)?",
+        r"\bPOM_5V_SYS\s+([+-]?\d+(?:\.\d+)?)(m?W)?(?:/([+-]?\d+(?:\.\d+)?)(m?W)?)?",
+    ]
+    for pat in power_patterns:
+        m_pow = re.search(pat, line, flags=re.IGNORECASE)
+        if not m_pow:
+            continue
+        raw = _safe_float(m_pow.group(1))
+        unit = (m_pow.group(2) or "").lower()
+        if not np.isfinite(raw):
+            continue
+        if unit == "w":
+            sample["power_w"] = raw
+        elif unit == "mw" or raw > 100.0:
+            sample["power_w"] = raw / 1000.0
+        else:
+            sample["power_w"] = raw
+        break
+
+    return sample
+
+
+def _extract_numeric_from_obj(obj: Any) -> float:
+    if isinstance(obj, (int, float)):
+        return float(obj)
+    if isinstance(obj, str):
+        return _parse_first_number(obj)
+    if isinstance(obj, dict):
+        for key in ("value", "val", "avg", "cur", "current", "usage", "percent", "perc"):
+            if key in obj and _is_finite(obj[key]):
+                return float(obj[key])
+        vals = [_extract_numeric_from_obj(v) for v in obj.values()]
+        return _avg_valid(vals)
+    if isinstance(obj, (list, tuple)):
+        vals = [_extract_numeric_from_obj(v) for v in obj]
+        return _avg_valid(vals)
+    return float("nan")
+
+
+class HardwareSampler:
+    def __init__(self, sample_hz: float) -> None:
+        self.sample_hz = max(1e-3, float(sample_hz))
+        self.interval_s = 1.0 / self.sample_hz
+        self.backend = "none"
+        self.samples: List[Dict[str, Any]] = []
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start_t = 0.0
+
+        self._jtop_obj = None
+        self._tegrastats_proc: Optional[subprocess.Popen[str]] = None
+        self._psutil_mod = None
+
+    def start(self) -> str:
+        self._start_t = time.perf_counter()
+        self._stop_event.clear()
+
+        try:
+            from jtop import jtop  # type: ignore
+
+            self._jtop_obj = jtop()
+            self._jtop_obj.start()
+            self.backend = "jtop"
+            self._thread = threading.Thread(target=self._run_jtop, name="hw-jtop", daemon=True)
+            self._thread.start()
+            return self.backend
+        except Exception:
+            self._jtop_obj = None
+
+        if shutil.which("tegrastats") is not None:
+            try:
+                interval_ms = max(100, int(round(self.interval_s * 1000.0)))
+                self._tegrastats_proc = subprocess.Popen(
+                    ["tegrastats", "--interval", str(interval_ms)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+                self.backend = "tegrastats"
+                self._thread = threading.Thread(target=self._run_tegrastats, name="hw-tegrastats", daemon=True)
+                self._thread.start()
+                return self.backend
+            except Exception:
+                self._tegrastats_proc = None
+
+        try:
+            import psutil  # type: ignore
+
+            self._psutil_mod = psutil
+            self._psutil_mod.cpu_percent(interval=None)
+            self.backend = "psutil"
+            self._thread = threading.Thread(target=self._run_psutil, name="hw-psutil", daemon=True)
+            self._thread.start()
+            return self.backend
+        except Exception:
+            self._psutil_mod = None
+            self.backend = "none"
+            return self.backend
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+        if self._tegrastats_proc is not None:
+            try:
+                self._tegrastats_proc.terminate()
+            except Exception:
+                pass
+
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+        if self._tegrastats_proc is not None:
+            try:
+                if self._tegrastats_proc.poll() is None:
+                    self._tegrastats_proc.kill()
+            except Exception:
+                pass
+            self._tegrastats_proc = None
+
+        if self._jtop_obj is not None:
+            try:
+                self._jtop_obj.close()
+            except Exception:
+                pass
+            self._jtop_obj = None
+
+    def get_samples(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(x) for x in self.samples]
+
+    def _append_sample(self, sample: Dict[str, Any]) -> None:
+        row = {
+            "t_s": float(time.perf_counter() - self._start_t),
+            "ram_used_pct": sample.get("ram_used_pct", float("nan")),
+            "cpu_pct": sample.get("cpu_pct", float("nan")),
+            "gpu_pct": sample.get("gpu_pct", float("nan")),
+            "cpu_temp_c": sample.get("cpu_temp_c", float("nan")),
+            "gpu_temp_c": sample.get("gpu_temp_c", float("nan")),
+            "power_w": sample.get("power_w", float("nan")),
+            "backend": self.backend,
+        }
+        with self._lock:
+            self.samples.append(row)
+
+    def _run_jtop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                if self._jtop_obj is None:
+                    break
+                ok_method = getattr(self._jtop_obj, "ok", None)
+                if callable(ok_method) and not ok_method():
+                    break
+                stats = dict(getattr(self._jtop_obj, "stats", {}))
+            except Exception:
+                stats = {}
+
+            self._append_sample(self._sample_from_jtop_stats(stats))
+            if self._stop_event.wait(self.interval_s):
+                break
+
+    def _run_tegrastats(self) -> None:
+        proc = self._tegrastats_proc
+        if proc is None or proc.stdout is None:
+            return
+        while not self._stop_event.is_set():
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.01)
+                continue
+            self._append_sample(_parse_tegrastats_line(line))
+
+    def _run_psutil(self) -> None:
+        psutil = self._psutil_mod
+        if psutil is None:
+            return
+        while not self._stop_event.is_set():
+            ram_pct = float("nan")
+            cpu_pct = float("nan")
+            cpu_temp = float("nan")
+
+            try:
+                ram_pct = float(psutil.virtual_memory().percent)
+            except Exception:
+                pass
+            try:
+                cpu_pct = float(psutil.cpu_percent(interval=None))
+            except Exception:
+                pass
+            try:
+                temps = psutil.sensors_temperatures(fahrenheit=False)
+                cpu_candidates: List[float] = []
+                for name, entries in (temps or {}).items():
+                    name_l = str(name).lower()
+                    for ent in entries:
+                        cur = _safe_float(getattr(ent, "current", float("nan")))
+                        if not np.isfinite(cur):
+                            continue
+                        if "cpu" in name_l or "core" in name_l or "soc" in name_l:
+                            cpu_candidates.append(cur)
+                cpu_temp = _avg_valid(cpu_candidates)
+            except Exception:
+                pass
+
+            self._append_sample(
+                {
+                    "ram_used_pct": ram_pct,
+                    "cpu_pct": cpu_pct,
+                    "gpu_pct": float("nan"),
+                    "cpu_temp_c": cpu_temp,
+                    "gpu_temp_c": float("nan"),
+                    "power_w": float("nan"),
+                }
+            )
+            if self._stop_event.wait(self.interval_s):
+                break
+
+    def _sample_from_jtop_stats(self, stats: Dict[str, Any]) -> Dict[str, float]:
+        out = {
+            "ram_used_pct": float("nan"),
+            "cpu_pct": float("nan"),
+            "gpu_pct": float("nan"),
+            "cpu_temp_c": float("nan"),
+            "gpu_temp_c": float("nan"),
+            "power_w": float("nan"),
+        }
+        if not stats:
+            return out
+
+        ram_v = stats.get("RAM", None)
+        if isinstance(ram_v, dict):
+            used = _extract_numeric_from_obj(ram_v.get("used", ram_v.get("use", None)))
+            total = _extract_numeric_from_obj(ram_v.get("tot", ram_v.get("total", None)))
+            if np.isfinite(used) and np.isfinite(total) and total > 0.0:
+                out["ram_used_pct"] = 100.0 * used / total
+            else:
+                out["ram_used_pct"] = _extract_numeric_from_obj(ram_v)
+        elif isinstance(ram_v, (list, tuple)) and len(ram_v) >= 2:
+            used = _extract_numeric_from_obj(ram_v[0])
+            total = _extract_numeric_from_obj(ram_v[1])
+            if np.isfinite(used) and np.isfinite(total) and total > 0.0:
+                out["ram_used_pct"] = 100.0 * used / total
+        else:
+            out["ram_used_pct"] = _extract_numeric_from_obj(ram_v)
+        if np.isfinite(out["ram_used_pct"]) and out["ram_used_pct"] <= 1.0:
+            out["ram_used_pct"] *= 100.0
+
+        out["cpu_pct"] = _extract_numeric_from_obj(stats.get("CPU", None))
+        if not np.isfinite(out["cpu_pct"]):
+            cpu_keys = [k for k in stats.keys() if re.fullmatch(r"cpu\d+", str(k).lower())]
+            cpu_vals = [_extract_numeric_from_obj(stats[k]) for k in cpu_keys]
+            out["cpu_pct"] = _avg_valid(cpu_vals)
+
+        gpu_candidates: List[float] = []
+        for k, v in stats.items():
+            k_l = str(k).lower()
+            if "gpu" in k_l or "gr3d" in k_l:
+                gpu_candidates.append(_extract_numeric_from_obj(v))
+        out["gpu_pct"] = _avg_valid(gpu_candidates)
+
+        cpu_t: List[float] = []
+        gpu_t: List[float] = []
+        for k, v in stats.items():
+            k_l = str(k).lower().replace(" ", "_")
+            if "temp" in k_l and "cpu" in k_l:
+                cpu_t.append(_extract_numeric_from_obj(v))
+            if "temp" in k_l and "gpu" in k_l:
+                gpu_t.append(_extract_numeric_from_obj(v))
+        out["cpu_temp_c"] = _avg_valid(cpu_t)
+        out["gpu_temp_c"] = _avg_valid(gpu_t)
+
+        power_candidates: List[float] = []
+        power_pref: List[float] = []
+        for k, v in stats.items():
+            k_l = str(k).lower().replace(" ", "_")
+            if "power" in k_l or "pom_" in k_l or "vdd_in" in k_l:
+                val = _extract_numeric_from_obj(v)
+                if np.isfinite(val):
+                    power_candidates.append(val)
+                    if "5v_in" in k_l or "vdd_in" in k_l or "tot" in k_l:
+                        power_pref.append(val)
+        raw_power = _avg_valid(power_pref) if power_pref else _avg_valid(power_candidates)
+        if np.isfinite(raw_power):
+            out["power_w"] = raw_power / 1000.0 if raw_power > 100.0 else raw_power
+
+        return out
 
 
 def _slugify_name(name: str) -> str:
@@ -219,6 +565,7 @@ class BenchmarkRunConfig:
     pad_tail: bool
 
     retain_window_payloads: bool = False
+    hw_sample_hz: float = 1.0
 
 
 @dataclass
@@ -273,6 +620,7 @@ def _resolve_active_window(
 def _build_summary(
     frame_rows: List[Dict[str, Any]],
     window_rows: List[Dict[str, Any]],
+    hw_rows: List[Dict[str, Any]],
     warmup_frames: int,
     warmup_windows: int,
 ) -> Dict[str, Any]:
@@ -356,13 +704,28 @@ def _build_summary(
         "postprocess_ms.mean = render_ms + writer_ms per frame."
     )
 
-    # Hardware keys kept for compatibility with legacy dashboards.
-    summary["avg_cpu_pct"] = None
-    summary["avg_gpu_pct"] = None
-    summary["avg_ram_pct"] = None
-    summary["avg_cpu_temp_c"] = None
-    summary["avg_gpu_temp_c"] = None
-    summary["avg_power_w"] = None
+    ram_vals = [_safe_float(r.get("ram_used_pct", np.nan)) for r in hw_rows]
+    cpu_vals = [_safe_float(r.get("cpu_pct", np.nan)) for r in hw_rows]
+    gpu_vals = [_safe_float(r.get("gpu_pct", np.nan)) for r in hw_rows]
+    cpu_temp_vals = [_safe_float(r.get("cpu_temp_c", np.nan)) for r in hw_rows]
+    gpu_temp_vals = [_safe_float(r.get("gpu_temp_c", np.nan)) for r in hw_rows]
+    power_vals = [_safe_float(r.get("power_w", np.nan)) for r in hw_rows]
+
+    hw_backend = None
+    for row in hw_rows:
+        backend = str(row.get("backend") or "").strip()
+        if backend:
+            hw_backend = backend
+            break
+
+    summary["avg_cpu_pct"] = _json_safe_number(_avg_valid(cpu_vals))
+    summary["avg_gpu_pct"] = _json_safe_number(_avg_valid(gpu_vals))
+    summary["avg_ram_pct"] = _json_safe_number(_avg_valid(ram_vals))
+    summary["avg_cpu_temp_c"] = _json_safe_number(_avg_valid(cpu_temp_vals))
+    summary["avg_gpu_temp_c"] = _json_safe_number(_avg_valid(gpu_temp_vals))
+    summary["avg_power_w"] = _json_safe_number(_avg_valid(power_vals))
+    summary["hw_backend"] = hw_backend
+    summary["hw_samples_collected"] = int(len(hw_rows))
 
     return summary
 
@@ -495,8 +858,19 @@ def run_shared_benchmark(
     run_t0 = time.perf_counter()
     user_exit = False
     cap_ended = False
+    hw_rows: List[Dict[str, Any]] = []
+    hw_sampler: Optional[HardwareSampler] = None
 
     policy = classifier.window_policy
+
+    if bool(config.profile_enabled) and float(config.hw_sample_hz) > 0.0:
+        try:
+            candidate_sampler = HardwareSampler(sample_hz=float(config.hw_sample_hz))
+            backend = candidate_sampler.start()
+            if backend != "none":
+                hw_sampler = candidate_sampler
+        except Exception as exc:
+            print(f"[benchmark][WARN] Could not start hardware sampler: {exc}")
 
     def stop_due_profile_duration() -> bool:
         if not bool(config.profile_enabled):
@@ -741,10 +1115,14 @@ def run_shared_benchmark(
             writer.release()
         if not bool(config.no_display):
             cv2.destroyAllWindows()
+        if hw_sampler is not None:
+            hw_sampler.stop()
+            hw_rows = hw_sampler.get_samples()
 
     summary = _build_summary(
         frame_rows=frame_rows,
         window_rows=window_rows,
+        hw_rows=hw_rows,
         warmup_frames=int(config.warmup_frames),
         warmup_windows=int(config.warmup_windows),
     )
@@ -757,6 +1135,7 @@ def run_shared_benchmark(
 
     per_frame_csv = None
     per_window_csv = None
+    per_hw_csv = None
     summary_json = None
 
     if bool(config.profile_enabled) and config.profile_out_dir is not None:
@@ -765,6 +1144,7 @@ def run_shared_benchmark(
 
         per_frame_csv = out_dir / "frame_metrics.csv"
         per_window_csv = out_dir / "window_metrics.csv"
+        per_hw_csv = out_dir / "hw_metrics.csv"
         summary_json = out_dir / "summary.json"
 
         frame_fields = [
@@ -803,6 +1183,11 @@ def run_shared_benchmark(
 
         _write_csv(per_frame_csv, frame_rows, frame_fields)
         _write_csv(per_window_csv, window_rows, window_fields)
+        _write_csv(
+            per_hw_csv,
+            hw_rows,
+            ["t_s", "ram_used_pct", "cpu_pct", "gpu_pct", "cpu_temp_c", "gpu_temp_c", "power_w", "backend"],
+        )
 
         legacy_time_rows = _build_legacy_time_rows(frame_rows)
         _write_csv(
