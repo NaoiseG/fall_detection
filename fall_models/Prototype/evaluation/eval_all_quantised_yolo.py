@@ -19,10 +19,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 CLASSIFIER_MODELS: Tuple[str, ...] = ("cnnlstm", "stgcn", "MotionBERT")
-POSE_SIZES: Tuple[str, ...] = ("yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x")
+ALPHAPOSE_VARIANT = "alphapose"
+POSE_SIZES: Tuple[str, ...] = ("yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x", ALPHAPOSE_VARIANT)
 PRECISIONS: Tuple[str, ...] = ("base", "fp16", "int8")
 
 DEFAULT_KEYPOINTS_ROOT = Path("/home/people/21376026/scratch/keypoints/UPFall_keypoints")
+DEFAULT_ALPHAPOSE_KEYPOINTS_ROOT = Path("/home/people/21376026/scratch/keypoints/UPFall_keypoints_alpha")
 DEFAULT_CLASSIFICATION_ROOT = Path("/home/people/21376026/scratch/classification_models")
 DEFAULT_OUTPUT_ROOT = Path("/home/people/21376026/scratch/evaluations")
 DEFAULT_MOTIONBERT_PKL_ROOT = Path("/home/people/21376026/scratch/MotionBERT_pkls")
@@ -42,6 +44,12 @@ MODEL_ALIASES = {
     "motionbert": "MotionBERT",
     "motionbert_action": "MotionBERT",
     "MotionBERT": "MotionBERT",
+}
+
+ALPHAPOSE_PRECISION_DIRS = {
+    "base": "base",
+    "fp16": "fp16_fp16",
+    "int8": "int8_fp16",
 }
 
 pd = None
@@ -101,6 +109,7 @@ class SweepPaths:
     prepare_motionbert_script: Path
     motionbert_code_root: Path
     keypoints_root: Path
+    alphapose_keypoints_root: Path
     classification_root: Path
     output_root: Path
     motionbert_pkl_root: Path
@@ -189,7 +198,7 @@ def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a resumable 45-run UP-Fall evaluation sweep over keypoint pose variants."
+        description="Run a resumable UP-Fall evaluation sweep over keypoint pose variants."
     )
     parser.add_argument(
         "--only-models",
@@ -201,7 +210,7 @@ def parse_args() -> argparse.Namespace:
         "--only-pose-sizes",
         nargs="+",
         default=None,
-        help="Optional subset of pose backbone sizes: yolo11n yolo11s yolo11m yolo11l yolo11x",
+        help="Optional subset of pose variants: yolo11n yolo11s yolo11m yolo11l yolo11x alphapose",
     )
     parser.add_argument(
         "--only-precisions",
@@ -223,7 +232,13 @@ def parse_args() -> argparse.Namespace:
         "--keypoints-root",
         type=Path,
         default=DEFAULT_KEYPOINTS_ROOT,
-        help=f"Keypoints root (default: {DEFAULT_KEYPOINTS_ROOT.as_posix()})",
+        help=f"YOLO keypoints root (default: {DEFAULT_KEYPOINTS_ROOT.as_posix()})",
+    )
+    parser.add_argument(
+        "--alphapose-keypoints-root",
+        type=Path,
+        default=DEFAULT_ALPHAPOSE_KEYPOINTS_ROOT,
+        help=f"AlphaPose keypoints root (default: {DEFAULT_ALPHAPOSE_KEYPOINTS_ROOT.as_posix()})",
     )
     parser.add_argument(
         "--classification-root",
@@ -287,22 +302,31 @@ def normalize_filter_tokens(
 
 
 def get_npz_root(paths: SweepPaths, pose_size: str, precision: str) -> Path:
+    if pose_size == ALPHAPOSE_VARIANT:
+        return paths.alphapose_keypoints_root / ALPHAPOSE_PRECISION_DIRS[precision]
     return paths.keypoints_root / pose_size / precision
 
 
+def get_checkpoint_subdir_name(pose_size: str) -> str:
+    if pose_size == ALPHAPOSE_VARIANT:
+        return ALPHAPOSE_VARIANT
+    return f"{pose_size}-pose"
+
+
 def get_checkpoint_path(paths: SweepPaths, classifier_model: str, pose_size: str) -> Path:
+    checkpoint_subdir = get_checkpoint_subdir_name(pose_size)
     if classifier_model in ("cnnlstm", "stgcn"):
         return (
             paths.classification_root
             / classifier_model
-            / f"{pose_size}-pose"
+            / checkpoint_subdir
             / f"{classifier_model}_best.pt"
         )
     if classifier_model == "MotionBERT":
         return (
             paths.classification_root
             / "MotionBERT"
-            / f"{pose_size}-pose"
+            / checkpoint_subdir
             / "FT_MB_release_MB_ft_UPFall_xsub"
             / "best_epoch.bin"
         )
@@ -451,6 +475,9 @@ def write_master_json(
         "script_path": paths.script_path.as_posix(),
         "repo_root": paths.repo_root.as_posix(),
         "motionbert_code_root": paths.motionbert_code_root.as_posix(),
+        "keypoints_root": paths.keypoints_root.as_posix(),
+        "alphapose_keypoints_root": paths.alphapose_keypoints_root.as_posix(),
+        "classification_root": paths.classification_root.as_posix(),
         "output_root": paths.output_root.as_posix(),
         "motionbert_pkl_root": paths.motionbert_pkl_root.as_posix(),
         "total_runs": len(ordered_entries),
@@ -1136,6 +1163,7 @@ def main() -> int:
             else (repo_root / "models" / "MotionBERT").resolve()
         ),
         keypoints_root=args.keypoints_root.expanduser(),
+        alphapose_keypoints_root=args.alphapose_keypoints_root.expanduser(),
         classification_root=args.classification_root.expanduser(),
         output_root=args.output_root.expanduser(),
         motionbert_pkl_root=args.motionbert_pkl_root.expanduser(),
