@@ -23,6 +23,7 @@ The script keeps the attached script's general pattern:
   - best weights kept in RAM
   - Ultralytics checkpoint saving disabled during training to avoid ModelOpt pickling issues
   - final weights re-packed into real Ultralytics .pt files
+  - optional subset fine-tuning/search via --train_fraction
 
 Example:
   python prune_pose.py \
@@ -38,7 +39,8 @@ Example:
     --name_prefix pruned_pose \
     --project /home/people/21376026/scratch/pruned_pose_runs \
     --device 0 \
-    --cache
+    --cache \
+    --train_fraction 0.2
 """
 
 from __future__ import annotations
@@ -53,6 +55,51 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from ultralytics import YOLO
+
+try:
+    import torchprofile.handlers as tp_handlers
+    import torchprofile.profile as tp_profile
+except Exception:
+    tp_handlers = None
+    tp_profile = None
+
+
+def _normalize_torchprofile_handlers() -> None:
+    if tp_handlers is None or tp_profile is None:
+        return
+
+    def _coerce_handler_pairs(raw_handlers: Any) -> Optional[List[Tuple[Any, Any]]]:
+        if raw_handlers is None:
+            return None
+        if isinstance(raw_handlers, dict):
+            pairs = list(raw_handlers.items())
+        else:
+            try:
+                pairs = list(raw_handlers)
+            except TypeError:
+                return None
+
+        if not pairs:
+            return pairs
+        if all(isinstance(item, tuple) and len(item) == 2 for item in pairs):
+            return pairs
+        return None
+
+    # ModelOpt iterates torchprofile.profile.handlers as (op_names, op) pairs.
+    normalized_handlers = None
+    for attr_name in ("handlers", "HANDLER_MAP"):
+        candidate_handlers = _coerce_handler_pairs(getattr(tp_handlers, attr_name, None))
+        if candidate_handlers is None:
+            continue
+        normalized_handlers = candidate_handlers
+        if candidate_handlers:
+            break
+    if normalized_handlers is not None:
+        tp_profile.handlers = normalized_handlers
+
+
+_normalize_torchprofile_handlers()
+
 import modelopt.torch.prune as mtp
 
 
@@ -66,6 +113,27 @@ def always_true() -> bool:
 
 def safe_tag(text: str) -> str:
     return text.replace("%", "p").replace("/", "_").replace("-", "_").replace(" ", "_")
+
+
+def fraction_suffix(train_fraction: float) -> str:
+    """
+    Stable run-name suffix so subset runs do not overwrite full-data runs.
+    Examples:
+      1.0 -> ""
+      0.2 -> "_trainfrac20p"
+      0.125 -> "_trainfrac12_5p"
+    """
+    try:
+        frac = float(train_fraction)
+    except Exception:
+        return ""
+
+    if frac >= 0.999999:
+        return ""
+
+    pct = frac * 100.0
+    pct_text = f"{pct:.4f}".rstrip("0").rstrip(".")
+    return f"_trainfrac{safe_tag(pct_text)}p"
 
 
 def model_run_tag(model_path: str) -> str:
@@ -154,6 +222,7 @@ def write_manifest(
     flops_target: str,
     metric: str,
     epochs: int,
+    train_fraction: float,
     reason: Optional[str] = None,
     best_score: Optional[float] = None,
     best_epoch_text: Optional[str] = None,
@@ -169,6 +238,7 @@ def write_manifest(
         f"flops_target={flops_target}",
         f"metric={metric}",
         f"epochs={epochs}",
+        f"train_fraction={train_fraction}",
     ]
     if last_epoch is not None:
         lines.append(f"last_epoch={last_epoch}")
@@ -203,6 +273,18 @@ def repack_to_ultralytics_pt(base_pt: Path, state_dict: Dict[str, torch.Tensor],
     y = YOLO(str(base_pt))
     y.model.load_state_dict(state_dict, strict=True)
     y.save(str(out_pt))
+
+
+def normalize_modelopt_prune_result(prune_result: Any) -> Tuple[Any, Any]:
+    """
+    Handle small ModelOpt return-shape differences without changing the pruning flow.
+    """
+    if isinstance(prune_result, tuple):
+        if len(prune_result) >= 2:
+            return prune_result[0], prune_result[1]
+        if len(prune_result) == 1:
+            return prune_result[0], {}
+    return prune_result, {}
 
 
 def _first_present(results_dict: Dict[str, Any], keys: Iterable[str]) -> Optional[float]:
@@ -396,6 +478,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--train_fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of the training split to use for both FastNAS search and fine-tuning. "
+            "For example, --train_fraction 0.2 uses 20%% of the train split per epoch. "
+            "Validation remains on the full val split."
+        ),
+    )
 
     parser.add_argument("--flops", nargs="+", default=["90%", "80%", "70%"], help="FastNAS FLOPs targets")
     parser.add_argument("--max_iter_data_loader", type=int, default=20, help="FastNAS search budget")
@@ -419,7 +511,11 @@ def parse_args() -> argparse.Namespace:
         default="map5095",
         help="Primary validation metric. For this project, keep this at pose mAP50-95.",
     )
-    return parser.parse_args()
+
+    args = parser.parse_args()
+    if not (0.0 < float(args.train_fraction) <= 1.0):
+        parser.error("--train_fraction must be in the range (0, 1].")
+    return args
 
 
 # ---------- main pruning logic ----------
@@ -430,7 +526,7 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
     src_model_tag = model_run_tag(model_path)
 
     for flops_target in flops_targets:
-        run_name = f"{args.name_prefix}_{src_model_tag}_flops{safe_tag(flops_target)}"
+        run_name = f"{args.name_prefix}_{src_model_tag}_flops{safe_tag(flops_target)}{fraction_suffix(args.train_fraction)}"
         run_dir = expected_run_dir(args, run_name)
         weights_dir = run_dir / "weights"
         epochs_this_run = resolve_epochs_for_target(flops_target, args)
@@ -512,7 +608,7 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                 self.model.is_fused = always_true
 
                 try:
-                    self.model, prune_info = mtp.prune(
+                    prune_result = mtp.prune(
                         model=self.model,
                         mode="fastnas",
                         constraints={"flops": flops_target},
@@ -525,6 +621,7 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                             "checkpoint": str(search_ckpt_path),
                         },
                     )
+                    self.model, prune_info = normalize_modelopt_prune_result(prune_result)
                 except ValueError as exc:
                     msg = str(exc)
                     if "NOT all constraints can be satisfied" in msg or "cannot be satisfied" in msg:
@@ -538,6 +635,17 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
 
                 # Rebuild optimizer and scheduler because the model graph changed after pruning.
                 weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs
+                try:
+                    train_dataset = self.train_loader.dataset
+                    train_dataset_len = len(train_dataset)
+                except Exception:
+                    train_dataset_len = None
+
+                if train_dataset_len is not None:
+                    LOGGER.info(
+                        f"🧩 Train fraction active: fraction={args.train_fraction:.4f} | "
+                        f"train_samples_seen_per_epoch={train_dataset_len}"
+                    )
                 iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
                 self.optimizer = self.build_optimizer(
                     model=self.model,
@@ -638,6 +746,7 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
             cache=args.cache,
             plots=args.plots,
             verbose=args.verbose,
+            fraction=args.train_fraction,
             name=run_name,
             trainer=PrunedPoseTrainer,
             exist_ok=True,
@@ -697,6 +806,7 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                 flops_target=flops_target,
                 metric=args.metric,
                 epochs=epochs_this_run,
+                train_fraction=args.train_fraction,
                 best_score=best_score,
                 best_epoch_text=best_epoch_text,
                 last_epoch=last_epoch,
@@ -728,6 +838,7 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                 flops_target=flops_target,
                 metric=args.metric,
                 epochs=epochs_this_run,
+                train_fraction=args.train_fraction,
                 reason=reason,
             )
             continue

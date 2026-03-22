@@ -37,6 +37,8 @@ DEFAULT_BATCH=16
 PATIENCE=20
 WORKERS=8
 MAX_ITER_DL=20
+# Leave empty for full training data, or set e.g. TRAIN_FRACTION="0.2" for 20%% of the train split.
+TRAIN_FRACTION=""
 SEARCH_CKPT="modelopt_fastnas_search_checkpoint.pth"
 NAME_PREFIX="pruned_pose"
 METRIC="map5095"
@@ -99,6 +101,7 @@ echo "Output project: ${OUT_PROJECT}"
 echo "Task: ${TASK}"
 echo "Metric: pose mAP50-95 (${METRIC})"
 echo "FLOPs targets: ${FLOPS[*]}"
+echo "Train fraction: ${TRAIN_FRACTION:-full}"
 
 # ---------- Required file checks ----------
 [[ -x "${PYTHON_BIN}" ]] || { echo "ERROR: Python interpreter not executable: ${PYTHON_BIN}"; exit 1; }
@@ -141,7 +144,12 @@ run_one() {
     batch_size="${MODEL_BATCH_OVERRIDES[${model_dirname}]}"
   fi
 
-  echo "[$(date)] START model=${model_tag} dir=${model_dirname} gpu=${gpu_id} batch=${batch_size}"
+  echo "[$(date)] START model=${model_tag} dir=${model_dirname} gpu=${gpu_id} batch=${batch_size} train_fraction=${TRAIN_FRACTION:-full}"
+
+  local -a extra_args=()
+  if [[ -n "${TRAIN_FRACTION}" ]]; then
+    extra_args+=(--train_fraction "${TRAIN_FRACTION}")
+  fi
 
   if [[ -n "${EPOCHS_OVERRIDE}" ]]; then
     CUDA_VISIBLE_DEVICES="${gpu_id}" \
@@ -161,7 +169,8 @@ run_one() {
       --project "${OUT_PROJECT}" \
       --metric "${METRIC}" \
       --device 0 \
-      --cache
+      --cache \
+      "${extra_args[@]}"
   else
     CUDA_VISIBLE_DEVICES="${gpu_id}" \
     "${PYTHON_BIN}" "${PRUNE_SCRIPT}" \
@@ -179,7 +188,8 @@ run_one() {
       --project "${OUT_PROJECT}" \
       --metric "${METRIC}" \
       --device 0 \
-      --cache
+      --cache \
+      "${extra_args[@]}"
   fi
 
   echo "[$(date)] DONE model=${model_tag} dir=${model_dirname} gpu=${gpu_id}"
