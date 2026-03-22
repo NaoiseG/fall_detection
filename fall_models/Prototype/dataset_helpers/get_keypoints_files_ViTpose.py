@@ -2,7 +2,8 @@
 Entry-point script to run ViTPose extraction on the full UP-Fall directory tree.
 
 This file contains the main() logic plus a minimal ViTPose pipeline using
-HuggingFace Transformers (RTDetr for person detection + ViTPose for keypoints).
+Hugging Face Transformers processors with either Hugging Face checkpoints or
+TensorRT `.engine` forwards (RTDetr for person detection + ViTPose for keypoints).
 
 Usage examples:
   python dataset_helpers/get_keypoints_files_ViTpose.py --camera 1
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import argparse
@@ -36,23 +38,42 @@ except ModuleNotFoundError as exc:
         "Install with: pip install transformers"
     ) from exc
 
+try:
+    if __package__:
+        from .pose_alphapose import TensorRTEngineRunner, _infer_engine_outputs_batched
+    else:
+        from pose_alphapose import TensorRTEngineRunner, _infer_engine_outputs_batched
+    _TENSORRT_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - only exercised when TRT support is unavailable
+    TensorRTEngineRunner = None  # type: ignore[assignment]
+    _infer_engine_outputs_batched = None  # type: ignore[assignment]
+    _TENSORRT_IMPORT_ERROR = exc
+
+
+DEFAULT_DETECTOR_MODEL = "PekingU/rtdetr_r50vd_coco_o365"
+DEFAULT_POSE_MODEL = "usyd-community/vitpose-base"
+LOCK_SETTINGS_CHOICES = ("strict_lock", "default")
+
 
 # ----------------------------- CONFIG -----------------------------
 
 @dataclass
 class VitPoseExportConfig:
-    # HF model names
-    detector_model: str = "PekingU/rtdetr_r50vd_coco_o365"
-    pose_model: str = "usyd-community/vitpose-base"
+    # Hugging Face model IDs/local dirs or TensorRT .engine paths
+    detector_model: str = DEFAULT_DETECTOR_MODEL
+    detector_processor: Optional[str] = None
+    pose_model: str = DEFAULT_POSE_MODEL
+    pose_processor: Optional[str] = None
 
     # thresholds
-    person_threshold: float = 0.01
-    pose_threshold: float = 0.01
-    conf_min: float = 0.01
-    draw_kpt_threshold: float = 0.01
+    person_threshold: float = 0.25
+    pose_threshold: float = 0.30
+    conf_min: float = 0.75
+    draw_kpt_threshold: float = 0.30
 
     fps: int = 30
     max_people: int = 1
+    detector_max_det: int = 10
     num_kpts: int = 17
     video_codec: str = "mp4v"
     save_csv: bool = False
@@ -71,6 +92,38 @@ class VitPoseExportConfig:
     draw_confidence_text: bool = True
     render_video: bool = True
     device: Optional[str] = None  # "cuda" or "cpu"; None => auto
+
+
+VITPOSE_LOCK_SETTINGS_PRESETS: Dict[str, Dict[str, Any]] = {
+    "default": {},
+    "strict_lock": {
+        "person_threshold": 0.01,
+        "conf_min": 0.01,
+        "detector_max_det": 10,
+        "max_jump_px": None,
+        "max_jump_diag_frac": 0.12,
+        "max_lost": 60,
+        "switch_margin_px": 9999.0,
+        "reset_on_max_lost": False,
+        "lock_first_target": True,
+        "strict_reacquire": True,
+        "min_iou_same_track": 0.05,
+        "max_box_area_ratio": 2.5,
+        "target_x_frac": 0.5,
+        "target_y_frac": 0.5,
+    },
+}
+
+
+def apply_vitpose_lock_settings(config: VitPoseExportConfig, preset_name: str) -> VitPoseExportConfig:
+    preset_key = str(preset_name).strip().lower()
+    if preset_key not in VITPOSE_LOCK_SETTINGS_PRESETS:
+        choices = ", ".join(sorted(VITPOSE_LOCK_SETTINGS_PRESETS))
+        raise ValueError(f"Unknown pose lock settings preset '{preset_name}'. Choices: {choices}")
+
+    for field_name, value in VITPOSE_LOCK_SETTINGS_PRESETS[preset_key].items():
+        setattr(config, field_name, value)
+    return config
 
 
 # ----------------------------- PATH HELPERS -----------------------------
@@ -174,6 +227,28 @@ def make_video_writer(out_path: str, fps: int, frame_size: Tuple[int, int], code
     return cv2.VideoWriter(out_path, fourcc, fps, (w, h))
 
 
+def normalize_model_source(model_source: str) -> str:
+    source = str(model_source).strip()
+    if not source:
+        return source
+    candidate = Path(source).expanduser()
+    if candidate.exists():
+        return str(candidate.resolve())
+    return source
+
+
+def is_engine_model_path(model_source: str) -> bool:
+    return Path(str(model_source)).suffix.lower() == ".engine"
+
+
+def resolve_processor_source(model_source: str, processor_source: Optional[str], default_source: str) -> str:
+    if processor_source is not None and str(processor_source).strip():
+        return normalize_model_source(str(processor_source))
+    if not is_engine_model_path(model_source):
+        return normalize_model_source(model_source)
+    return default_source
+
+
 # ----------------------------- LABELS -----------------------------
 
 def load_window_labels(csv_path: str) -> pd.DataFrame:
@@ -239,6 +314,145 @@ def _to_numpy(x: Any) -> Optional[np.ndarray]:
     if isinstance(x, np.ndarray):
         return x
     return np.array(x)
+
+
+def _to_cpu_torch_tensor(x: Any) -> torch.Tensor:
+    if torch.is_tensor(x):
+        out = x.detach().cpu()
+        if torch.is_floating_point(out) and out.dtype != torch.float32:
+            out = out.to(dtype=torch.float32)
+        return out
+
+    arr = np.asarray(x)
+    if np.issubdtype(arr.dtype, np.floating) and arr.dtype != np.float32:
+        arr = arr.astype(np.float32, copy=False)
+    if not arr.flags.c_contiguous:
+        arr = np.ascontiguousarray(arr)
+    return torch.from_numpy(arr)
+
+
+def _engine_output_items(engine_runner: Any, outputs: List[np.ndarray]) -> List[Tuple[str, np.ndarray]]:
+    output_names = list(getattr(engine_runner, "output_names", []))
+    items: List[Tuple[str, np.ndarray]] = []
+    for idx, arr in enumerate(outputs):
+        name = output_names[idx] if idx < len(output_names) else f"output_{idx}"
+        items.append((str(name), np.asarray(arr)))
+    return items
+
+
+def _select_engine_output(
+    items: List[Tuple[str, np.ndarray]],
+    preferred_tokens: Tuple[str, ...],
+    validator,
+    description: str,
+) -> np.ndarray:
+    matches: List[Tuple[str, np.ndarray]] = []
+    for token in preferred_tokens:
+        token_l = token.lower()
+        for name, arr in items:
+            if token_l in name.lower() and validator(arr):
+                matches.append((name, arr))
+        if matches:
+            break
+
+    if matches:
+        if len(matches) == 1:
+            return matches[0][1]
+        matches = sorted(matches, key=lambda item: int(np.asarray(item[1]).size), reverse=True)
+        return matches[0][1]
+
+    fallback = [arr for _, arr in items if validator(arr)]
+    if fallback:
+        fallback = sorted(fallback, key=lambda arr: int(np.asarray(arr).size), reverse=True)
+        return fallback[0]
+
+    shapes = ", ".join(f"{name}:{tuple(arr.shape)}" for name, arr in items)
+    raise RuntimeError(f"Could not find TensorRT output for {description}. Available outputs: {shapes}")
+
+
+def _prepare_rtdetr_logits(arr: np.ndarray) -> np.ndarray:
+    out = np.asarray(arr)
+    if out.ndim == 2:
+        out = out[None, ...]
+    if out.ndim != 3 or out.shape[-1] <= 4:
+        raise RuntimeError(f"Unexpected RT-DETR logits shape from TensorRT engine: {tuple(out.shape)}")
+    return out
+
+
+def _prepare_rtdetr_boxes(arr: np.ndarray) -> np.ndarray:
+    out = np.asarray(arr)
+    if out.ndim == 2:
+        out = out[None, ...]
+    if out.ndim != 3 or out.shape[-1] != 4:
+        raise RuntimeError(f"Unexpected RT-DETR boxes shape from TensorRT engine: {tuple(out.shape)}")
+    return out
+
+
+def _prepare_vitpose_heatmaps(arr: np.ndarray, num_kpts: int) -> np.ndarray:
+    out = np.asarray(arr)
+    if out.ndim == 3 and out.shape[0] == int(num_kpts):
+        out = out[None, ...]
+    if out.ndim != 4:
+        raise RuntimeError(f"Unexpected ViTPose heatmaps shape from TensorRT engine: {tuple(out.shape)}")
+    if out.shape[1] != int(num_kpts):
+        raise RuntimeError(
+            f"Unexpected ViTPose heatmap channels from TensorRT engine: got {tuple(out.shape)}, "
+            f"expected num_kpts={int(num_kpts)}"
+        )
+    return out
+
+
+def _make_rtdetr_outputs_from_engine(engine_runner: Any, outputs: List[np.ndarray]) -> SimpleNamespace:
+    items = _engine_output_items(engine_runner, outputs)
+    logits = _prepare_rtdetr_logits(
+        _select_engine_output(
+            items,
+            preferred_tokens=("logits", "pred_logits", "cls_logits", "scores"),
+            validator=lambda arr: np.asarray(arr).ndim in (2, 3) and np.asarray(arr).shape[-1] > 4,
+            description="RT-DETR logits",
+        )
+    )
+    pred_boxes = _prepare_rtdetr_boxes(
+        _select_engine_output(
+            items,
+            preferred_tokens=("pred_boxes", "boxes", "bbox", "bboxes"),
+            validator=lambda arr: np.asarray(arr).ndim in (2, 3) and np.asarray(arr).shape[-1] == 4,
+            description="RT-DETR boxes",
+        )
+    )
+
+    if logits.shape[0] != pred_boxes.shape[0] or logits.shape[1] != pred_boxes.shape[1]:
+        raise RuntimeError(
+            "TensorRT RT-DETR outputs are inconsistent: "
+            f"logits={tuple(logits.shape)}, pred_boxes={tuple(pred_boxes.shape)}"
+        )
+
+    return SimpleNamespace(
+        logits=_to_cpu_torch_tensor(logits),
+        pred_boxes=_to_cpu_torch_tensor(pred_boxes),
+    )
+
+
+def _make_vitpose_outputs_from_engine(
+    engine_runner: Any,
+    outputs: List[np.ndarray],
+    num_kpts: int,
+) -> SimpleNamespace:
+    items = _engine_output_items(engine_runner, outputs)
+    heatmaps = _prepare_vitpose_heatmaps(
+        _select_engine_output(
+            items,
+            preferred_tokens=("heatmaps", "heatmap", "logits", "output"),
+            validator=lambda arr: (
+                np.asarray(arr).ndim == 4 and np.asarray(arr).shape[1] == int(num_kpts)
+            ) or (
+                np.asarray(arr).ndim == 3 and np.asarray(arr).shape[0] == int(num_kpts)
+            ),
+            description="ViTPose heatmaps",
+        ),
+        num_kpts=num_kpts,
+    )
+    return SimpleNamespace(heatmaps=_to_cpu_torch_tensor(heatmaps))
 
 
 def _pose_to_arrays(person_pose: Dict[str, Any], num_kpts: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -502,22 +716,82 @@ class VitPoseRunner:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             device = config.device.lower()
-            if device == "cuda" and not torch.cuda.is_available():
+            if device.startswith("cuda") and not torch.cuda.is_available():
                 device = "cpu"
         self.device = device
 
-        self.person_image_processor = AutoProcessor.from_pretrained(config.detector_model)
-        self.person_model = RTDetrForObjectDetection.from_pretrained(config.detector_model)
-        self.person_model.to(self.device).eval()
+        self.person_is_engine = is_engine_model_path(config.detector_model)
+        self.pose_is_engine = is_engine_model_path(config.pose_model)
+        self.person_processor_source = resolve_processor_source(
+            config.detector_model,
+            config.detector_processor,
+            default_source=DEFAULT_DETECTOR_MODEL,
+        )
+        self.pose_processor_source = resolve_processor_source(
+            config.pose_model,
+            config.pose_processor,
+            default_source=DEFAULT_POSE_MODEL,
+        )
 
-        self.pose_image_processor = AutoProcessor.from_pretrained(config.pose_model)
-        self.pose_model = VitPoseForPoseEstimation.from_pretrained(config.pose_model)
-        self.pose_model.to(self.device).eval()
+        self.person_image_processor = AutoProcessor.from_pretrained(self.person_processor_source)
+        self.pose_image_processor = AutoProcessor.from_pretrained(self.pose_processor_source)
+
+        self.person_engine_runner = None
+        self.pose_engine_runner = None
+        self.person_model = None
+        self.pose_model = None
+
+        if (self.person_is_engine or self.pose_is_engine) and not self.device.startswith("cuda"):
+            raise RuntimeError(
+                "TensorRT .engine models require CUDA. "
+                f"Resolved device is '{self.device}'."
+            )
+        if (self.person_is_engine or self.pose_is_engine) and _TENSORRT_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "TensorRT support for ViTPose could not be initialised. "
+                "The shared TensorRT runner import failed."
+            ) from _TENSORRT_IMPORT_ERROR
+
+        if self.person_is_engine:
+            detector_engine_path = Path(config.detector_model).expanduser()
+            if not detector_engine_path.exists():
+                raise FileNotFoundError(f"RT-DETR TensorRT engine not found: {detector_engine_path}")
+            self.person_engine_runner = TensorRTEngineRunner(detector_engine_path, device=self.device)
+            print(f"Using TensorRT RT-DETR engine: {detector_engine_path}")
+            print(f"Detector processor source: {self.person_processor_source}")
+        else:
+            self.person_model = RTDetrForObjectDetection.from_pretrained(config.detector_model)
+            self.person_model.to(self.device).eval()
+
+        if self.pose_is_engine:
+            pose_engine_path = Path(config.pose_model).expanduser()
+            if not pose_engine_path.exists():
+                raise FileNotFoundError(f"ViTPose TensorRT engine not found: {pose_engine_path}")
+            self.pose_engine_runner = TensorRTEngineRunner(pose_engine_path, device=self.device)
+            print(f"Using TensorRT ViTPose engine: {pose_engine_path}")
+            print(f"Pose processor source: {self.pose_processor_source}")
+        else:
+            self.pose_model = VitPoseForPoseEstimation.from_pretrained(config.pose_model)
+            self.pose_model.to(self.device).eval()
 
     def _detect_people(self, image: Image.Image) -> Tuple[np.ndarray, np.ndarray]:
-        inputs = self.person_image_processor(images=image, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.person_model(**inputs)
+        inputs = self.person_image_processor(images=image, return_tensors="pt")
+        if self.person_is_engine:
+            if self.person_engine_runner is None or _infer_engine_outputs_batched is None:
+                raise RuntimeError("RT-DETR TensorRT engine runner is not initialised.")
+            if "pixel_values" not in inputs:
+                raise RuntimeError("RT-DETR processor did not return 'pixel_values' for TensorRT inference.")
+            engine_outputs = _infer_engine_outputs_batched(
+                self.person_engine_runner,
+                inputs["pixel_values"].detach().cpu().numpy(),
+            )
+            outputs = _make_rtdetr_outputs_from_engine(self.person_engine_runner, engine_outputs)
+        else:
+            if self.person_model is None:
+                raise RuntimeError("RT-DETR model is not initialised.")
+            inputs = inputs.to(self.device)
+            with torch.no_grad():
+                outputs = self.person_model(**inputs)
 
         results = self.person_image_processor.post_process_object_detection(
             outputs,
@@ -537,6 +811,14 @@ class VitPoseRunner:
         boxes = boxes.detach().cpu().numpy().astype(np.float32)
         scores = scores.detach().cpu().numpy().astype(np.float32)
 
+        if scores.size > 0:
+            order = np.argsort(-scores)
+            max_det = max(1, int(self.config.detector_max_det))
+            if order.size > max_det:
+                order = order[:max_det]
+            boxes = boxes[order]
+            scores = scores[order]
+
         # Convert boxes from VOC (x1,y1,x2,y2) to COCO (x1,y1,w,h)
         boxes[:, 2] = boxes[:, 2] - boxes[:, 0]
         boxes[:, 3] = boxes[:, 3] - boxes[:, 1]
@@ -547,9 +829,27 @@ class VitPoseRunner:
         if boxes_xywh.size == 0:
             return []
 
-        inputs = self.pose_image_processor(image, boxes=[boxes_xywh], return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.pose_model(**inputs)
+        inputs = self.pose_image_processor(image, boxes=[boxes_xywh], return_tensors="pt")
+        if self.pose_is_engine:
+            if self.pose_engine_runner is None or _infer_engine_outputs_batched is None:
+                raise RuntimeError("ViTPose TensorRT engine runner is not initialised.")
+            if "pixel_values" not in inputs:
+                raise RuntimeError("ViTPose processor did not return 'pixel_values' for TensorRT inference.")
+            engine_outputs = _infer_engine_outputs_batched(
+                self.pose_engine_runner,
+                inputs["pixel_values"].detach().cpu().numpy(),
+            )
+            outputs = _make_vitpose_outputs_from_engine(
+                self.pose_engine_runner,
+                engine_outputs,
+                num_kpts=self.config.num_kpts,
+            )
+        else:
+            if self.pose_model is None:
+                raise RuntimeError("ViTPose model is not initialised.")
+            inputs = inputs.to(self.device)
+            with torch.no_grad():
+                outputs = self.pose_model(**inputs)
 
         pose_results = self.pose_image_processor.post_process_pose_estimation(
             outputs, boxes=[boxes_xywh], threshold=self.config.pose_threshold
@@ -890,35 +1190,124 @@ def main() -> None:
         default=Path("../../Datasets/UPFall_keypoints_vitpose/outputs_npz"),
         help="Root where outputs are written (default: ../../Datasets/UPFall_keypoints_vitpose/outputs_npz).",
     )
+    ap.add_argument(
+        "--detector-model",
+        type=str,
+        default=DEFAULT_DETECTOR_MODEL,
+        help="RT-DETR model source: Hugging Face model ID/local directory or TensorRT .engine path.",
+    )
+    ap.add_argument(
+        "--detector-processor",
+        type=str,
+        default=None,
+        help=(
+            "AutoProcessor source for detector preprocessing. Defaults to --detector-model for Hugging Face "
+            "checkpoints/directories, or the built-in RT-DETR processor when --detector-model is a .engine file."
+        ),
+    )
+    ap.add_argument(
+        "--pose-model",
+        type=str,
+        default=DEFAULT_POSE_MODEL,
+        help="ViTPose model source: Hugging Face model ID/local directory or TensorRT .engine path.",
+    )
+    ap.add_argument(
+        "--pose-processor",
+        type=str,
+        default=None,
+        help=(
+            "AutoProcessor source for pose preprocessing. Defaults to --pose-model for Hugging Face "
+            "checkpoints/directories, or the built-in ViTPose processor when --pose-model is a .engine file."
+        ),
+    )
+    ap.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Inference device. Examples: cuda, cuda:0, cpu. TensorRT .engine paths require CUDA.",
+    )
+    ap.add_argument(
+        "--lock-settings",
+        choices=LOCK_SETTINGS_CHOICES,
+        default="strict_lock",
+        help=(
+            "Tracking/lock preset. "
+            "'strict_lock' matches the strict-lock settings used by get_keypoints_files.py."
+        ),
+    )
+    ap.add_argument("--conf-thres", type=float, default=None, help="Override detector confidence threshold.")
+    ap.add_argument("--conf-min", type=float, default=None, help="Override minimum confidence used when selecting the tracked target.")
+    ap.add_argument("--detector-max-det", type=int, default=None, help="Override the maximum number of detector candidates considered per frame.")
+    ap.add_argument("--max-jump-px", type=float, default=None, help="Override the maximum allowed target-center jump in pixels.")
+    ap.add_argument(
+        "--max-jump-diag-frac",
+        type=float,
+        default=None,
+        help="Override the maximum allowed target-center jump as a fraction of the image diagonal when --max-jump-px is unset.",
+    )
+    ap.add_argument("--max-lost", type=int, default=None, help="Override the number of consecutive lost frames tolerated before reset logic applies.")
+    ap.add_argument("--min-iou-same-track", type=float, default=None, help="Override the minimum IoU required to stay on the same track after lock.")
+    ap.add_argument("--max-box-area-ratio", type=float, default=None, help="Override the allowed box-area ratio change when staying on the same track.")
+    ap.add_argument("--target-x-frac", type=float, default=None, help="Override the horizontal target-acquisition anchor as a fraction of image width.")
+    ap.add_argument("--target-y-frac", type=float, default=None, help="Override the vertical target-acquisition anchor as a fraction of image height.")
+    ap.add_argument("--lock-first-target", dest="lock_first_target", action="store_true", help="Lock onto the first acquired target.")
+    ap.add_argument("--no-lock-first-target", dest="lock_first_target", action="store_false", help="Disable permanent first-target locking.")
+    ap.add_argument("--strict-reacquire", dest="strict_reacquire", action="store_true", help="Require IoU and area-ratio consistency when reacquiring the locked target.")
+    ap.add_argument("--no-strict-reacquire", dest="strict_reacquire", action="store_false", help="Disable strict locked-target reacquisition checks.")
+    ap.add_argument("--reset-on-max-lost", dest="reset_on_max_lost", action="store_true", help="Reset the tracked target after too many consecutive lost frames.")
+    ap.add_argument("--no-reset-on-max-lost", dest="reset_on_max_lost", action="store_false", help="Disable reset after too many consecutive lost frames.")
+    ap.set_defaults(lock_first_target=None, strict_reacquire=None, reset_on_max_lost=None)
     args = ap.parse_args()
 
     upfall_root = args.upfall_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
+    detector_model = normalize_model_source(args.detector_model)
+    detector_processor = (
+        normalize_model_source(args.detector_processor)
+        if args.detector_processor is not None and str(args.detector_processor).strip()
+        else None
+    )
+    pose_model = normalize_model_source(args.pose_model)
+    pose_processor = (
+        normalize_model_source(args.pose_processor)
+        if args.pose_processor is not None and str(args.pose_processor).strip()
+        else None
+    )
 
     if not upfall_root.exists() or not upfall_root.is_dir():
         raise SystemExit(f"UP-Fall root does not exist or is not a directory: {upfall_root}")
 
     cfg = VitPoseExportConfig(
-        detector_model="PekingU/rtdetr_r50vd_coco_o365",
-        pose_model="usyd-community/vitpose-base",
-        person_threshold=0.02,
-        pose_threshold=0.3,
-        conf_min=0.05,
-        draw_kpt_threshold=0.3,
+        detector_model=detector_model,
+        detector_processor=detector_processor,
+        pose_model=pose_model,
+        pose_processor=pose_processor,
         fps=30,
         max_people=1,
-        max_jump_px=None,  # None => use max_jump_diag_frac * image_diagonal
-        max_jump_diag_frac=0.12,
-        max_lost=60,
-        switch_margin_px=9999.0,
-        reset_on_max_lost=False,
-        lock_first_target=True,
-        strict_reacquire=True,
-        min_iou_same_track=0.05,
-        max_box_area_ratio=2.5,
         save_csv=False,
         render_video=True,
+        device=args.device,
     )
+    apply_vitpose_lock_settings(cfg, args.lock_settings)
+
+    overrides = {
+        "person_threshold": args.conf_thres,
+        "conf_min": args.conf_min,
+        "detector_max_det": args.detector_max_det,
+        "max_jump_px": args.max_jump_px,
+        "max_jump_diag_frac": args.max_jump_diag_frac,
+        "max_lost": args.max_lost,
+        "min_iou_same_track": args.min_iou_same_track,
+        "max_box_area_ratio": args.max_box_area_ratio,
+        "target_x_frac": args.target_x_frac,
+        "target_y_frac": args.target_y_frac,
+        "lock_first_target": args.lock_first_target,
+        "strict_reacquire": args.strict_reacquire,
+        "reset_on_max_lost": args.reset_on_max_lost,
+    }
+    for field_name, value in overrides.items():
+        if value is not None:
+            setattr(cfg, field_name, value)
 
     runner = VitPoseRunner(cfg)
 
@@ -930,6 +1319,12 @@ def main() -> None:
 
     print(f"UP-Fall root: {upfall_root}")
     print(f"Output root: {output_root}")
+    print(f"Detector model: {cfg.detector_model}")
+    print(f"Detector processor: {runner.person_processor_source}")
+    print(f"Pose model: {cfg.pose_model}")
+    print(f"Pose processor: {runner.pose_processor_source}")
+    print(f"Device: {runner.device}")
+    print(f"Lock settings preset: {args.lock_settings}")
     print(f"Subjects: {args.subjects}")
     print("Camera folders found:", len(camera_folders))
     total = len(camera_folders)
