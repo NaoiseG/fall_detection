@@ -35,8 +35,23 @@ from pathlib import Path
 from typing import Any
 
 import onnx
+import PIL.Image
 import torch
 from torch import nn
+
+# Older Pillow builds on Jetson may not expose Image.Resampling, but recent
+# transformers releases import it unconditionally.
+if not hasattr(PIL.Image, "Resampling"):
+    class _PillowResamplingCompat:
+        NEAREST = PIL.Image.NEAREST
+        BOX = getattr(PIL.Image, "BOX", PIL.Image.NEAREST)
+        BILINEAR = PIL.Image.BILINEAR
+        HAMMING = getattr(PIL.Image, "HAMMING", PIL.Image.BILINEAR)
+        BICUBIC = PIL.Image.BICUBIC
+        LANCZOS = getattr(PIL.Image, "LANCZOS", PIL.Image.BICUBIC)
+
+    PIL.Image.Resampling = _PillowResamplingCompat
+
 from transformers import RTDetrForObjectDetection, VitPoseForPoseEstimation
 
 
