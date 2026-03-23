@@ -402,7 +402,36 @@ def _infer_engine_outputs_batched(engine_runner: TensorRTEngineRunner, x_batch: 
     static_bs = engine_runner.static_batch_size
     batch_size = int(x_np.shape[0])
     if static_bs is None or static_bs <= 0 or batch_size == static_bs:
-        return engine_runner.infer(x_np)
+        try:
+            return engine_runner.infer(x_np)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            profile_mismatch = (
+                "satisfyprofile" in msg
+                or "optimization profile" in msg
+                or "failed to set tensorrt dynamic input shape" in msg
+            )
+            if not profile_mismatch or batch_size <= 1:
+                raise
+
+            mid = max(1, batch_size // 2)
+            left_outputs = _infer_engine_outputs_batched(engine_runner, x_np[:mid])
+            right_outputs = _infer_engine_outputs_batched(engine_runner, x_np[mid:])
+            if len(left_outputs) != len(right_outputs):
+                raise RuntimeError(
+                    "TensorRT engine returned an inconsistent number of outputs across split batches."
+                ) from exc
+
+            merged: List[np.ndarray] = []
+            for left_arr, right_arr in zip(left_outputs, right_outputs):
+                left_np = np.asarray(left_arr)
+                right_np = np.asarray(right_arr)
+                if left_np.ndim == 0 or right_np.ndim == 0:
+                    raise RuntimeError(
+                        "TensorRT engine output cannot be merged after split-batch fallback."
+                    ) from exc
+                merged.append(np.concatenate((left_np, right_np), axis=0))
+            return merged
 
     out_parts: Optional[List[List[np.ndarray]]] = None
     start = 0

@@ -31,7 +31,7 @@ import torch
 from PIL import Image
 
 try:
-    from transformers import AutoProcessor, RTDetrForObjectDetection, VitPoseForPoseEstimation
+    from transformers import AutoImageProcessor, AutoProcessor, RTDetrForObjectDetection, VitPoseForPoseEstimation
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
         "transformers is required for ViTPose extraction. "
@@ -247,6 +247,39 @@ def resolve_processor_source(model_source: str, processor_source: Optional[str],
     if not is_engine_model_path(model_source):
         return normalize_model_source(model_source)
     return default_source
+
+
+def load_image_processor(processor_source: str, role: str):
+    load_errors: List[Tuple[str, Exception]] = []
+
+    for loader_name, loader in (
+        ("AutoImageProcessor", AutoImageProcessor),
+        ("AutoProcessor", AutoProcessor),
+    ):
+        try:
+            return loader.from_pretrained(processor_source)
+        except Exception as exc:
+            load_errors.append((loader_name, exc))
+
+    hints: List[str] = []
+    error_text = " | ".join(
+        f"{loader_name}: {type(exc).__name__}: {exc}" for loader_name, exc in load_errors
+    )
+    if "PyTorch >= 2.4" in error_text:
+        hints.append(
+            "The installed transformers build expects a newer PyTorch version than the one in this environment."
+        )
+    if "torchvision" in error_text or "torch._dynamo" in error_text:
+        hints.append(
+            "A mismatched torchvision install may be getting imported instead of the torchvision build paired with this torch install."
+        )
+
+    hint_text = f" Hints: {' '.join(hints)}" if hints else ""
+    last_exc = load_errors[-1][1]
+    raise RuntimeError(
+        f"Failed to load the {role} processor from '{processor_source}'. "
+        f"Tried AutoImageProcessor then AutoProcessor. Errors: {error_text}.{hint_text}"
+    ) from last_exc
 
 
 # ----------------------------- LABELS -----------------------------
@@ -733,8 +766,14 @@ class VitPoseRunner:
             default_source=DEFAULT_POSE_MODEL,
         )
 
-        self.person_image_processor = AutoProcessor.from_pretrained(self.person_processor_source)
-        self.pose_image_processor = AutoProcessor.from_pretrained(self.pose_processor_source)
+        self.person_image_processor = load_image_processor(
+            self.person_processor_source,
+            role="detector",
+        )
+        self.pose_image_processor = load_image_processor(
+            self.pose_processor_source,
+            role="pose",
+        )
 
         self.person_engine_runner = None
         self.pose_engine_runner = None
