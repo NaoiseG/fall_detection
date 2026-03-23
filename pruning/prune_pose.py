@@ -115,6 +115,20 @@ def safe_tag(text: str) -> str:
     return text.replace("%", "p").replace("/", "_").replace("-", "_").replace(" ", "_")
 
 
+RESUME_LAST_CKPT_NAME = "resume_last.pt"
+RESUME_BEST_CKPT_NAME = "resume_best.pt"
+
+
+def resolve_search_checkpoint_path(run_dir: Path, search_ckpt: str) -> Path:
+    path = Path(search_ckpt)
+    return path if path.is_absolute() else run_dir / path.name
+
+
+def resume_checkpoint_paths(run_dir: Path) -> Tuple[Path, Path]:
+    weights_dir = run_dir / "weights"
+    return weights_dir / RESUME_LAST_CKPT_NAME, weights_dir / RESUME_BEST_CKPT_NAME
+
+
 def fraction_suffix(train_fraction: float) -> str:
     """
     Stable run-name suffix so subset runs do not overwrite full-data runs.
@@ -191,7 +205,12 @@ def run_is_complete(run_dir: Path) -> bool:
     )
 
 
-def cleanup_stale_run_outputs(run_dir: Path, search_ckpt_name: str) -> None:
+def cleanup_stale_run_outputs(
+    run_dir: Path,
+    search_ckpt_path: Optional[Path] = None,
+    *,
+    preserve_search_ckpt: bool = False,
+) -> None:
     """
     Keep the run directory stable for restart-friendliness, but remove stale files that can
     confuse later validation/manifest generation on rerun.
@@ -200,11 +219,14 @@ def cleanup_stale_run_outputs(run_dir: Path, search_ckpt_name: str) -> None:
     if weights_dir.exists():
         shutil.rmtree(weights_dir, ignore_errors=True)
 
-    for path in [
+    stale_paths = [
         run_dir / "results.csv",
         run_dir / "best_epoch.txt",
-        run_dir / search_ckpt_name,
-    ]:
+    ]
+    if search_ckpt_path is not None and not preserve_search_ckpt:
+        stale_paths.append(search_ckpt_path)
+
+    for path in stale_paths:
         try:
             if path.exists():
                 path.unlink()
@@ -273,6 +295,11 @@ def repack_to_ultralytics_pt(base_pt: Path, state_dict: Dict[str, torch.Tensor],
     y = YOLO(str(base_pt))
     y.model.load_state_dict(state_dict, strict=True)
     y.save(str(out_pt))
+
+
+def load_state_dict_from_ultralytics_pt(pt_path: Path) -> Dict[str, torch.Tensor]:
+    y = YOLO(str(pt_path))
+    return {k: v.detach().cpu() for k, v in y.model.state_dict().items()}
 
 
 def normalize_modelopt_prune_result(prune_result: Any) -> Tuple[Any, Any]:
@@ -504,6 +531,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plots", action="store_true", help="Enable Ultralytics plots")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose Ultralytics logging")
     parser.add_argument("--force", action="store_true", help="Rerun even if final artifacts already exist")
+    parser.add_argument(
+        "--resume_incomplete",
+        action="store_true",
+        help="Resume incomplete runs from saved FastNAS search or fine-tuning checkpoints when available.",
+    )
+    parser.add_argument(
+        "--resume_save_period",
+        type=int,
+        default=1,
+        help="Save a resumable fine-tuning checkpoint every N epochs when --resume_incomplete is enabled.",
+    )
 
     parser.add_argument(
         "--metric",
@@ -515,6 +553,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not (0.0 < float(args.train_fraction) <= 1.0):
         parser.error("--train_fraction must be in the range (0, 1].")
+    if int(args.resume_save_period) < 1:
+        parser.error("--resume_save_period must be >= 1.")
     return args
 
 
@@ -530,15 +570,29 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
         run_dir = expected_run_dir(args, run_name)
         weights_dir = run_dir / "weights"
         epochs_this_run = resolve_epochs_for_target(flops_target, args)
+        search_ckpt_path = resolve_search_checkpoint_path(run_dir, args.search_ckpt)
+        resume_last_path, resume_best_path = resume_checkpoint_paths(run_dir)
+        load_model_path = model_path
+        resume_training = False
 
         if run_is_complete(run_dir) and not args.force:
             print(f"[INFO] Skipping completed run: {run_name}")
             continue
 
         if run_dir.exists():
-            cleanup_stale_run_outputs(run_dir, Path(args.search_ckpt).name)
+            if args.force:
+                cleanup_stale_run_outputs(run_dir, search_ckpt_path)
+            elif args.resume_incomplete and resume_last_path.exists():
+                print(f"[INFO] Resuming fine-tuning from checkpoint: {resume_last_path}")
+                load_model_path = str(resume_last_path)
+                resume_training = True
+            elif args.resume_incomplete and search_ckpt_path.exists():
+                print(f"[INFO] Resuming FastNAS search from checkpoint: {search_ckpt_path}")
+                cleanup_stale_run_outputs(run_dir, search_ckpt_path, preserve_search_ckpt=True)
+            else:
+                cleanup_stale_run_outputs(run_dir, search_ckpt_path)
 
-        y = YOLO(model_path)
+        y = YOLO(load_model_path)
         base_task = args.task or y.task
         BaseTrainer = y.task_map[base_task]["trainer"]
 
@@ -561,6 +615,119 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                 self._last_val_epoch: int = -1
                 self._logged_metric_keys_once = False
                 self._search_ckpt_path: Optional[Path] = None
+                self._resume_last_ckpt_path: Optional[Path] = None
+                self._resume_best_ckpt_path: Optional[Path] = None
+                self._setup_model_ckpt: Optional[Dict[str, Any]] = None
+
+            def setup_model(self):
+                ckpt = super().setup_model()
+                self._setup_model_ckpt = ckpt
+                return ckpt
+
+            def _restore_custom_resume_state(self) -> None:
+                ckpt = self._setup_model_ckpt if isinstance(self._setup_model_ckpt, dict) else {}
+                if not ckpt:
+                    return
+
+                best_score = ckpt.get("custom_best_score", None)
+                if best_score is not None:
+                    try:
+                        self._best_score_custom = float(best_score)
+                    except Exception:
+                        pass
+
+                best_epoch = ckpt.get("custom_best_epoch", None)
+                if best_epoch is not None:
+                    try:
+                        self._best_epoch_custom = int(best_epoch)
+                    except Exception:
+                        pass
+
+                best_epoch_text = ckpt.get("custom_best_epoch_text", None)
+                if best_epoch_text:
+                    best_epoch_path = Path(self.save_dir) / "best_epoch.txt"
+                    if not best_epoch_path.exists():
+                        try:
+                            best_epoch_path.write_text(str(best_epoch_text))
+                        except Exception:
+                            pass
+
+            def _serializable_resume_model(self):
+                from copy import deepcopy
+
+                model_obj = self.ema.ema if getattr(self, "ema", None) is not None else self.model
+                model_obj = getattr(model_obj, "module", model_obj)
+                model_obj = deepcopy(model_obj).half()
+                if hasattr(model_obj, "criterion"):
+                    model_obj.criterion = None
+                for param in model_obj.parameters():
+                    param.requires_grad = False
+                return model_obj
+
+            def _build_resume_checkpoint(self, *, include_optimizer: bool) -> Dict[str, Any]:
+                from copy import deepcopy
+                from datetime import datetime
+
+                from ultralytics import __version__
+                from ultralytics.utils.torch_utils import convert_optimizer_state_dict_to_fp16
+
+                metrics_dict = self.metrics if isinstance(self.metrics, dict) else {}
+                try:
+                    results_dict = self.read_results_csv()
+                except Exception:
+                    results_dict = {}
+
+                best_epoch_path = Path(self.save_dir) / "best_epoch.txt"
+                best_epoch_text = best_epoch_path.read_text() if best_epoch_path.exists() else ""
+
+                ckpt = {
+                    "epoch": int(getattr(self, "epoch", -1)),
+                    "best_fitness": self.best_fitness,
+                    "model": None,
+                    "ema": self._serializable_resume_model(),
+                    "updates": getattr(self.ema, "updates", 0) if getattr(self, "ema", None) is not None else 0,
+                    "optimizer": None,
+                    "train_args": vars(self.args),
+                    "train_metrics": {**metrics_dict, **{"fitness": self.fitness}},
+                    "train_results": results_dict,
+                    "date": datetime.now().isoformat(),
+                    "version": __version__,
+                    "license": "AGPL-3.0 (https://ultralytics.com/license)",
+                    "docs": "https://docs.ultralytics.com",
+                    "custom_best_score": self._best_score_custom,
+                    "custom_best_epoch": self._best_epoch_custom,
+                    "custom_best_epoch_text": best_epoch_text,
+                }
+                if include_optimizer:
+                    ckpt["optimizer"] = convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict()))
+                return ckpt
+
+            def _write_resume_checkpoint(self, path: Path, *, include_optimizer: bool) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(self._build_resume_checkpoint(include_optimizer=include_optimizer), path)
+
+            def save_model(self):
+                if not args.resume_incomplete:
+                    return
+
+                epoch_num = int(getattr(self, "epoch", -1)) + 1
+                if epoch_num < 1:
+                    return
+
+                is_period_epoch = (epoch_num % args.resume_save_period) == 0
+                is_final_epoch = epoch_num >= int(self.epochs)
+                if not (is_period_epoch or is_final_epoch):
+                    return
+
+                if self._resume_last_ckpt_path is None:
+                    return
+
+                try:
+                    self._write_resume_checkpoint(self._resume_last_ckpt_path, include_optimizer=True)
+                except Exception as exc:
+                    from ultralytics.utils import LOGGER
+
+                    LOGGER.warning(f"⚠️ Failed to save resumable checkpoint at epoch {epoch_num}: {exc}")
 
             def _setup_train(self):
                 from ultralytics.utils import LOGGER
@@ -570,11 +737,24 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
 
                 self.save_dir = Path(self.save_dir)
                 self.save_dir.mkdir(parents=True, exist_ok=True)
+                weights_dir_local = self.save_dir / "weights"
+                weights_dir_local.mkdir(parents=True, exist_ok=True)
+
+                self._resume_last_ckpt_path = weights_dir_local / RESUME_LAST_CKPT_NAME
+                self._resume_best_ckpt_path = weights_dir_local / RESUME_BEST_CKPT_NAME
 
                 search_ckpt_path = Path(args.search_ckpt)
                 if not search_ckpt_path.is_absolute():
                     search_ckpt_path = self.save_dir / search_ckpt_path.name
                 self._search_ckpt_path = search_ckpt_path
+
+                if self.resume:
+                    self._restore_custom_resume_state()
+                    LOGGER.info(
+                        f"🔁 Resumed fine-tuning for {run_name} from "
+                        f"{self._resume_last_ckpt_path if self._resume_last_ckpt_path else 'checkpoint'}"
+                    )
+                    return
 
                 dummy = torch.randn(1, 3, args.imgsz, args.imgsz).to(self.device)
 
@@ -658,6 +838,12 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                 self._setup_scheduler()
                 LOGGER.info(f"✅ Pruning applied | target FLOPs={flops_target} | info={prune_info}")
 
+                if args.resume_incomplete and self._resume_last_ckpt_path is not None:
+                    try:
+                        self._write_resume_checkpoint(self._resume_last_ckpt_path, include_optimizer=True)
+                    except Exception as exc:
+                        LOGGER.warning(f"⚠️ Failed to save post-prune resumable checkpoint: {exc}")
+
             def validate(self):
                 from ultralytics.utils import LOGGER
 
@@ -723,6 +909,14 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                     )
                     LOGGER.info(f"🏁 BEST UPDATE @ epoch {epoch_i}: {previous:.6f} -> {score:.6f}")
 
+                    if args.resume_incomplete and self._resume_best_ckpt_path is not None:
+                        try:
+                            self._write_resume_checkpoint(self._resume_best_ckpt_path, include_optimizer=False)
+                        except Exception as exc:
+                            LOGGER.warning(
+                                f"⚠️ Failed to save best resumable checkpoint at epoch {epoch_i}: {exc}"
+                            )
+
                 return out
 
             def on_train_epoch_end(self):
@@ -750,13 +944,15 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
             name=run_name,
             trainer=PrunedPoseTrainer,
             exist_ok=True,
-            save=False,
+            save=args.resume_incomplete,
             save_period=0,
         )
         if args.project:
             train_kwargs["project"] = args.project
         if args.device:
             train_kwargs["device"] = args.device
+        if resume_training:
+            train_kwargs["resume"] = True
 
         try:
             y.train(**train_kwargs)
@@ -770,7 +966,13 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
             y.save(str(base_last_tmp))
 
             last_sd = get_ema_state_dict(trainer)
-            best_sd = getattr(trainer, "_best_sd_custom", None) or last_sd
+            best_sd = getattr(trainer, "_best_sd_custom", None)
+            if best_sd is None and args.resume_incomplete and resume_best_path.exists():
+                try:
+                    best_sd = load_state_dict_from_ultralytics_pt(resume_best_path)
+                except Exception as exc:
+                    print(f"[WARN] Could not load resumable best checkpoint for {run_name}: {exc}")
+            best_sd = best_sd or last_sd
 
             repack_to_ultralytics_pt(base_last_tmp, last_sd, weights_dir / "last.pt")
             repack_to_ultralytics_pt(base_last_tmp, best_sd, weights_dir / "best.pt")
@@ -784,6 +986,12 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
             if search_ckpt_path is not None:
                 try:
                     Path(search_ckpt_path).unlink()
+                except Exception:
+                    pass
+            for resume_ckpt in [resume_last_path, resume_best_path]:
+                try:
+                    if resume_ckpt.exists():
+                        resume_ckpt.unlink()
                 except Exception:
                     pass
 
@@ -821,13 +1029,13 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
             print(f"[WARN] {status.upper()} run {run_name}: {reason}")
             print(traceback.format_exc())
 
-            # Best-effort cleanup of the temporary search checkpoint for failed/skipped runs.
-            search_ckpt_path = run_dir / Path(args.search_ckpt).name
-            try:
-                if search_ckpt_path.exists():
-                    search_ckpt_path.unlink()
-            except Exception:
-                pass
+            # Keep resumable artifacts for failed runs when explicitly requested.
+            if status == "skipped" or not args.resume_incomplete:
+                try:
+                    if search_ckpt_path.exists():
+                        search_ckpt_path.unlink()
+                except Exception:
+                    pass
 
             write_manifest(
                 (run_dir / "weights" / "artifacts_manifest.txt"),
