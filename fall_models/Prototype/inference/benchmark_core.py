@@ -166,6 +166,67 @@ def _extract_numeric_from_obj(obj: Any) -> float:
     return float("nan")
 
 
+def _normalize_stat_key(name: Any) -> str:
+    return re.sub(r"[\s\-]+", "_", str(name).strip().lower())
+
+
+def _extract_percent_from_obj(obj: Any) -> float:
+    """
+    Extract utilization-style percentages without accidentally treating
+    temperatures or raw frequencies as percentages.
+
+    This is used for jtop GPU parsing where values may look like:
+      - 95
+      - "95%"
+      - "95%@1109"
+      - {"val": 95, "frq": 1109}
+    """
+    if isinstance(obj, (int, float)):
+        val = float(obj)
+        if np.isfinite(val) and 0.0 <= val <= 100.0:
+            return val
+        return float("nan")
+
+    if isinstance(obj, str):
+        matches = [
+            _safe_float(m.group(1))
+            for m in re.finditer(r"([+-]?\d+(?:\.\d+)?)\s*%", obj)
+        ]
+        return _avg_valid(matches)
+
+    if isinstance(obj, dict):
+        preferred_keys = (
+            "load",
+            "usage",
+            "percent",
+            "perc",
+            "value",
+            "val",
+            "avg",
+            "cur",
+            "current",
+        )
+
+        preferred_vals = [_extract_percent_from_obj(obj[key]) for key in preferred_keys if key in obj]
+        preferred_pct = _avg_valid(preferred_vals)
+        if np.isfinite(preferred_pct):
+            return preferred_pct
+
+        vals = []
+        for key, value in obj.items():
+            key_l = _normalize_stat_key(key)
+            if any(token in key_l for token in ("temp", "freq", "mhz", "clock", "power", "volt", "fan")):
+                continue
+            vals.append(_extract_percent_from_obj(value))
+        return _avg_valid(vals)
+
+    if isinstance(obj, (list, tuple)):
+        vals = [_extract_percent_from_obj(v) for v in obj]
+        return _avg_valid(vals)
+
+    return float("nan")
+
+
 class HardwareSampler:
     def __init__(self, sample_hz: float) -> None:
         self.sample_hz = max(1e-3, float(sample_hz))
@@ -386,15 +447,21 @@ class HardwareSampler:
 
         gpu_candidates: List[float] = []
         for k, v in stats.items():
-            k_l = str(k).lower()
-            if "gpu" in k_l or "gr3d" in k_l:
-                gpu_candidates.append(_extract_numeric_from_obj(v))
+            k_l = _normalize_stat_key(k)
+            if "gpu" not in k_l and "gr3d" not in k_l:
+                continue
+            if any(token in k_l for token in ("temp", "power", "volt", "fan")):
+                continue
+
+            gpu_pct = _extract_percent_from_obj(v)
+            if np.isfinite(gpu_pct):
+                gpu_candidates.append(gpu_pct)
         out["gpu_pct"] = _avg_valid(gpu_candidates)
 
         cpu_t: List[float] = []
         gpu_t: List[float] = []
         for k, v in stats.items():
-            k_l = str(k).lower().replace(" ", "_")
+            k_l = _normalize_stat_key(k)
             if "temp" in k_l and "cpu" in k_l:
                 cpu_t.append(_extract_numeric_from_obj(v))
             if "temp" in k_l and "gpu" in k_l:
@@ -405,7 +472,7 @@ class HardwareSampler:
         power_candidates: List[float] = []
         power_pref: List[float] = []
         for k, v in stats.items():
-            k_l = str(k).lower().replace(" ", "_")
+            k_l = _normalize_stat_key(k)
             if "power" in k_l or "pom_" in k_l or "vdd_in" in k_l:
                 val = _extract_numeric_from_obj(v)
                 if np.isfinite(val):
