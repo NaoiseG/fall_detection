@@ -134,6 +134,10 @@ printf 'Normalize python: %s\n' "${NORMALIZE_PYTHON}"
 printf 'Normalize helper: %s\n' "${NORMALIZE_HELPER}"
 printf 'Model directories seen: %d\n' "${TOTAL_SEEN}"
 
+if [[ "${NORMALIZE_PYTHON}" == "${PYTHON_BIN}" ]]; then
+  printf 'Warning: normalization is using the export Python. Set NORMALIZE_PYTHON to a ModelOpt-capable env if needed.\n'
+fi
+
 INDEX=0
 for model_dir in "${MODEL_DIRS[@]}"; do
   INDEX=$((INDEX + 1))

@@ -535,7 +535,7 @@ def parse_args() -> argparse.Namespace:
         "--epochs",
         type=int,
         default=None,
-        help="Fine-tune epochs for every run. If omitted, use per-target defaults: 90%%->40, 80%%->60, 70%%->80.",
+        help="Fine-tune epochs for every run. If omitted, use per-target defaults: 90%%->60, 80%%->80, 70%%->80.",
     )
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--workers", type=int, default=8)

@@ -45,8 +45,8 @@ METRIC="map5095"
 FLOPS=("90%" "80%" "70%")
 
 # If --epochs is omitted below, prune_pose.py uses the per-target schedule:
-#   90% -> 40 epochs
-#   80% -> 60 epochs
+#   90% -> 60 epochs
+#   80% -> 80 epochs
 #   70% -> 80 epochs
 # Set EPOCHS_OVERRIDE to a number to force the same epoch count for every run.
 EPOCHS_OVERRIDE=""

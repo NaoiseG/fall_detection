@@ -16,6 +16,10 @@
 """Nvidia Model Optimizer (modelopt)."""
 
 import warnings as _warnings
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _version
 
-__version__ = _version("nvidia-modelopt")
+try:
+    __version__ = _version("nvidia-modelopt")
+except _PackageNotFoundError:
+    __version__ = "0+local"

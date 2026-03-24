@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from importlib import metadata as importlib_metadata
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,50 @@ def prepend_sys_path(path_text: str) -> None:
     resolved = str(path)
     if resolved not in sys.path:
         sys.path.insert(0, resolved)
+
+
+def clear_modules(prefix: str) -> None:
+    for module_name in list(sys.modules):
+        if module_name == prefix or module_name.startswith(f"{prefix}."):
+            sys.modules.pop(module_name, None)
+
+
+def patch_modelopt_version_lookup() -> None:
+    original_version = importlib_metadata.version
+
+    def version_with_local_fallback(distribution_name: str) -> str:
+        if distribution_name != "nvidia-modelopt":
+            return original_version(distribution_name)
+        try:
+            return original_version(distribution_name)
+        except importlib_metadata.PackageNotFoundError:
+            return "0+local"
+
+    importlib_metadata.version = version_with_local_fallback
+
+
+def import_modelopt_modules(modelopt_root: str) -> tuple[Any, Any, str]:
+    try:
+        import modelopt.torch.nas as mtn
+        import modelopt.torch.opt as mto
+
+        return mtn, mto, "installed package"
+    except Exception as first_exc:
+        clear_modules("modelopt")
+        prepend_sys_path(modelopt_root)
+        patch_modelopt_version_lookup()
+
+        try:
+            import modelopt.torch.nas as mtn
+            import modelopt.torch.opt as mto
+
+            return mtn, mto, str(Path(modelopt_root).resolve())
+        except Exception as second_exc:
+            raise RuntimeError(
+                "Could not import ModelOpt for checkpoint normalization. "
+                f"Installed-package import failed with: {first_exc!r}. "
+                f"Local checkout import failed with: {second_exc!r}."
+            ) from second_exc
 
 
 def clear_instance_override(model: Any, attr_name: str) -> None:
@@ -100,14 +145,15 @@ def main() -> int:
         raise FileExistsError(f"Output checkpoint already exists: {output_path}")
 
     prepend_sys_path(args.ultralytics_root)
-    prepend_sys_path(args.modelopt_root)
 
     import torch
-    import modelopt.torch.nas as mtn
-    import modelopt.torch.opt as mto
+    import ultralytics  # noqa: F401  # patches torch.save/torch.load for use_dill compatibility
+
+    mtn, mto, modelopt_source = import_modelopt_modules(args.modelopt_root)
 
     print(f"[normalize] input:  {input_path}")
     print(f"[normalize] output: {output_path}")
+    print(f"[normalize] modelopt: {modelopt_source}")
 
     try:
         ckpt = torch.load(input_path, map_location="cpu", weights_only=False)
