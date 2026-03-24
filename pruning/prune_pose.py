@@ -100,6 +100,8 @@ def _normalize_torchprofile_handlers() -> None:
 
 _normalize_torchprofile_handlers()
 
+import modelopt.torch.nas as mtn
+import modelopt.torch.opt as mto
 import modelopt.torch.prune as mtp
 
 
@@ -109,6 +111,35 @@ import modelopt.torch.prune as mtp
 def always_true() -> bool:
     """Small top-level helper used to mimic the attached script's fused-model workaround."""
     return True
+
+
+def clear_instance_override(model: torch.nn.Module, attr_name: str) -> None:
+    """Drop instance-level monkey patches so checkpoints only rely on class-defined behavior."""
+    if attr_name in getattr(model, "__dict__", {}):
+        delattr(model, attr_name)
+
+
+def finalize_pruned_model(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Export a FastNAS-pruned model back to a regular module and strip ModelOpt metadata.
+
+    This keeps the final checkpoints loadable in plain Ultralytics environments.
+    """
+    model = getattr(model, "module", model)
+    clear_instance_override(model, "is_fused")
+
+    if mto.ModeloptStateManager.is_converted(model):
+        model = mtn.export(model)
+
+    if hasattr(model, "_modelopt_state"):
+        mto.ModeloptStateManager.remove_state(model)
+    if hasattr(model, "_modelopt_state_version"):
+        delattr(model, "_modelopt_state_version")
+
+    clear_instance_override(model, "is_fused")
+    if hasattr(model, "criterion"):
+        model.criterion = None
+    return model
 
 
 def safe_tag(text: str) -> str:
@@ -167,8 +198,8 @@ def parse_target_percent(flops_target: str) -> Optional[int]:
 def resolve_epochs_for_target(flops_target: str, args: argparse.Namespace) -> int:
     """
     Per-target schedule when --epochs is omitted:
-      90% -> 40
-      80% -> 60
+      90% -> 60
+      80% -> 80
       70% -> 80
     Any other target falls back to 60.
     """
@@ -177,9 +208,9 @@ def resolve_epochs_for_target(flops_target: str, args: argparse.Namespace) -> in
 
     pct = parse_target_percent(flops_target)
     if pct == 90:
-        return 40
-    if pct == 80:
         return 60
+    if pct == 80:
+        return 80
     if pct == 70:
         return 80
     return 60
@@ -293,12 +324,15 @@ def repack_to_ultralytics_pt(base_pt: Path, state_dict: Dict[str, torch.Tensor],
     This preserves a loadable Ultralytics artifact instead of a raw state_dict-only file.
     """
     y = YOLO(str(base_pt))
+    y.model = finalize_pruned_model(y.model)
     y.model.load_state_dict(state_dict, strict=True)
-    y.save(str(out_pt))
+    clear_instance_override(y.model, "is_fused")
+    y.save(str(out_pt), use_dill=False)
 
 
 def load_state_dict_from_ultralytics_pt(pt_path: Path) -> Dict[str, torch.Tensor]:
     y = YOLO(str(pt_path))
+    y.model = finalize_pruned_model(y.model)
     return {k: v.detach().cpu() for k, v in y.model.state_dict().items()}
 
 
@@ -809,6 +843,10 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                             f"Unachievable FLOPs target for run={run_name}, target={flops_target}. {msg}"
                         ) from exc
                     raise
+                finally:
+                    clear_instance_override(self.model, "is_fused")
+
+                self.model = finalize_pruned_model(self.model)
 
                 self.model.to(self.device)
                 self.ema = ModelEMA(self.model)
@@ -837,6 +875,7 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                 )
                 self._setup_scheduler()
                 LOGGER.info(f"✅ Pruning applied | target FLOPs={flops_target} | info={prune_info}")
+                LOGGER.info("📦 Exported pruned subnet to a regular Ultralytics model for checkpointing.")
 
                 if args.resume_incomplete and self._resume_last_ckpt_path is not None:
                     try:
@@ -963,7 +1002,9 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
             weights_dir.mkdir(parents=True, exist_ok=True)
 
             base_last_tmp = weights_dir / "_base_last_tmp.pt"
-            y.save(str(base_last_tmp))
+            y.model = finalize_pruned_model(y.model)
+            clear_instance_override(y.model, "is_fused")
+            y.save(str(base_last_tmp), use_dill=False)
 
             last_sd = get_ema_state_dict(trainer)
             best_sd = getattr(trainer, "_best_sd_custom", None)
