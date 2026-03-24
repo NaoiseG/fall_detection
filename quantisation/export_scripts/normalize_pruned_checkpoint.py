@@ -14,6 +14,14 @@ DEFAULT_MODELOPT_ROOT = REPO_ROOT / "pruning" / "Model-Optimizer"
 DEFAULT_ULTRALYTICS_ROOT = REPO_ROOT / "pruning" / "yolov11-prune"
 
 
+def always_true() -> bool:
+    """
+    Compatibility shim for older pruned checkpoints that serialized an instance-level
+    `is_fused = always_true` monkey patch from a script executed as `__main__`.
+    """
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -99,11 +107,24 @@ def clear_instance_override(model: Any, attr_name: str) -> None:
         delattr(model, attr_name)
 
 
+def get_last_modelopt_mode_name(model: Any) -> str | None:
+    state = getattr(model, "_modelopt_state", None)
+    if not state:
+        return None
+    try:
+        return str(state[-1][0])
+    except Exception:
+        return None
+
+
 def finalize_model(model: Any, *, nas_module: Any, opt_module: Any) -> Any:
     model = getattr(model, "module", model)
     clear_instance_override(model, "is_fused")
 
-    if opt_module.ModeloptStateManager.is_converted(model):
+    last_mode_name = get_last_modelopt_mode_name(model)
+    already_exported = last_mode_name in {"export", "export_nas"}
+
+    if opt_module.ModeloptStateManager.is_converted(model) and not already_exported:
         model = nas_module.export(model)
 
     if hasattr(model, "_modelopt_state"):

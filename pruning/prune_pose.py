@@ -119,6 +119,17 @@ def clear_instance_override(model: torch.nn.Module, attr_name: str) -> None:
         delattr(model, attr_name)
 
 
+def get_last_modelopt_mode_name(model: torch.nn.Module) -> Optional[str]:
+    """Return the raw last mode name from saved ModelOpt state without requiring registry lookup."""
+    state = getattr(model, "_modelopt_state", None)
+    if not state:
+        return None
+    try:
+        return str(state[-1][0])
+    except Exception:
+        return None
+
+
 def finalize_pruned_model(model: torch.nn.Module) -> torch.nn.Module:
     """
     Export a FastNAS-pruned model back to a regular module and strip ModelOpt metadata.
@@ -128,7 +139,10 @@ def finalize_pruned_model(model: torch.nn.Module) -> torch.nn.Module:
     model = getattr(model, "module", model)
     clear_instance_override(model, "is_fused")
 
-    if mto.ModeloptStateManager.is_converted(model):
+    last_mode_name = get_last_modelopt_mode_name(model)
+    already_exported = last_mode_name in {"export", "export_nas"}
+
+    if mto.ModeloptStateManager.is_converted(model) and not already_exported:
         model = mtn.export(model)
 
     if hasattr(model, "_modelopt_state"):
@@ -140,6 +154,85 @@ def finalize_pruned_model(model: torch.nn.Module) -> torch.nn.Module:
     if hasattr(model, "criterion"):
         model.criterion = None
     return model
+
+
+def model_needs_checkpoint_normalization(model: Optional[torch.nn.Module]) -> bool:
+    if model is None:
+        return False
+    model = getattr(model, "module", model)
+    return any(
+        [
+            "is_fused" in getattr(model, "__dict__", {}),
+            hasattr(model, "_modelopt_state"),
+            hasattr(model, "_modelopt_state_version"),
+            hasattr(model, "criterion"),
+        ]
+    )
+
+
+def clone_serializable_model(
+    model: torch.nn.Module,
+    *,
+    half: bool = True,
+    freeze: bool = True,
+) -> torch.nn.Module:
+    """Create a checkpoint-safe copy of a model with pruning metadata stripped."""
+    from copy import deepcopy
+
+    model_obj = deepcopy(getattr(model, "module", model))
+    model_obj = finalize_pruned_model(model_obj)
+    if half:
+        model_obj = model_obj.half()
+    if hasattr(model_obj, "criterion"):
+        model_obj.criterion = None
+    for param in model_obj.parameters():
+        param.requires_grad = not freeze
+    return model_obj
+
+
+def checkpoint_model_object(ckpt: Any, *, prefer_ema: bool = False) -> Optional[torch.nn.Module]:
+    if isinstance(ckpt, dict):
+        keys = ("ema", "model") if prefer_ema else ("model", "ema")
+        for key in keys:
+            model_obj = ckpt.get(key, None)
+            if isinstance(model_obj, torch.nn.Module):
+                return model_obj
+    if isinstance(ckpt, torch.nn.Module):
+        return ckpt
+    return None
+
+
+def ensure_resume_checkpoint_compat(path: Path) -> bool:
+    """
+    Upgrade legacy resumable checkpoints in place so Ultralytics resume sees a real pruned model.
+
+    Older checkpoints stored model=None and only kept the EMA module, which is enough for this script to
+    serialize but can cause architecture mismatches on resume/final repack.
+    """
+    ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        return False
+
+    changed = False
+    source_model = checkpoint_model_object(ckpt)
+    if source_model is None:
+        return False
+
+    if ckpt.get("model", None) is None or model_needs_checkpoint_normalization(ckpt.get("model", None)):
+        ckpt["model"] = clone_serializable_model(ckpt.get("model", None) or source_model)
+        changed = True
+
+    ema_model = ckpt.get("ema", None)
+    if ema_model is None:
+        ckpt["ema"] = clone_serializable_model(source_model)
+        changed = True
+    elif model_needs_checkpoint_normalization(ema_model):
+        ckpt["ema"] = clone_serializable_model(ema_model)
+        changed = True
+
+    if changed:
+        torch.save(ckpt, str(path))
+    return changed
 
 
 def safe_tag(text: str) -> str:
@@ -331,6 +424,16 @@ def repack_to_ultralytics_pt(base_pt: Path, state_dict: Dict[str, torch.Tensor],
 
 
 def load_state_dict_from_ultralytics_pt(pt_path: Path) -> Dict[str, torch.Tensor]:
+    try:
+        ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+    except Exception:
+        ckpt = None
+
+    model_obj = checkpoint_model_object(ckpt, prefer_ema=True)
+    if model_obj is not None:
+        model_obj = finalize_pruned_model(model_obj)
+        return {k: v.detach().cpu() for k, v in model_obj.state_dict().items()}
+
     y = YOLO(str(pt_path))
     y.model = finalize_pruned_model(y.model)
     return {k: v.detach().cpu() for k, v in y.model.state_dict().items()}
@@ -617,6 +720,15 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
             if args.force:
                 cleanup_stale_run_outputs(run_dir, search_ckpt_path)
             elif args.resume_incomplete and resume_last_path.exists():
+                upgraded_resume_paths = []
+                for resume_ckpt in [resume_last_path, resume_best_path]:
+                    if resume_ckpt.exists() and ensure_resume_checkpoint_compat(resume_ckpt):
+                        upgraded_resume_paths.append(resume_ckpt.name)
+                if upgraded_resume_paths:
+                    print(
+                        "[INFO] Upgraded legacy resume checkpoint(s) for "
+                        f"{run_name}: {', '.join(upgraded_resume_paths)}"
+                    )
                 print(f"[INFO] Resuming fine-tuning from checkpoint: {resume_last_path}")
                 load_model_path = str(resume_last_path)
                 resume_training = True
@@ -686,17 +798,10 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                         except Exception:
                             pass
 
-            def _serializable_resume_model(self):
-                from copy import deepcopy
-
-                model_obj = self.ema.ema if getattr(self, "ema", None) is not None else self.model
-                model_obj = getattr(model_obj, "module", model_obj)
-                model_obj = deepcopy(model_obj).half()
-                if hasattr(model_obj, "criterion"):
-                    model_obj.criterion = None
-                for param in model_obj.parameters():
-                    param.requires_grad = False
-                return model_obj
+            def _serializable_resume_model(self, model_obj: Optional[torch.nn.Module] = None):
+                if model_obj is None:
+                    model_obj = self.ema.ema if getattr(self, "ema", None) is not None else self.model
+                return clone_serializable_model(model_obj)
 
             def _build_resume_checkpoint(self, *, include_optimizer: bool) -> Dict[str, Any]:
                 from copy import deepcopy
@@ -714,11 +819,16 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                 best_epoch_path = Path(self.save_dir) / "best_epoch.txt"
                 best_epoch_text = best_epoch_path.read_text() if best_epoch_path.exists() else ""
 
+                resume_model = self._serializable_resume_model(self.model)
+                resume_ema = self._serializable_resume_model(
+                    self.ema.ema if getattr(self, "ema", None) is not None else self.model
+                )
+
                 ckpt = {
                     "epoch": int(getattr(self, "epoch", -1)),
                     "best_fitness": self.best_fitness,
-                    "model": None,
-                    "ema": self._serializable_resume_model(),
+                    "model": resume_model,
+                    "ema": resume_ema,
                     "updates": getattr(self.ema, "updates", 0) if getattr(self, "ema", None) is not None else 0,
                     "optimizer": None,
                     "train_args": vars(self.args),
@@ -1002,7 +1112,8 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
             weights_dir.mkdir(parents=True, exist_ok=True)
 
             base_last_tmp = weights_dir / "_base_last_tmp.pt"
-            y.model = finalize_pruned_model(y.model)
+            export_model = getattr(getattr(trainer, "ema", None), "ema", None) or trainer.model
+            y.model = clone_serializable_model(export_model, half=False)
             clear_instance_override(y.model, "is_fused")
             y.save(str(base_last_tmp), use_dill=False)
 
