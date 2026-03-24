@@ -183,6 +183,8 @@ def clone_serializable_model(
     model_obj = finalize_pruned_model(model_obj)
     if half:
         model_obj = model_obj.half()
+    else:
+        model_obj = model_obj.float()
     if hasattr(model_obj, "criterion"):
         model_obj.criterion = None
     for param in model_obj.parameters():
@@ -200,6 +202,41 @@ def checkpoint_model_object(ckpt: Any, *, prefer_ema: bool = False) -> Optional[
     if isinstance(ckpt, torch.nn.Module):
         return ckpt
     return None
+
+
+def is_resume_checkpoint_path(path_like: Any) -> bool:
+    try:
+        name = Path(path_like).name
+    except Exception:
+        return False
+    return name in {RESUME_LAST_CKPT_NAME, RESUME_BEST_CKPT_NAME}
+
+
+def load_checkpoint_model_direct(pt_path: Path) -> Tuple[torch.nn.Module, Dict[str, Any]]:
+    """
+    Load the pruned model module directly from a resumable checkpoint.
+
+    Ultralytics' default trainer path rebuilds a model from weights.yaml, which loses the pruned channel
+    structure. For resume checkpoints we instead take the serialized module object itself.
+    """
+    from ultralytics.nn.tasks import guess_model_task
+    from ultralytics.utils import DEFAULT_CFG_DICT
+
+    ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise TypeError(f"Expected dict checkpoint at {pt_path}, got {type(ckpt)}")
+
+    model_obj = checkpoint_model_object(ckpt, prefer_ema=True)
+    if model_obj is None:
+        raise RuntimeError(f"Checkpoint {pt_path} does not contain a loadable model or ema module.")
+
+    model_obj = clone_serializable_model(model_obj, half=False, freeze=False)
+    model_obj.args = {**DEFAULT_CFG_DICT, **(ckpt.get("train_args", {}) or {})}
+    model_obj.pt_path = str(pt_path)
+    model_obj.task = getattr(model_obj, "task", guess_model_task(model_obj))
+    if not hasattr(model_obj, "stride"):
+        model_obj.stride = torch.tensor([32.0])
+    return model_obj, ckpt
 
 
 def ensure_resume_checkpoint_compat(path: Path) -> bool:
@@ -755,6 +792,11 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
 
             def __init__(self, *trainer_args, **trainer_kwargs):
                 super().__init__(*trainer_args, **trainer_kwargs)
+                target_epochs = int(epochs_this_run)
+                if int(getattr(self.args, "epochs", 0) or 0) != target_epochs:
+                    self.args.epochs = target_epochs
+                if int(getattr(self, "epochs", 0) or 0) != target_epochs:
+                    self.epochs = target_epochs
                 self._best_score_custom: float = float("-inf")
                 self._best_sd_custom: Optional[Dict[str, torch.Tensor]] = None
                 self._best_epoch_custom: Optional[int] = None
@@ -766,6 +808,11 @@ def run_one_model(model_path: str, args: argparse.Namespace, flops_targets: Sequ
                 self._setup_model_ckpt: Optional[Dict[str, Any]] = None
 
             def setup_model(self):
+                if self.resume and is_resume_checkpoint_path(self.model):
+                    self.model, ckpt = load_checkpoint_model_direct(Path(self.model))
+                    self._setup_model_ckpt = ckpt
+                    return ckpt
+
                 ckpt = super().setup_model()
                 self._setup_model_ckpt = ckpt
                 return ckpt
