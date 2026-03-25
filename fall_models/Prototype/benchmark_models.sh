@@ -48,6 +48,13 @@ ALPHAPOSE_VERSIONS=(
   "int8det_fp16pose"
 )
 
+VITPOSE_POSE_MODEL="vitpose"
+VITPOSE_VERSIONS=(
+  "base"
+  "fp32"
+  "fp16"
+)
+
 CLASSIFIERS=(
   "cnnlstm"
   "stgcn"
@@ -61,7 +68,8 @@ MOTIONBERT_WEIGHT="../../web_app/models/classification/MotionBERT/yolo11l-pose/c
 
 TOTAL_RUNS=$(( \
   ${#POSE_MODELS[@]} * ${#VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
-  ${#ALPHAPOSE_VERSIONS[@]} * ${#CLASSIFIERS[@]} \
+  ${#ALPHAPOSE_VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
+  ${#VITPOSE_VERSIONS[@]} * ${#CLASSIFIERS[@]} \
 ))
 
 ###############################################################################
@@ -168,6 +176,32 @@ alphapose_checkpoint_for_version() {
   esac
 }
 
+vitpose_detector_model_for_version() {
+  local version="$1"
+
+  case "$version" in
+    base) printf '%s' "PekingU/rtdetr_r50vd_coco_o365" ;;
+    fp32) printf '%s' "../../quantisation/models/vitpose_trt/engines/detector_pekingu_rtdetr_r50vd_coco_o365_fp32.engine" ;;
+    fp16) printf '%s' "../../quantisation/models/vitpose_trt/engines/detector_pekingu_rtdetr_r50vd_coco_o365_fp16.engine" ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+vitpose_pose_model_for_version() {
+  local version="$1"
+
+  case "$version" in
+    base) printf '%s' "usyd-community/vitpose-base" ;;
+    fp32) printf '%s' "../../quantisation/models/vitpose_trt/engines/pose_usyd_community_vitpose_base_fp32.engine" ;;
+    fp16) printf '%s' "../../quantisation/models/vitpose_trt/engines/pose_usyd_community_vitpose_base_fp16.engine" ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 resolve_alphapose_check_path() {
   local alphapose_root="$1"
   local path_arg="$2"
@@ -229,6 +263,35 @@ require_file_or_log() {
   if [[ ! -f "$path" ]]; then
     log_failure \
       "pose_model=${pose_model} version=${version} classifier=${classifier} status=missing_file missing=${description} path=${path} cmd=\"${cmd_str}\""
+    return 1
+  fi
+
+  return 0
+}
+
+require_model_source_or_log() {
+  local source="$1"
+  local pose_model="$2"
+  local version="$3"
+  local classifier="$4"
+  local description="$5"
+  local cmd_str="$6"
+
+  if [[ -e "$source" ]]; then
+    return 0
+  fi
+
+  case "$source" in
+    *.engine|*.pt|*.pth|*.onnx|*.bin|*.ckpt|/*|./*|../*)
+      log_failure \
+        "pose_model=${pose_model} version=${version} classifier=${classifier} status=missing_source missing=${description} path=${source} cmd=\"${cmd_str}\""
+      return 1
+      ;;
+  esac
+
+  if [[ -z "$source" ]]; then
+    log_failure \
+      "pose_model=${pose_model} version=${version} classifier=${classifier} status=missing_source missing=${description} path=${source} cmd=\"${cmd_str}\""
     return 1
   fi
 
@@ -329,6 +392,47 @@ build_alphapose_command() {
       --alphapose-detector-cfg "${ALPHAPOSE_DETECTOR_CFG}" \
       --alphapose-checkpoint "${alphapose_checkpoint}" \
       --alphapose-detector-weights "${alphapose_detector_weights}" \
+      --device cuda \
+      --max-det 10 \
+      --warmup-frames 0 \
+      --warmup-windows 0 \
+      --benchmark 1 \
+      --profile-out "${BENCH_DIR}" \
+      --no-display 1
+  fi
+}
+
+build_vitpose_command() {
+  local classifier="$1"
+  local cls_weight="$2"
+  local vitpose_detector_model="$3"
+  local vitpose_pose_model="$4"
+
+  if [[ "$classifier" == "motionbert" ]]; then
+    printf '%s\0' \
+      python -m inference.infer_motionbert_video_vitpose \
+      --video "${VIDEO_PATH}" \
+      --model "${cls_weight}" \
+      --config "${MOTIONBERT_CONFIG}" \
+      --vitpose-detector-model "${vitpose_detector_model}" \
+      --vitpose-pose-model "${vitpose_pose_model}" \
+      --device cuda \
+      --max-det 10 \
+      --warmup-frames 0 \
+      --warmup-windows 0 \
+      --benchmark 1 \
+      --profile-out "${BENCH_DIR}" \
+      --no-display 1 \
+      --out-csv "" \
+      --out-pkl ""
+  else
+    printf '%s\0' \
+      python -m inference.inference_on_video_vitpose \
+      --video "${VIDEO_PATH}" \
+      --model "${cls_weight}" \
+      --arch "${classifier}" \
+      --vitpose-detector-model "${vitpose_detector_model}" \
+      --vitpose-pose-model "${vitpose_pose_model}" \
       --device cuda \
       --max-det 10 \
       --warmup-frames 0 \
@@ -557,6 +661,118 @@ run_one_alphapose_benchmark() {
     log_failure \
       "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_unique_new_directory_found cmd=\"${cmd_str}\""
     rm -f "${before_file}" "${after_file}"
+      return 1
+  fi
+}
+
+run_one_vitpose_benchmark() {
+  local run_idx="$1"
+  local version="$2"
+  local classifier="$3"
+
+  local vitpose_detector_model
+  local vitpose_pose_model
+  local cls_weight
+  local dest_dir
+  local cmd_str
+  local rc=0
+  local run_model_tag
+
+  vitpose_detector_model="$(vitpose_detector_model_for_version "${version}")" || {
+    log_failure \
+      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=internal_error reason=invalid_vitpose_detector_mapping"
+    return 1
+  }
+
+  vitpose_pose_model="$(vitpose_pose_model_for_version "${version}")" || {
+    log_failure \
+      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=internal_error reason=invalid_vitpose_pose_mapping"
+    return 1
+  }
+
+  cls_weight="$(classifier_weight_for_arch "${classifier}")" || {
+    log_failure \
+      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=internal_error reason=invalid_classifier_mapping"
+    return 1
+  }
+
+  dest_dir="${BENCH_DIR}/${VITPOSE_POSE_MODEL}/${version}"
+  mkdir -p "${dest_dir}"
+
+  run_model_tag="${classifier}_vitpose"
+  if combination_already_done "${VITPOSE_POSE_MODEL}" "${version}" "${run_model_tag}"; then
+    printf '[%d/%d] Skipping %s %s + %s (already benchmarked)\n' \
+      "${run_idx}" "${TOTAL_RUNS}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}"
+
+    log_skip \
+      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=skipped reason=already_benchmarked dest_dir=${dest_dir}"
+    return 2
+  fi
+
+  local cmd=()
+  while IFS= read -r -d '' token; do
+    cmd+=("$token")
+  done < <(build_vitpose_command "${classifier}" "${cls_weight}" "${vitpose_detector_model}" "${vitpose_pose_model}")
+
+  cmd_str="$(join_cmd "${cmd[@]}")"
+
+  printf '[%d/%d] Running %s %s + %s\n' \
+    "${run_idx}" "${TOTAL_RUNS}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}"
+
+  # Pre-flight checks
+  require_file_or_log "${VIDEO_PATH}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "video" "${cmd_str}" || return 1
+  require_file_or_log "${cls_weight}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" || return 1
+  require_model_source_or_log "${vitpose_detector_model}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "vitpose_detector_model" "${cmd_str}" || return 1
+  require_model_source_or_log "${vitpose_pose_model}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "vitpose_pose_model" "${cmd_str}" || return 1
+
+  if [[ "${classifier}" == "motionbert" ]]; then
+    require_file_or_log "${MOTIONBERT_CONFIG}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" || return 1
+  fi
+
+  local before_file after_file new_run_dir
+  before_file="$(mktemp)"
+  after_file="$(mktemp)"
+
+  snapshot_top_level_dirs > "${before_file}"
+
+  "${cmd[@]}"
+  rc=$?
+
+  snapshot_top_level_dirs > "${after_file}"
+
+  if [[ "${rc}" -ne 0 ]]; then
+    log_failure \
+      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    rm -f "${before_file}" "${after_file}"
+    return 1
+  fi
+
+  if new_run_dir="$(find_new_run_dir "${before_file}" "${after_file}")"; then
+    if [[ -d "${new_run_dir}" ]]; then
+      local run_basename
+      run_basename="$(basename "${new_run_dir}")"
+
+      if mv "${new_run_dir}" "${dest_dir}/"; then
+        log_success \
+          "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
+        rm -f "${before_file}" "${after_file}"
+        return 0
+      else
+        log_failure \
+          "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
+        rm -f "${before_file}" "${after_file}"
+        return 1
+      fi
+    else
+      log_failure \
+        "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_new_directory_found reason=diff_returned_non_directory path=${new_run_dir} cmd=\"${cmd_str}\""
+      rm -f "${before_file}" "${after_file}"
+      return 1
+    fi
+  else
+    log_failure \
+      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_unique_new_directory_found cmd=\"${cmd_str}\""
+    rm -f "${before_file}" "${after_file}"
     return 1
   fi
 }
@@ -592,6 +808,10 @@ for version in "${ALPHAPOSE_VERSIONS[@]}"; do
   mkdir -p "${BENCH_DIR}/${ALPHAPOSE_POSE_MODEL}/${version}"
 done
 
+for version in "${VITPOSE_VERSIONS[@]}"; do
+  mkdir -p "${BENCH_DIR}/${VITPOSE_POSE_MODEL}/${version}"
+done
+
 run_idx=0
 success_count=0
 failure_count=0
@@ -621,6 +841,23 @@ for version in "${ALPHAPOSE_VERSIONS[@]}"; do
     run_idx=$((run_idx + 1))
 
     run_one_alphapose_benchmark "${run_idx}" "${version}" "${classifier}"
+    rc=$?
+
+    if [[ "${rc}" -eq 0 ]]; then
+      success_count=$((success_count + 1))
+    elif [[ "${rc}" -eq 2 ]]; then
+      skip_count=$((skip_count + 1))
+    else
+      failure_count=$((failure_count + 1))
+    fi
+  done
+done
+
+for version in "${VITPOSE_VERSIONS[@]}"; do
+  for classifier in "${CLASSIFIERS[@]}"; do
+    run_idx=$((run_idx + 1))
+
+    run_one_vitpose_benchmark "${run_idx}" "${version}" "${classifier}"
     rc=$?
 
     if [[ "${rc}" -eq 0 ]]; then

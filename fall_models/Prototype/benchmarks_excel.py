@@ -29,6 +29,8 @@ CLASSIFIER_MAP = {
 ARCHITECTURE_MAP = {
     "alphapose": "Alphapose",
     "alpha_pose": "Alphapose",
+    "vitpose": "ViTPose",
+    "vit_pose": "ViTPose",
 }
 
 VERSION_MAP = {
