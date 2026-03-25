@@ -316,7 +316,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("walking_scan.csv"),
+        default=None,
         help="CSV report output path",
     )
     parser.add_argument(
@@ -352,8 +352,9 @@ def main() -> None:
             failed.append((str(fpath), str(e)))
             print(f"[{i}/{len(files)}] ERROR - {fpath} - {e}")
 
-    write_csv(rows, args.output)
-    print(f"\nWrote report: {args.output}")
+    if args.output is not None:
+        write_csv(rows, args.output)
+        print(f"\nWrote report: {args.output}")
 
     suspicious = [r for r in rows if r["suspicious"]]
     print(f"Suspicious files: {len(suspicious)} / {len(rows)}")
