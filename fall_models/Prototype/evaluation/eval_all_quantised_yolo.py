@@ -20,11 +20,24 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 CLASSIFIER_MODELS: Tuple[str, ...] = ("cnnlstm", "stgcn", "MotionBERT")
 ALPHAPOSE_VARIANT = "alphapose"
-POSE_SIZES: Tuple[str, ...] = ("yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x", ALPHAPOSE_VARIANT)
-PRECISIONS: Tuple[str, ...] = ("base", "fp16", "int8")
+VITPOSE_VARIANT = "vitpose"
+POSE_SIZES: Tuple[str, ...] = (
+    "yolo11n",
+    "yolo11s",
+    "yolo11m",
+    "yolo11l",
+    "yolo11x",
+    ALPHAPOSE_VARIANT,
+    VITPOSE_VARIANT,
+)
+PRECISIONS: Tuple[str, ...] = ("base", "fp32", "fp16", "int8")
+DEFAULT_SWEEP_PRECISIONS: Tuple[str, ...] = ("base", "fp16", "int8")
+VITPOSE_SWEEP_PRECISIONS: Tuple[str, ...] = ("base", "fp32", "fp16", "int8")
+VITPOSE_SUPPORTED_PRECISIONS: Tuple[str, ...] = ("base", "fp32")
 
 DEFAULT_KEYPOINTS_ROOT = Path("/home/people/21376026/scratch/keypoints/UPFall_keypoints")
 DEFAULT_ALPHAPOSE_KEYPOINTS_ROOT = Path("/home/people/21376026/scratch/keypoints/UPFall_keypoints_alpha")
+DEFAULT_VITPOSE_KEYPOINTS_ROOT = Path("/home/people/21376026/scratch/keypoints/UPFall_keypoints_vitpose")
 DEFAULT_CLASSIFICATION_ROOT = Path("/home/people/21376026/scratch/classification_models")
 DEFAULT_OUTPUT_ROOT = Path("/home/people/21376026/scratch/evaluations")
 DEFAULT_MOTIONBERT_PKL_ROOT = Path("/home/people/21376026/scratch/MotionBERT_pkls")
@@ -110,6 +123,7 @@ class SweepPaths:
     motionbert_code_root: Path
     keypoints_root: Path
     alphapose_keypoints_root: Path
+    vitpose_keypoints_root: Path
     classification_root: Path
     output_root: Path
     motionbert_pkl_root: Path
@@ -210,13 +224,13 @@ def parse_args() -> argparse.Namespace:
         "--only-pose-sizes",
         nargs="+",
         default=None,
-        help="Optional subset of pose variants: yolo11n yolo11s yolo11m yolo11l yolo11x alphapose",
+        help="Optional subset of pose variants: yolo11n yolo11s yolo11m yolo11l yolo11x alphapose vitpose",
     )
     parser.add_argument(
         "--only-precisions",
         nargs="+",
         default=None,
-        help="Optional subset of precisions: base fp16 int8",
+        help="Optional subset of precisions: base fp32 fp16 int8",
     )
     parser.add_argument(
         "--force-rerun",
@@ -239,6 +253,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_ALPHAPOSE_KEYPOINTS_ROOT,
         help=f"AlphaPose keypoints root (default: {DEFAULT_ALPHAPOSE_KEYPOINTS_ROOT.as_posix()})",
+    )
+    parser.add_argument(
+        "--vitpose-keypoints-root",
+        type=Path,
+        default=DEFAULT_VITPOSE_KEYPOINTS_ROOT,
+        help=f"ViTPose keypoints root (default: {DEFAULT_VITPOSE_KEYPOINTS_ROOT.as_posix()})",
     )
     parser.add_argument(
         "--classification-root",
@@ -304,13 +324,28 @@ def normalize_filter_tokens(
 def get_npz_root(paths: SweepPaths, pose_size: str, precision: str) -> Path:
     if pose_size == ALPHAPOSE_VARIANT:
         return paths.alphapose_keypoints_root / ALPHAPOSE_PRECISION_DIRS[precision]
+    if pose_size == VITPOSE_VARIANT:
+        vitpose_dir = "base" if precision in {"base", "fp32"} else precision
+        return paths.vitpose_keypoints_root / vitpose_dir
     return paths.keypoints_root / pose_size / precision
 
 
 def get_checkpoint_subdir_name(pose_size: str) -> str:
-    if pose_size == ALPHAPOSE_VARIANT:
-        return ALPHAPOSE_VARIANT
+    if pose_size in {ALPHAPOSE_VARIANT, VITPOSE_VARIANT}:
+        return pose_size
     return f"{pose_size}-pose"
+
+
+def get_pose_sweep_precisions(pose_size: str) -> Tuple[str, ...]:
+    if pose_size == VITPOSE_VARIANT:
+        return VITPOSE_SWEEP_PRECISIONS
+    return DEFAULT_SWEEP_PRECISIONS
+
+
+def get_supported_precisions(pose_size: str) -> Tuple[str, ...]:
+    if pose_size == VITPOSE_VARIANT:
+        return VITPOSE_SUPPORTED_PRECISIONS
+    return DEFAULT_SWEEP_PRECISIONS
 
 
 def get_checkpoint_path(paths: SweepPaths, classifier_model: str, pose_size: str) -> Path:
@@ -355,30 +390,31 @@ def get_motionbert_pkl_paths(paths: SweepPaths, pose_size: str, precision: str) 
 
 def build_run_matrix(paths: SweepPaths) -> List[RunSpec]:
     runs: List[RunSpec] = []
-    for classifier_model, pose_size, precision in product(CLASSIFIER_MODELS, POSE_SIZES, PRECISIONS):
-        npz_root = get_npz_root(paths, pose_size, precision)
-        checkpoint_path = get_checkpoint_path(paths, classifier_model, pose_size)
-        run_dir = get_run_dir(paths, classifier_model, pose_size, precision)
-        kwargs: Dict[str, Any] = {}
-        if classifier_model == "MotionBERT":
-            pkl_path, label_map_path = get_motionbert_pkl_paths(paths, pose_size, precision)
-            kwargs["motionbert_repo_root"] = get_motionbert_repo_root(paths, pose_size)
-            kwargs["motionbert_pkl_path"] = pkl_path
-            kwargs["motionbert_label_map_path"] = label_map_path
-        runs.append(
-            RunSpec(
-                classifier_model=classifier_model,
-                pose_model_size=pose_size,
-                precision=precision,
-                npz_root=npz_root,
-                checkpoint_path=checkpoint_path,
-                run_dir=run_dir,
-                stdout_log_path=run_dir / "stdout.log",
-                stderr_log_path=run_dir / "stderr.log",
-                run_status_path=run_dir / "run_status.json",
-                **kwargs,
+    for classifier_model, pose_size in product(CLASSIFIER_MODELS, POSE_SIZES):
+        for precision in get_pose_sweep_precisions(pose_size):
+            npz_root = get_npz_root(paths, pose_size, precision)
+            checkpoint_path = get_checkpoint_path(paths, classifier_model, pose_size)
+            run_dir = get_run_dir(paths, classifier_model, pose_size, precision)
+            kwargs: Dict[str, Any] = {}
+            if classifier_model == "MotionBERT":
+                pkl_path, label_map_path = get_motionbert_pkl_paths(paths, pose_size, precision)
+                kwargs["motionbert_repo_root"] = get_motionbert_repo_root(paths, pose_size)
+                kwargs["motionbert_pkl_path"] = pkl_path
+                kwargs["motionbert_label_map_path"] = label_map_path
+            runs.append(
+                RunSpec(
+                    classifier_model=classifier_model,
+                    pose_model_size=pose_size,
+                    precision=precision,
+                    npz_root=npz_root,
+                    checkpoint_path=checkpoint_path,
+                    run_dir=run_dir,
+                    stdout_log_path=run_dir / "stdout.log",
+                    stderr_log_path=run_dir / "stderr.log",
+                    run_status_path=run_dir / "run_status.json",
+                    **kwargs,
+                )
             )
-        )
     return runs
 
 
@@ -477,6 +513,7 @@ def write_master_json(
         "motionbert_code_root": paths.motionbert_code_root.as_posix(),
         "keypoints_root": paths.keypoints_root.as_posix(),
         "alphapose_keypoints_root": paths.alphapose_keypoints_root.as_posix(),
+        "vitpose_keypoints_root": paths.vitpose_keypoints_root.as_posix(),
         "classification_root": paths.classification_root.as_posix(),
         "output_root": paths.output_root.as_posix(),
         "motionbert_pkl_root": paths.motionbert_pkl_root.as_posix(),
@@ -836,6 +873,12 @@ def parse_run_metrics(run: RunSpec, output_dir: Path) -> Dict[str, Optional[floa
 
 def check_required_inputs(paths: SweepPaths, run: RunSpec) -> List[str]:
     missing: List[str] = []
+    supported_precisions = get_supported_precisions(run.pose_model_size)
+    if run.precision not in supported_precisions:
+        missing.append(
+            f"precision unsupported for {run.pose_model_size}: {run.precision} "
+            f"(supported: {', '.join(supported_precisions)})"
+        )
     if not paths.prepare_motionbert_script.is_file():
         missing.append(f"prepare script missing: {paths.prepare_motionbert_script.as_posix()}")
     eval_models_path = paths.repo_root / "evaluation" / "eval_models.py"
@@ -1164,6 +1207,7 @@ def main() -> int:
         ),
         keypoints_root=args.keypoints_root.expanduser(),
         alphapose_keypoints_root=args.alphapose_keypoints_root.expanduser(),
+        vitpose_keypoints_root=args.vitpose_keypoints_root.expanduser(),
         classification_root=args.classification_root.expanduser(),
         output_root=args.output_root.expanduser(),
         motionbert_pkl_root=args.motionbert_pkl_root.expanduser(),
