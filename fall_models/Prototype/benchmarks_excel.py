@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
@@ -17,6 +18,8 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 DEFAULT_BENCHMARK_ROOT = Path("benchmarks")
 DEFAULT_WORKBOOK_PATH = Path(r"..\..\..\Conference\Metrics.xlsx")
+PRUNED_BENCHMARK_ROOT = Path("benchmarks/pruned_models")
+PRUNED_WORKBOOK_PATH = Path(r"..\..\..\Conference\Pruning_Metrics.xlsx")
 SHEET_NAME = "Metrics Tracker"
 HEADER_ROW = 4
 
@@ -45,6 +48,29 @@ VERSION_MAP = {
     "int8det_fp16pose": "INT8",
 }
 
+PRUNED_POSE_MODELS = {
+    "yolo11n",
+    "yolo11s",
+    "yolo11m",
+    "yolo11l",
+    "yolo11x",
+}
+
+PRUNED_VERSION_FOLDERS = {
+    "pruned_80",
+    "pruned_90",
+}
+
+PRUNED_WRITABLE_METRIC_KEYS = {
+    "fps",
+    "inference_time",
+    "cpu_usage",
+    "gpu_usage",
+    "memory_usage",
+    "temperature",
+    "power_draw",
+}
+
 
 # =============================================================================
 # Data classes
@@ -52,8 +78,8 @@ VERSION_MAP = {
 
 @dataclass
 class BenchmarkRecord:
-    architecture_raw: str
-    architecture_excel: str
+    pose_model_raw: str
+    pose_model_excel: str
     version_folder: str
     version_excel: str
     classifier_raw: str
@@ -82,6 +108,14 @@ class Stats:
     no_matching_row: int = 0
     json_failures: int = 0
     workbook_write_failures: int = 0
+
+
+@dataclass(frozen=True)
+class ModeConfig:
+    name: str
+    benchmark_root: Path
+    workbook_path: Path
+    writable_metric_keys: Optional[Set[str]] = None
 
 
 # =============================================================================
@@ -273,17 +307,43 @@ def parse_classifier(run_dir_name: str) -> Optional[str]:
     return None
 
 
-def map_architecture(architecture_dir_name: str) -> str:
-    normalized = architecture_dir_name.strip()
+def map_regular_pose_model(folder_name: str) -> str:
+    normalized = folder_name.strip()
     lowered = normalized.lower()
     return ARCHITECTURE_MAP.get(lowered, normalized)
 
 
-def map_version(version_folder_name: str) -> Optional[str]:
-    return VERSION_MAP.get(version_folder_name.strip().lower())
+def map_pose_model(folder_name: str, mode: str) -> Optional[str]:
+    if mode == "regular":
+        return map_regular_pose_model(folder_name)
+
+    if mode == "pruned":
+        lowered = folder_name.strip().lower()
+        if lowered not in PRUNED_POSE_MODELS:
+            return None
+        return f"{lowered}-pose"
+
+    raise ValueError(f"Unsupported mode: {mode}")
 
 
-def scan_benchmark_records(benchmark_root: Path, stats: Stats) -> List[BenchmarkRecord]:
+def map_version(version_folder_name: str, mode: str) -> Optional[str]:
+    if mode == "regular":
+        return VERSION_MAP.get(version_folder_name.strip().lower())
+
+    if mode == "pruned":
+        lowered = version_folder_name.strip().lower()
+        if lowered in PRUNED_VERSION_FOLDERS:
+            return lowered
+        return None
+
+    raise ValueError(f"Unsupported mode: {mode}")
+
+
+def scan_benchmark_records(
+    benchmark_root: Path,
+    stats: Stats,
+    mode: str,
+) -> List[BenchmarkRecord]:
     records: List[BenchmarkRecord] = []
 
     if not benchmark_root.exists():
@@ -291,16 +351,19 @@ def scan_benchmark_records(benchmark_root: Path, stats: Stats) -> List[Benchmark
     if not benchmark_root.is_dir():
         raise NotADirectoryError(f"Benchmark root is not a directory: {benchmark_root}")
 
-    for architecture_dir in sorted(p for p in benchmark_root.iterdir() if p.is_dir()):
-        architecture_raw = architecture_dir.name
-        architecture_excel = map_architecture(architecture_raw)
+    for pose_model_dir in sorted(p for p in benchmark_root.iterdir() if p.is_dir()):
+        pose_model_raw = pose_model_dir.name
+        pose_model_excel = map_pose_model(pose_model_raw, mode)
+        if pose_model_excel is None:
+            warn(f"Skipping unknown pose model folder for mode={mode}: {pose_model_dir}")
+            stats.parse_failures += 1
+            continue
 
-        for version_dir in sorted(p for p in architecture_dir.iterdir() if p.is_dir()):
+        for version_dir in sorted(p for p in pose_model_dir.iterdir() if p.is_dir()):
             version_folder = version_dir.name
-            version_excel = map_version(version_folder)
-
+            version_excel = map_version(version_folder, mode)
             if version_excel is None:
-                warn(f"Skipping unknown version folder: {version_dir}")
+                warn(f"Skipping unknown version folder for mode={mode}: {version_dir}")
                 stats.parse_failures += 1
                 continue
 
@@ -327,8 +390,8 @@ def scan_benchmark_records(benchmark_root: Path, stats: Stats) -> List[Benchmark
 
                 records.append(
                     BenchmarkRecord(
-                        architecture_raw=architecture_raw,
-                        architecture_excel=architecture_excel,
+                        pose_model_raw=pose_model_raw,
+                        pose_model_excel=pose_model_excel,
                         version_folder=version_folder,
                         version_excel=version_excel,
                         classifier_raw=classifier_raw,
@@ -435,19 +498,25 @@ def build_row_index(ws: Worksheet, columns: Dict[str, int]) -> Dict[Tuple[str, s
 
 def find_matching_row(
     row_index: Dict[Tuple[str, str, str], int],
-    architecture: str,
+    pose_model: str,
     version_excel: str,
     classifier_excel: str,
 ) -> Optional[int]:
     key = (
-        normalize_text(architecture),
+        normalize_text(pose_model),
         normalize_text(version_excel),
         normalize_text(classifier_excel),
     )
     return row_index.get(key)
 
 
-def write_metrics_to_row(ws: Worksheet, columns: Dict[str, int], row_number: int, metrics: Metrics) -> None:
+def write_metrics_to_row(
+    ws: Worksheet,
+    columns: Dict[str, int],
+    row_number: int,
+    metrics: Metrics,
+    writable_metric_keys: Optional[Set[str]] = None,
+) -> None:
     metric_values = {
         "fps": metrics.avg_fps,
         "inference_time": metrics.inference_time_per_frame_ms,
@@ -459,6 +528,8 @@ def write_metrics_to_row(ws: Worksheet, columns: Dict[str, int], row_number: int
     }
 
     for key, value in metric_values.items():
+        if writable_metric_keys is not None and key not in writable_metric_keys:
+            continue
         col = columns.get(key)
         if col is None:
             warn(f"Metric column not found in workbook header row for key: {key}")
@@ -472,11 +543,12 @@ def write_metrics_to_row(ws: Worksheet, columns: Dict[str, int], row_number: int
 # Main update logic
 # =============================================================================
 
-def update_workbook(benchmark_root: Path, workbook_path: Path) -> Stats:
+def update_workbook(mode_config: ModeConfig) -> Stats:
     stats = Stats()
-    records = scan_benchmark_records(benchmark_root, stats)
+    records = scan_benchmark_records(mode_config.benchmark_root, stats, mode_config.name)
     info(f"Found {len(records)} benchmark folders eligible for processing.")
 
+    workbook_path = mode_config.workbook_path
     if not workbook_path.exists():
         raise FileNotFoundError(f"Workbook not found: {workbook_path}")
 
@@ -501,7 +573,7 @@ def update_workbook(benchmark_root: Path, workbook_path: Path) -> Stats:
 
         row_number = find_matching_row(
             row_index=row_index,
-            architecture=record.architecture_excel,
+            pose_model=record.pose_model_excel,
             version_excel=record.version_excel,
             classifier_excel=record.classifier_excel,
         )
@@ -509,8 +581,8 @@ def update_workbook(benchmark_root: Path, workbook_path: Path) -> Stats:
         if row_number is None:
             warn(
                 "No matching Excel row for "
-                f"architecture={record.architecture_excel!r}, "
-                f"architecture_raw={record.architecture_raw!r}, "
+                f"pose_model={record.pose_model_excel!r}, "
+                f"pose_model_raw={record.pose_model_raw!r}, "
                 f"version={record.version_excel!r}, "
                 f"version_folder={record.version_folder!r}, "
                 f"classifier={record.classifier_excel!r} "
@@ -521,11 +593,17 @@ def update_workbook(benchmark_root: Path, workbook_path: Path) -> Stats:
 
         try:
             metrics = extract_metrics(summary)
-            write_metrics_to_row(ws, columns, row_number, metrics)
+            write_metrics_to_row(
+                ws,
+                columns,
+                row_number,
+                metrics,
+                writable_metric_keys=mode_config.writable_metric_keys,
+            )
             stats.rows_updated += 1
             info(
                 f"Updated row {row_number}: "
-                f"{record.architecture_excel} | {record.version_excel} | {record.classifier_excel}"
+                f"{record.pose_model_excel} | {record.version_excel} | {record.classifier_excel}"
             )
         except Exception as exc:
             warn(f"Failed to update workbook for {record.run_dir}: {exc}")
@@ -557,16 +635,49 @@ def print_summary(stats: Stats) -> None:
     print(f"Skipped (workbook write failures):   {stats.workbook_write_failures}")
 
 
-def main() -> int:
-    benchmark_root = DEFAULT_BENCHMARK_ROOT.resolve()
-    workbook_path = DEFAULT_WORKBOOK_PATH.resolve()
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Write benchmark metrics from summary.json files into the Excel tracker workbook."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("regular", "pruned"),
+        default="regular",
+        help="Workbook/update mode. 'regular' preserves the current default behavior.",
+    )
+    return parser.parse_args(argv)
 
-    info(f"Benchmark root: {benchmark_root}")
-    info(f"Workbook path:  {workbook_path}")
+
+def resolve_mode_config(mode: str) -> ModeConfig:
+    if mode == "regular":
+        return ModeConfig(
+            name="regular",
+            benchmark_root=DEFAULT_BENCHMARK_ROOT.resolve(),
+            workbook_path=DEFAULT_WORKBOOK_PATH.resolve(),
+        )
+
+    if mode == "pruned":
+        return ModeConfig(
+            name="pruned",
+            benchmark_root=PRUNED_BENCHMARK_ROOT.resolve(),
+            workbook_path=PRUNED_WORKBOOK_PATH.resolve(),
+            writable_metric_keys=PRUNED_WRITABLE_METRIC_KEYS,
+        )
+
+    raise ValueError(f"Unsupported mode: {mode}")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    mode_config = resolve_mode_config(args.mode)
+
+    info(f"Mode:           {mode_config.name}")
+    info(f"Benchmark root: {mode_config.benchmark_root}")
+    info(f"Workbook path:  {mode_config.workbook_path}")
     info(f"Sheet name:     {SHEET_NAME}")
 
     try:
-        stats = update_workbook(benchmark_root, workbook_path)
+        stats = update_workbook(mode_config)
         print_summary(stats)
         return 0
     except Exception as exc:
