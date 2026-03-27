@@ -20,6 +20,7 @@ PROJECT_DIR="/home/jetson/NaoiseG/fall_detection/fall_models/Prototype"
 BENCH_DIR="benchmarks"
 PRUNED_MODEL_ROOT="/home/jetson/NaoiseG/fall_detection/pruning/pruned_models"
 FULL_PRUNED_MODEL_ROOT="/home/jetson/NaoiseG/fall_detection/pruning/pruned_models/full_pruned"
+FULL_PRUNED_BASE_CHECKPOINT="best_export_ready.pt"
 VIDEO_PATH="../../Datasets/test_vids/sitting.mp4"
 MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
 
@@ -181,6 +182,12 @@ full_pruned_weights_dir_name() {
   basename "$(dirname "${weights_dir}")"
 }
 
+full_pruned_base_checkpoint_for_dir() {
+  local weights_dir="$1"
+
+  printf '%s/%s' "${weights_dir}" "${FULL_PRUNED_BASE_CHECKPOINT}"
+}
+
 full_pruned_pose_weight_for_version() {
   local weights_dir="$1"
   local version="$2"
@@ -189,7 +196,7 @@ full_pruned_pose_weight_for_version() {
   model_name="$(full_pruned_weights_dir_name "${weights_dir}")"
 
   case "$version" in
-    base) printf '%s/best.pt' "${weights_dir}" ;;
+    base) printf '%s' "$(full_pruned_base_checkpoint_for_dir "${weights_dir}")" ;;
     fp32|fp16|int8) printf '%s/%s_%s.engine' "${weights_dir}" "${model_name}" "${version}" ;;
     *)
       return 1
@@ -210,6 +217,20 @@ discover_full_pruned_weights_dirs() {
   fi
 
   find "${FULL_PRUNED_MODEL_ROOT}" -type d -name weights -print 2>/dev/null | sort
+}
+
+discover_full_pruned_versions() {
+  local weights_dir="$1"
+  local version
+  local pose_weight
+
+  for version in "${FULL_PRUNED_WEIGHT_VERSIONS[@]}"; do
+    pose_weight="$(full_pruned_pose_weight_for_version "${weights_dir}" "${version}")" || continue
+
+    if [[ -f "${pose_weight}" ]]; then
+      printf '%s\n' "${version}"
+    fi
+  done
 }
 
 snapshot_top_level_dirs() {
@@ -268,6 +289,49 @@ combination_already_done() {
   [[ -d "${dest_dir}" ]] || return 1
 
   find "${dest_dir}" -mindepth 1 -maxdepth 1 -type d -name "*__model_${run_model_tag}__*" -print -quit 2>/dev/null | grep -q .
+}
+
+run_command_with_heartbeat() {
+  local run_label="$1"
+  shift
+
+  local interval_raw="${BENCHMARK_HEARTBEAT_S:-60}"
+  local interval_s
+
+  case "${interval_raw}" in
+    ''|*[!0-9]*)
+      interval_s=60
+      ;;
+    *)
+      interval_s="${interval_raw}"
+      ;;
+  esac
+
+  if [[ "${interval_s}" -le 0 ]]; then
+    "$@"
+    return $?
+  fi
+
+  "$@" &
+  local cmd_pid=$!
+  local start_ts now elapsed
+  start_ts="$(date +%s)"
+
+  while kill -0 "${cmd_pid}" 2>/dev/null; do
+    sleep "${interval_s}"
+
+    if kill -0 "${cmd_pid}" 2>/dev/null; then
+      now="$(date +%s)"
+      elapsed=$(( now - start_ts ))
+      printf '    ... still running %s elapsed=%02dh:%02dm:%02ds\n' \
+        "${run_label}" \
+        "$(( elapsed / 3600 ))" \
+        "$(( (elapsed % 3600) / 60 ))" \
+        "$(( elapsed % 60 ))"
+    fi
+  done
+
+  wait "${cmd_pid}"
 }
 
 build_command() {
@@ -386,7 +450,7 @@ run_one_benchmark() {
 
   snapshot_top_level_dirs > "${before_file}"
 
-  "${cmd[@]}"
+  run_command_with_heartbeat "${pose_model} ${version} + ${classifier}" "${cmd[@]}"
   rc=$?
 
   snapshot_top_level_dirs > "${after_file}"
@@ -492,7 +556,7 @@ run_one_full_pruned_benchmark() {
 
   snapshot_top_level_dirs > "${before_file}"
 
-  "${cmd[@]}"
+  run_command_with_heartbeat "full_pruned ${model_name} ${version} + ${classifier}" "${cmd[@]}"
   rc=$?
 
   snapshot_top_level_dirs > "${after_file}"
@@ -573,18 +637,38 @@ elif [[ "${#full_pruned_weight_dirs[@]}" -eq 0 ]]; then
   echo "WARNING: No weights directories found under FULL_PRUNED_MODEL_ROOT: ${FULL_PRUNED_MODEL_ROOT}" >&2
 fi
 
-TOTAL_RUNS=$(( \
-  ${#POSE_MODELS[@]} * ${#PRUNE_VARIANTS[@]} * ${#CLASSIFIERS[@]} + \
-  ${#full_pruned_weight_dirs[@]} * ${#FULL_PRUNED_WEIGHT_VERSIONS[@]} * ${#CLASSIFIERS[@]} \
-))
+legacy_total_runs=$(( ${#POSE_MODELS[@]} * ${#PRUNE_VARIANTS[@]} * ${#CLASSIFIERS[@]} ))
+full_pruned_total_runs=0
 
 for weights_dir in "${full_pruned_weight_dirs[@]}"; do
   model_name="$(full_pruned_weights_dir_name "${weights_dir}")"
+  mapfile -t benchmarkable_versions < <(discover_full_pruned_versions "${weights_dir}")
 
-  for version in "${FULL_PRUNED_WEIGHT_VERSIONS[@]}"; do
+  if [[ "${#benchmarkable_versions[@]}" -eq 0 ]]; then
+    echo "WARNING: No runnable full_pruned benchmark artifacts found for ${model_name} under ${weights_dir}" >&2
+    continue
+  fi
+
+  if [[ -f "${weights_dir}/best.pt" && ! -f "$(full_pruned_base_checkpoint_for_dir "${weights_dir}")" ]]; then
+    echo "WARNING: full_pruned base benchmark disabled for ${model_name}; missing normalized checkpoint $(full_pruned_base_checkpoint_for_dir "${weights_dir}")" >&2
+  fi
+
+  full_pruned_total_runs=$(( full_pruned_total_runs + ${#benchmarkable_versions[@]} * ${#CLASSIFIERS[@]} ))
+done
+
+TOTAL_RUNS=$(( legacy_total_runs + full_pruned_total_runs ))
+
+for weights_dir in "${full_pruned_weight_dirs[@]}"; do
+  model_name="$(full_pruned_weights_dir_name "${weights_dir}")"
+  mapfile -t benchmarkable_versions < <(discover_full_pruned_versions "${weights_dir}")
+
+  for version in "${benchmarkable_versions[@]}"; do
     mkdir -p "$(benchmark_dest_dir_for_full_pruned "${model_name}" "${version}")"
   done
 done
+
+echo "Benchmark duration per run: ${BENCHMARK_DURATION_S:-600}s"
+echo "Benchmark heartbeat:        ${BENCHMARK_HEARTBEAT_S:-60}s"
 
 run_idx=0
 success_count=0
@@ -611,7 +695,9 @@ for pose_model in "${POSE_MODELS[@]}"; do
 done
 
 for weights_dir in "${full_pruned_weight_dirs[@]}"; do
-  for version in "${FULL_PRUNED_WEIGHT_VERSIONS[@]}"; do
+  mapfile -t benchmarkable_versions < <(discover_full_pruned_versions "${weights_dir}")
+
+  for version in "${benchmarkable_versions[@]}"; do
     for classifier in "${CLASSIFIERS[@]}"; do
       run_idx=$((run_idx + 1))
 
