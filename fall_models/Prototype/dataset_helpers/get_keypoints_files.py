@@ -105,6 +105,17 @@ def main():
         default=Path("pose_models/ultralytics/yolo11l-pose.pt"),
         help="Path to YOLO pose weights (.pt or TensorRT .engine).",
     )
+    ap.add_argument(
+        "--imgsz",
+        type=float,
+        default=None,
+        help=(
+            "Optional YOLO inference input size control. "
+            "Values in (0,1] are interpreted as a fraction of original input pixels, "
+            "e.g. --imgsz 0.9 targets 90%% of the original input pixels. "
+            "Values >1 are treated as an explicit square YOLO imgsz."
+        ),
+    )
 
     ap.add_argument(
         "--lock-settings",
@@ -165,6 +176,7 @@ def main():
         fps=30,
         max_people=1,  # export one tracked person
         save_csv=False,
+        imgsz=args.imgsz,
     )
     apply_pose_lock_settings(cfg, args.lock_settings)
 

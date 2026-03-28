@@ -3,6 +3,7 @@ import os
 import glob
 import re
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
@@ -19,6 +20,7 @@ from ultralytics import YOLO
 @dataclass
 class PoseExportConfig:
     model_path: str = "pose_models/ultralytics/yolo11l-pose.pt"
+    imgsz: Optional[float] = None
     conf_thres: float = 0.25
     conf_min: float = 0.75
     fps: int = 30
@@ -81,6 +83,98 @@ def apply_pose_lock_settings(config: PoseExportConfig, preset_name: str) -> Pose
     return config
 
 
+def extract_model_stride(model: YOLO) -> int:
+    stride = getattr(getattr(model, "model", None), "stride", 32)
+    if torch.is_tensor(stride):
+        return max(1, int(stride.max().item()))
+    if isinstance(stride, (list, tuple)):
+        numeric = []
+        for value in stride:
+            try:
+                numeric.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if numeric:
+            return max(1, max(numeric))
+    try:
+        return max(1, int(stride))
+    except (TypeError, ValueError):
+        return 32
+
+
+def resolve_predict_imgsz(
+    imgsz_value: Optional[float],
+    frame_shape: Tuple[int, int],
+    stride: int,
+) -> Tuple[Optional[Any], Dict[str, Any]]:
+    info: Dict[str, Any] = {
+        "mode": "default",
+        "requested_value": None,
+        "applied_hw": None,
+        "applied_ratio": 1.0,
+    }
+    if imgsz_value is None:
+        return None, info
+
+    value = float(imgsz_value)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"imgsz must be positive, got {imgsz_value!r}")
+
+    frame_h, frame_w = frame_shape
+    frame_area = float(frame_h * frame_w)
+
+    if value <= 1.0:
+        target_ratio = value
+        aspect = float(frame_w) / float(frame_h)
+        max_h = max(stride, (frame_h // stride) * stride)
+        max_w = max(stride, (frame_w // stride) * stride)
+        h_candidates = list(range(stride, max_h + 1, stride))
+        w_candidates = list(range(stride, max_w + 1, stride))
+
+        best_hw: Optional[Tuple[int, int]] = None
+        best_score: Optional[Tuple[float, int, float, float]] = None
+        for cand_h in h_candidates:
+            for cand_w in w_candidates:
+                cand_ratio = float(cand_h * cand_w) / frame_area
+                area_err = abs(cand_ratio - target_ratio)
+                overshoot = 1 if cand_ratio > target_ratio + 1e-9 else 0
+                aspect_err = abs((float(cand_w) / float(cand_h)) - aspect)
+                score = (area_err, overshoot, aspect_err, -float(cand_h * cand_w))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_hw = (cand_h, cand_w)
+
+        if best_hw is None:
+            raise RuntimeError(
+                f"Could not resolve a valid imgsz for frame shape {(frame_h, frame_w)} and stride {stride}."
+            )
+
+        applied_ratio = float(best_hw[0] * best_hw[1]) / frame_area
+        info.update(
+            {
+                "mode": "pixel_ratio",
+                "requested_value": target_ratio,
+                "applied_hw": best_hw,
+                "applied_ratio": applied_ratio,
+            }
+        )
+        return list(best_hw), info
+
+    explicit_square = int(round(value))
+    if explicit_square <= 0:
+        raise ValueError(f"imgsz must be positive, got {imgsz_value!r}")
+
+    info.update(
+        {
+            "mode": "square",
+            "requested_value": explicit_square,
+            "applied_hw": (explicit_square, explicit_square),
+            "applied_ratio": float(explicit_square * explicit_square) / frame_area,
+        }
+    )
+    return explicit_square, info
+
+
 # ----------------------------- SORTING -----------------------------
 
 def frame_time_key(path: str) -> pd.Timestamp:
@@ -123,6 +217,79 @@ def read_image(path: str) -> np.ndarray:
     if img is None:
         raise RuntimeError(f"Failed to read image: {path}")
     return img
+
+
+def letterbox_image_to_shape(
+    image: np.ndarray,
+    new_shape: Tuple[int, int],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    orig_h, orig_w = image.shape[:2]
+    new_h, new_w = int(new_shape[0]), int(new_shape[1])
+    if new_h <= 0 or new_w <= 0:
+        raise ValueError(f"new_shape must be positive, got {new_shape!r}")
+
+    ratio = min(float(new_h) / float(orig_h), float(new_w) / float(orig_w))
+    new_unpad_w = int(round(float(orig_w) * ratio))
+    new_unpad_h = int(round(float(orig_h) * ratio))
+    dw = float(new_w - new_unpad_w) / 2.0
+    dh = float(new_h - new_unpad_h) / 2.0
+
+    resized = image
+    if (orig_w, orig_h) != (new_unpad_w, new_unpad_h):
+        resized = cv2.resize(image, (new_unpad_w, new_unpad_h), interpolation=cv2.INTER_LINEAR)
+
+    top = int(round(dh - 0.1))
+    bottom = int(round(dh + 0.1))
+    left = int(round(dw - 0.1))
+    right = int(round(dw + 0.1))
+    boxed = cv2.copyMakeBorder(
+        resized,
+        top,
+        bottom,
+        left,
+        right,
+        cv2.BORDER_CONSTANT,
+        value=(114, 114, 114),
+    )
+    return boxed, {"ratio": ratio, "pad_left": left, "pad_top": top}
+
+
+def scale_pose_from_letterbox(
+    pose: Dict[str, Any],
+    ratio: float,
+    pad_left: int,
+    pad_top: int,
+    orig_shape: Tuple[int, int],
+) -> Dict[str, Any]:
+    orig_h, orig_w = orig_shape
+    scaled = dict(pose)
+
+    xy = np.asarray(pose["xy"], dtype=np.float32).copy()
+    xy[..., 0] = (xy[..., 0] - float(pad_left)) / float(ratio)
+    xy[..., 1] = (xy[..., 1] - float(pad_top)) / float(ratio)
+    xy[..., 0] = np.clip(xy[..., 0], 0.0, float(orig_w - 1))
+    xy[..., 1] = np.clip(xy[..., 1], 0.0, float(orig_h - 1))
+    scaled["xy"] = xy
+
+    boxes_xyxy = np.asarray(pose["boxes_xyxy"], dtype=np.float32).copy()
+    if boxes_xyxy.size:
+        boxes_xyxy[:, [0, 2]] = (boxes_xyxy[:, [0, 2]] - float(pad_left)) / float(ratio)
+        boxes_xyxy[:, [1, 3]] = (boxes_xyxy[:, [1, 3]] - float(pad_top)) / float(ratio)
+        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0.0, float(orig_w - 1))
+        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0.0, float(orig_h - 1))
+    scaled["boxes_xyxy"] = boxes_xyxy
+
+    if boxes_xyxy.shape[0]:
+        centers = np.column_stack(
+            (
+                0.5 * (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]),
+                0.5 * (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]),
+            )
+        ).astype(np.float32)
+    else:
+        centers = np.empty((0, 2), dtype=np.float32)
+    scaled["box_centers"] = centers
+    return scaled
 
 
 def is_engine_weights_path(weights_path: Path) -> bool:
@@ -205,6 +372,54 @@ def ensure_ultralytics_engine_header(engine_path: Path) -> Path:
         dst.write(meta_raw)
         shutil.copyfileobj(src, dst, length=1024 * 1024)
     return wrapped_path
+
+
+def _torch_dtype_from_numpy_dtype(np_dtype: np.dtype) -> Optional[torch.dtype]:
+    mapping = {
+        np.dtype(np.float16): torch.float16,
+        np.dtype(np.float32): torch.float32,
+        np.dtype(np.float64): torch.float64,
+        np.dtype(np.int8): torch.int8,
+        np.dtype(np.int16): torch.int16,
+        np.dtype(np.int32): torch.int32,
+        np.dtype(np.int64): torch.int64,
+        np.dtype(np.uint8): torch.uint8,
+        np.dtype(np.bool_): torch.bool,
+    }
+    return mapping.get(np.dtype(np_dtype))
+
+
+def _tensor_from_numpy_without_bridge(arr: np.ndarray) -> torch.Tensor:
+    torch_dtype = _torch_dtype_from_numpy_dtype(arr.dtype)
+    if torch_dtype is None:
+        return torch.tensor(arr.tolist())
+    return torch.tensor(arr.tolist(), dtype=torch_dtype)
+
+
+@contextmanager
+def _temporary_torch_from_numpy_fallback(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    original_from_numpy = torch.from_numpy
+
+    def patched_from_numpy(arr):
+        try:
+            return original_from_numpy(arr)
+        except TypeError as exc:
+            if isinstance(arr, np.ndarray) and "expected np.ndarray" in str(exc):
+                # TensorRT binding setup in some Jetson stacks trips over
+                # torch.from_numpy(np.empty(...)). Falling back to a pure-Python
+                # conversion keeps engine initialization working.
+                return _tensor_from_numpy_without_bridge(arr)
+            raise
+
+    torch.from_numpy = patched_from_numpy
+    try:
+        yield
+    finally:
+        torch.from_numpy = original_from_numpy
 
 
 # ----------------------------- DATA STRUCTURES -----------------------------
@@ -574,6 +789,24 @@ def run_pose_on_frames(
 
     first = read_image(frame_paths[0])
     h, w = first.shape[:2]
+    _, predict_imgsz_info = resolve_predict_imgsz(
+        imgsz_value=config.imgsz,
+        frame_shape=(h, w),
+        stride=extract_model_stride(model),
+    )
+    if predict_imgsz_info["mode"] == "pixel_ratio":
+        applied_h, applied_w = predict_imgsz_info["applied_hw"]
+        print(
+            "Using resized predict canvas: "
+            f"{applied_w}x{applied_h} "
+            f"(requested pixel ratio={predict_imgsz_info['requested_value']:.3f}, "
+            f"applied={predict_imgsz_info['applied_ratio']:.3f} relative to {w}x{h})"
+        )
+    elif predict_imgsz_info["mode"] == "square":
+        print(
+            "Using explicit square predict imgsz: "
+            f"{int(predict_imgsz_info['requested_value'])}"
+        )
 
     out_video = os.path.join(out_dir, "pose_out.mp4")
     out_npz = os.path.join(out_dir, "keypoints.npz")
@@ -630,25 +863,29 @@ def run_pose_on_frames(
             print(f"Skipping unreadable frame: {p}")
             continue
 
+        frame_for_model = frame
+        letterbox_info = None
+        if predict_imgsz_info["applied_hw"] is not None:
+            frame_for_model, letterbox_info = letterbox_image_to_shape(
+                frame,
+                predict_imgsz_info["applied_hw"],
+            )
+
         # Keep detector candidate count independent from exported people count.
         max_det = max(1, int(config.detector_max_det))
+        predict_kwargs = {
+            "source": frame_for_model,
+            "conf": config.conf_thres,
+            "verbose": False,
+            "device": yolo_predict_device,
+            "max_det": max_det,
+        }
+        if predict_imgsz_info["applied_hw"] is not None:
+            predict_kwargs["imgsz"] = list(predict_imgsz_info["applied_hw"])
         if yolo_is_engine:
-            results = model.predict(
-                source=frame,
-                conf=config.conf_thres,
-                verbose=False,
-                device=yolo_predict_device,
-                half=use_half_yolo,
-                max_det=max_det,
-            )
-        else:
-            results = model.predict(
-                source=frame,
-                conf=config.conf_thres,
-                verbose=False,
-                device=yolo_predict_device,
-                max_det=max_det,
-            )
+            predict_kwargs["half"] = use_half_yolo
+        with _temporary_torch_from_numpy_fallback(enabled=bool(yolo_is_engine)):
+            results = model.predict(**predict_kwargs)
         r = results[0]
         selected_xy: Optional[np.ndarray] = None
         selected_kc: Optional[np.ndarray] = None
@@ -656,6 +893,14 @@ def run_pose_on_frames(
         selected_person_conf = float("nan")
 
         pose = extract_pose_for_frame(r)
+        if pose is not None and letterbox_info is not None:
+            pose = scale_pose_from_letterbox(
+                pose,
+                ratio=float(letterbox_info["ratio"]),
+                pad_left=int(letterbox_info["pad_left"]),
+                pad_top=int(letterbox_info["pad_top"]),
+                orig_shape=(h, w),
+            )
         if pose is None:
             lost_count += 1
         else:
@@ -769,6 +1014,12 @@ def run_pose_on_frames(
         frame_timestamps=np.array(frame_dts, dtype="datetime64[ns]"),
         fps=np.array([config.fps], dtype=np.int32),
         model_path=np.array([config.model_path], dtype=object),
+        predict_imgsz=np.array(
+            predict_imgsz_info["applied_hw"] if predict_imgsz_info["applied_hw"] is not None else (-1, -1),
+            dtype=np.int32,
+        ),
+        predict_pixel_ratio=np.array([predict_imgsz_info["applied_ratio"]], dtype=np.float32),
+        predict_imgsz_mode=np.array([predict_imgsz_info["mode"]], dtype=object),
     )
 
     if config.save_csv:
