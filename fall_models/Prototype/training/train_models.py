@@ -1116,6 +1116,11 @@ if __name__ == "__main__":
         help="Window label rule. hybrid_center_fallpct: label window as fall if fall frames >= fall_pct else center."
     )
     parser.add_argument("--min-valid-frac", type=float, default=0.3, help="Min fraction of joints above conf_thres for a frame to be valid.")
+    parser.add_argument(
+        "--keep-empty-windows",
+        action="store_true",
+        help="Keep windows with no valid frames after masking instead of dropping them (default: drop).",
+    )
     parser.add_argument("--add-mask-channel", type=int, default=1, help="Append mask channel (0/1).")
     parser.add_argument("--drop-ambig-share", type=float, default=0.6,
                         help="Drop windows where top-label share < this value (measured on valid frames). 0 disables.")
@@ -1421,6 +1426,7 @@ if __name__ == "__main__":
         stride=int(args.stride),
         label_mode=str(args.label_mode),
         min_valid_frac=float(args.min_valid_frac),
+        drop_empty_windows=not args.keep_empty_windows,
         add_mask_channel=add_mask_channel,
         fall_ids_0based=fall_ids_0based,
         fall_pct=float(args.fall_pct),
@@ -1451,6 +1457,7 @@ if __name__ == "__main__":
         stride=int(args.stride),
         label_mode=str(args.label_mode),
         min_valid_frac=float(args.min_valid_frac),
+        drop_empty_windows=not args.keep_empty_windows,
         add_mask_channel=add_mask_channel,
         fall_ids_0based=fall_ids_0based,
         fall_pct=float(args.fall_pct),
@@ -1477,6 +1484,7 @@ if __name__ == "__main__":
     print("num_classes:", num_classes, "| T_used:", T_used)
 
     print("window:", int(T_used), "frames | stride:", int(args.stride))
+    print("empty-window policy:", "drop" if not args.keep_empty_windows else "keep")
 
     # For checkpoint selection, we can upweight minority classes using inverse train frequency.
     metric_weights_np = None

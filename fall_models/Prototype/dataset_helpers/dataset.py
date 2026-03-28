@@ -756,7 +756,7 @@ def _load_windows_from_npzs_core(
     add_vel: bool = True,
     add_acc: bool = True,
     add_global: bool = True,
-    conf_thres: float = 0.2,
+    conf_thres: float = 0.05,
     max_interp_gap: int = 5,
     stride: int = 16,
     label_mode: str = "majority",
@@ -777,6 +777,7 @@ def _load_windows_from_npzs_core(
     rp_img_h: Optional[int] = None,
     feature_mode: str = "full",
     motion_xy_scale: float = 0.25,
+    drop_empty_windows: bool = False,
     collect_source_meta: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, int, Optional[Dict[str, Any]]]:
     """
@@ -835,6 +836,7 @@ def _load_windows_from_npzs_core(
                 rp_img_h=rp_img_h,
                 feature_mode=feature_mode,
                 motion_xy_scale=motion_xy_scale,
+                drop_empty_windows=drop_empty_windows,
             )
         else:
             X, y, _ = make_window_tensors(
@@ -866,6 +868,7 @@ def _load_windows_from_npzs_core(
                 rp_img_h=rp_img_h,
                 feature_mode=feature_mode,
                 motion_xy_scale=motion_xy_scale,
+                drop_empty_windows=drop_empty_windows,
             )
 
         X_all.append(X)
@@ -878,6 +881,13 @@ def _load_windows_from_npzs_core(
 
     if not X_all:
         raise RuntimeError("No NPZs found / no windows loaded.")
+
+    total_windows = sum(int(x.shape[0]) for x in X_all)
+    if total_windows == 0:
+        raise RuntimeError(
+            "No windows loaded after filtering. Check subject splits and window filters "
+            "(for example empty-window or ambiguity dropping)."
+        )
 
     X_cat = np.concatenate(X_all, axis=0)
     y_cat = np.concatenate(y_all, axis=0)
@@ -901,7 +911,7 @@ def load_windows_from_npzs(
     add_vel: bool = True,
     add_acc: bool = True,
     add_global: bool = True,
-    conf_thres: float = 0.2,
+    conf_thres: float = 0.05,
     max_interp_gap: int = 5,
     stride: int = 16,
     label_mode: str = "majority",  # center, majority, hybrid_center_fallpct
@@ -927,6 +937,7 @@ def load_windows_from_npzs(
     # NEW: feature composition
     feature_mode: str = "full",
     motion_xy_scale: float = 0.25,
+    drop_empty_windows: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Loads multiple trial NPZs, converts each to (W, T, K, C) windows,
@@ -964,6 +975,7 @@ def load_windows_from_npzs(
         rp_img_h=rp_img_h,
         feature_mode=feature_mode,
         motion_xy_scale=motion_xy_scale,
+        drop_empty_windows=drop_empty_windows,
         collect_source_meta=False,
     )
     return X_cat, y_cat, int(T_used)
@@ -977,7 +989,7 @@ def load_windows_with_source_meta_from_npzs(
     add_vel: bool = True,
     add_acc: bool = True,
     add_global: bool = True,
-    conf_thres: float = 0.2,
+    conf_thres: float = 0.05,
     max_interp_gap: int = 5,
     stride: int = 16,
     label_mode: str = "majority",
@@ -998,6 +1010,7 @@ def load_windows_with_source_meta_from_npzs(
     rp_img_h: Optional[int] = None,
     feature_mode: str = "full",
     motion_xy_scale: float = 0.25,
+    drop_empty_windows: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
     """
     Same as load_windows_from_npzs, but also returns source metadata aligned
@@ -1032,6 +1045,7 @@ def load_windows_with_source_meta_from_npzs(
         rp_img_h=rp_img_h,
         feature_mode=feature_mode,
         motion_xy_scale=motion_xy_scale,
+        drop_empty_windows=drop_empty_windows,
         collect_source_meta=True,
     )
     if meta is None:
@@ -1060,6 +1074,7 @@ def _make_sliding_windows(
     drop_ambig_nonfall_only: bool,
     layout: dict,
     label_convention: str,
+    drop_empty_windows: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Returns:
@@ -1106,6 +1121,10 @@ def _make_sliding_windows(
 
         # Build mask: 1 only where frame_valid is True (and non-padded)
         mask_t = valid.astype(np.float32)  # (T,)
+
+        # Drop windows that would otherwise become all zeros after hard masking.
+        if bool(drop_empty_windows) and not bool(np.any(valid)):
+            continue
 
         # Center label (merged space) is used both for window labeling and for
         # safeguarding rare classes from ambiguity-based dropping.
@@ -1177,6 +1196,14 @@ def _make_sliding_windows(
 
         if s + stride >= N and s >= N - 1:
             break
+
+    out_channels = C + (1 if add_mask_channel else 0)
+    if not X_windows:
+        return (
+            np.zeros((0, int(T), K, out_channels), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            int(T),
+        )
 
     return np.stack(X_windows), np.array(y_windows, dtype=np.int64), int(T)
 
@@ -1367,7 +1394,7 @@ def make_window_tensors(
     add_vel: bool = True,
     add_acc: bool = True,
     add_global: bool = True,
-    conf_thres: float = 0.2,
+    conf_thres: float = 0.05,
     max_interp_gap: int = 5,
     stride: int = 16,
     label_mode: str = "majority",
@@ -1393,6 +1420,7 @@ def make_window_tensors(
     # NEW: feature composition controls
     feature_mode: str = "full",
     motion_xy_scale: float = 0.25,
+    drop_empty_windows: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Converts frame-level pose data into window-level tensors.
@@ -1487,6 +1515,7 @@ def make_window_tensors(
         drop_ambig_nonfall_only=bool(drop_ambig_nonfall_only),
         layout=layout,
         label_convention=str(conv),
+        drop_empty_windows=bool(drop_empty_windows),
     )
 
     return X_windows, y_windows, T_used
@@ -1507,7 +1536,7 @@ def make_loader(
     add_vel: bool = True,
     add_acc: bool = True,
     add_global: bool = True,
-    conf_thres: float = 0.2,
+    conf_thres: float = 0.05,
     max_interp_gap: int = 5,
 ):
     OUTPUT_ROOT = Path("../../Datasets/UPFall_keypoints/outputs_npz")
