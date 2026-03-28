@@ -3,6 +3,7 @@
 import json
 import shutil
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -104,6 +105,54 @@ def ensure_ultralytics_engine_header(engine_path: Path) -> Path:
         shutil.copyfileobj(src, dst, length=1024 * 1024)
 
     return wrapped_path
+
+
+def _torch_dtype_from_numpy_dtype(np_dtype: np.dtype) -> Optional[torch.dtype]:
+    mapping = {
+        np.dtype(np.float16): torch.float16,
+        np.dtype(np.float32): torch.float32,
+        np.dtype(np.float64): torch.float64,
+        np.dtype(np.int8): torch.int8,
+        np.dtype(np.int16): torch.int16,
+        np.dtype(np.int32): torch.int32,
+        np.dtype(np.int64): torch.int64,
+        np.dtype(np.uint8): torch.uint8,
+        np.dtype(np.bool_): torch.bool,
+    }
+    return mapping.get(np.dtype(np_dtype))
+
+
+def _tensor_from_numpy_without_bridge(arr: np.ndarray) -> torch.Tensor:
+    torch_dtype = _torch_dtype_from_numpy_dtype(arr.dtype)
+    if torch_dtype is None:
+        return torch.tensor(arr.tolist())
+    return torch.tensor(arr.tolist(), dtype=torch_dtype)
+
+
+@contextmanager
+def _temporary_torch_from_numpy_fallback(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    original_from_numpy = torch.from_numpy
+
+    def patched_from_numpy(arr):
+        try:
+            return original_from_numpy(arr)
+        except TypeError as exc:
+            if isinstance(arr, np.ndarray) and "expected np.ndarray" in str(exc):
+                # TensorRT binding setup in some Jetson stacks trips over
+                # torch.from_numpy(np.empty(...)). Falling back to a pure-Python
+                # conversion keeps engine initialization working.
+                return _tensor_from_numpy_without_bridge(arr)
+            raise
+
+    torch.from_numpy = patched_from_numpy
+    try:
+        yield
+    finally:
+        torch.from_numpy = original_from_numpy
 
 
 def _to_numpy_or_none(x: Any) -> Optional[np.ndarray]:
@@ -312,7 +361,8 @@ class PosePipeline:
 
         _maybe_cuda_sync(sync_cuda_timing)
         t_pose0 = time.perf_counter()
-        results = self._pose_model.predict(**predict_kwargs)
+        with _temporary_torch_from_numpy_fallback(enabled=bool(self._yolo_is_engine)):
+            results = self._pose_model.predict(**predict_kwargs)
         _maybe_cuda_sync(sync_cuda_timing)
         pose_infer_ms = (time.perf_counter() - t_pose0) * 1000.0
 
