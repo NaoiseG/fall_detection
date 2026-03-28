@@ -32,8 +32,8 @@ POSE_SIZES: Tuple[str, ...] = (
 )
 PRECISIONS: Tuple[str, ...] = ("base", "fp32", "fp16", "int8")
 DEFAULT_SWEEP_PRECISIONS: Tuple[str, ...] = ("base", "fp16", "int8")
-VITPOSE_SWEEP_PRECISIONS: Tuple[str, ...] = ("base", "fp32", "fp16", "int8")
-VITPOSE_SUPPORTED_PRECISIONS: Tuple[str, ...] = ("base", "fp32")
+VITPOSE_SWEEP_PRECISIONS: Tuple[str, ...] = ("base", "fp16")
+VITPOSE_SUPPORTED_PRECISIONS: Tuple[str, ...] = ("base", "fp16")
 
 DEFAULT_KEYPOINTS_ROOT = Path("/home/people/21376026/scratch/keypoints/UPFall_keypoints")
 DEFAULT_ALPHAPOSE_KEYPOINTS_ROOT = Path("/home/people/21376026/scratch/keypoints/UPFall_keypoints_alpha")
