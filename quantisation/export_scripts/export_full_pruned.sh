@@ -306,12 +306,8 @@ for pt_path in "${CHECKPOINTS[@]}"; do
     fi
   done
 
-  if [[ "${missing_exports}" -eq 0 && ! -f "${normalized_pt}" ]]; then
-    missing_exports=1
-  fi
-
   if [[ "${missing_exports}" -eq 0 ]]; then
-    printf '    Skipping: all target engines and normalized checkpoint already exist.\n'
+    printf '    Skipping: all target engines already exist.\n'
     SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
     READY_COUNT=$((READY_COUNT + 1))
     continue
@@ -407,7 +403,7 @@ for pt_path in "${CHECKPOINTS[@]}"; do
 
   cleanup_export_artifacts "${weights_dir}" "${normalized_base}" "${model_name}_cleanup"
 
-  if [[ "${model_failed}" -eq 0 && -f "${normalized_pt}" && -f "${fp32_engine}" && -f "${fp16_engine}" && -f "${int8_engine}" ]]; then
+  if [[ "${model_failed}" -eq 0 && -f "${fp32_engine}" && -f "${fp16_engine}" && -f "${int8_engine}" ]]; then
     READY_COUNT=$((READY_COUNT + 1))
   else
     FAILED_COUNT=$((FAILED_COUNT + 1))
@@ -416,7 +412,7 @@ done
 
 printf '\nSummary\n'
 printf '  total pruned checkpoints found: %d\n' "${TOTAL_MODELS}"
-printf '  fully ready (base + 3 engines): %d\n' "${READY_COUNT}"
+printf '  ready (3 engines present):      %d\n' "${READY_COUNT}"
 printf '  skipped (already ready):       %d\n' "${SKIPPED_COUNT}"
 printf '  failed or incomplete:          %d\n' "${FAILED_COUNT}"
 
