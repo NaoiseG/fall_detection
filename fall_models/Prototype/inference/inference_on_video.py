@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -36,6 +37,39 @@ def _resolve_save_path(save_arg: Optional[str], video_path: Path) -> Optional[Pa
     return p
 
 
+def _build_imgsz_run_tag(imgsz_value: Optional[float]) -> Optional[str]:
+    if imgsz_value is None:
+        return None
+    value = float(imgsz_value)
+    if not np.isfinite(value) or value <= 0.0:
+        return None
+    if value <= 1.0:
+        return f"imgsz_{value:g}"
+    rounded = int(round(value))
+    if rounded == 640:
+        return None
+    return f"imgsz_{rounded}"
+
+
+def _persist_pose_imgsz_summary(result, pose_pipeline: PosePipeline) -> None:
+    info = pose_pipeline.predict_imgsz_info
+    applied_hw = info.get("applied_hw")
+    result.summary["pose_predict_stride"] = int(pose_pipeline.predict_stride)
+    result.summary["pose_predict_imgsz_cli"] = (
+        float(pose_pipeline.config.imgsz) if pose_pipeline.config.imgsz is not None else None
+    )
+    result.summary["pose_predict_imgsz_mode"] = str(info.get("mode", "default"))
+    result.summary["pose_predict_imgsz_requested"] = info.get("requested_value")
+    result.summary["pose_predict_imgsz_applied_hw"] = (
+        [int(applied_hw[0]), int(applied_hw[1])] if applied_hw is not None else None
+    )
+    result.summary["pose_predict_pixel_ratio_applied"] = float(info.get("applied_ratio", 1.0))
+    result.summary["pose_predict_manual_letterbox"] = bool(applied_hw is not None)
+    if result.summary_json is not None:
+        with result.summary_json.open("w", encoding="utf-8") as f:
+            json.dump(result.summary, f, indent=2)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Shared temporal inference wrapper (CNN-LSTM / ST-GCN / compatible arches).")
     ap.add_argument("--video", type=str, required=True, help="Path to input .mp4")
@@ -43,7 +77,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--arch", type=str, default=None, choices=KNOWN_ARCHES, help="Override model architecture if needed")
 
     ap.add_argument("--yolo-weights", type=str, default="pose_models/ultralytics/yolo11l-pose.pt")
-    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument(
+        "--imgsz",
+        type=float,
+        default=640,
+        help=(
+            "Optional YOLO inference input size control. "
+            "Values in (0,1] are interpreted as a fraction of original input pixels, "
+            "e.g. --imgsz 0.9 targets 90%% of the original input pixels. "
+            "Values >1 are treated as an explicit square YOLO imgsz."
+        ),
+    )
     ap.add_argument("--yolo-conf", type=float, default=0.25)
     ap.add_argument("--yolo-iou", type=float, default=None)
     ap.add_argument("--max-people", type=int, default=10)
@@ -102,6 +146,9 @@ def main() -> int:
         raise ValueError("--max-people must be >= 1.")
     if int(args.max_det) < 0:
         raise ValueError("--max-det must be >= 0.")
+    imgsz_value = float(args.imgsz)
+    if (not np.isfinite(imgsz_value)) or imgsz_value <= 0.0:
+        raise ValueError("--imgsz must be a finite number > 0.")
 
     video_path = Path(args.video).expanduser()
     if not video_path.exists():
@@ -164,6 +211,7 @@ def main() -> int:
             save_path=save_path,
             model_tag=str(adapter.name),
             yolo_weights_path=yolo_weights_path,
+            run_tag=_build_imgsz_run_tag(imgsz_value),
         )
 
     use_half = bool(int(args.half)) and str(device).startswith("cuda")
@@ -173,7 +221,7 @@ def main() -> int:
         PosePipelineConfig(
             yolo_weights=yolo_weights_path,
             device=str(device),
-            imgsz=int(args.imgsz),
+            imgsz=imgsz_value,
             yolo_conf=float(args.yolo_conf),
             yolo_iou=float(args.yolo_iou) if args.yolo_iou is not None else None,
             max_det=int(max_det),
@@ -213,6 +261,7 @@ def main() -> int:
         pose_pipeline=pose_pipeline,
         classifier=adapter,
     )
+    _persist_pose_imgsz_summary(result, pose_pipeline)
 
     if profile_enabled and result.profile_out_dir is not None:
         print(f"[profile] wrote outputs to: {result.profile_out_dir.as_posix()}")

@@ -6,8 +6,9 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
+import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
@@ -52,6 +53,169 @@ def resolve_yolo_predict_device(device: str, yolo_is_engine: bool) -> Any:
         if idx.isdigit():
             return int(idx)
     return device_str
+
+
+def extract_model_stride(model: YOLO) -> int:
+    stride = getattr(getattr(model, "model", None), "stride", 32)
+    if torch.is_tensor(stride):
+        return max(1, int(stride.max().item()))
+    if isinstance(stride, (list, tuple)):
+        numeric = []
+        for value in stride:
+            try:
+                numeric.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if numeric:
+            return max(1, max(numeric))
+    try:
+        return max(1, int(stride))
+    except (TypeError, ValueError):
+        return 32
+
+
+def resolve_predict_imgsz(
+    imgsz_value: Optional[float],
+    frame_shape: Tuple[int, int],
+    stride: int,
+) -> Tuple[Optional[Any], Dict[str, Any]]:
+    info: Dict[str, Any] = {
+        "mode": "default",
+        "requested_value": None,
+        "applied_hw": None,
+        "applied_ratio": 1.0,
+    }
+    if imgsz_value is None:
+        return None, info
+
+    value = float(imgsz_value)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"imgsz must be positive, got {imgsz_value!r}")
+
+    frame_h, frame_w = frame_shape
+    frame_area = float(frame_h * frame_w)
+
+    if value <= 1.0:
+        target_ratio = value
+        aspect = float(frame_w) / float(frame_h)
+        max_h = max(stride, (frame_h // stride) * stride)
+        max_w = max(stride, (frame_w // stride) * stride)
+        h_candidates = list(range(stride, max_h + 1, stride))
+        w_candidates = list(range(stride, max_w + 1, stride))
+
+        best_hw: Optional[Tuple[int, int]] = None
+        best_score: Optional[Tuple[float, int, float, float]] = None
+        for cand_h in h_candidates:
+            for cand_w in w_candidates:
+                cand_ratio = float(cand_h * cand_w) / frame_area
+                area_err = abs(cand_ratio - target_ratio)
+                overshoot = 1 if cand_ratio > target_ratio + 1e-9 else 0
+                aspect_err = abs((float(cand_w) / float(cand_h)) - aspect)
+                score = (area_err, overshoot, aspect_err, -float(cand_h * cand_w))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_hw = (cand_h, cand_w)
+
+        if best_hw is None:
+            raise RuntimeError(
+                f"Could not resolve a valid imgsz for frame shape {(frame_h, frame_w)} and stride {stride}."
+            )
+
+        applied_ratio = float(best_hw[0] * best_hw[1]) / frame_area
+        info.update(
+            {
+                "mode": "pixel_ratio",
+                "requested_value": target_ratio,
+                "applied_hw": best_hw,
+                "applied_ratio": applied_ratio,
+            }
+        )
+        return list(best_hw), info
+
+    explicit_square = int(round(value))
+    if explicit_square <= 0:
+        raise ValueError(f"imgsz must be positive, got {imgsz_value!r}")
+
+    info.update(
+        {
+            "mode": "square",
+            "requested_value": explicit_square,
+            "applied_hw": (explicit_square, explicit_square),
+            "applied_ratio": float(explicit_square * explicit_square) / frame_area,
+        }
+    )
+    return explicit_square, info
+
+
+def letterbox_image_to_shape(
+    image: np.ndarray,
+    new_shape: Tuple[int, int],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    orig_h, orig_w = image.shape[:2]
+    new_h, new_w = int(new_shape[0]), int(new_shape[1])
+    if new_h <= 0 or new_w <= 0:
+        raise ValueError(f"new_shape must be positive, got {new_shape!r}")
+
+    ratio = min(float(new_h) / float(orig_h), float(new_w) / float(orig_w))
+    new_unpad_w = int(round(float(orig_w) * ratio))
+    new_unpad_h = int(round(float(orig_h) * ratio))
+    dw = float(new_w - new_unpad_w) / 2.0
+    dh = float(new_h - new_unpad_h) / 2.0
+
+    resized = image
+    if (orig_w, orig_h) != (new_unpad_w, new_unpad_h):
+        resized = cv2.resize(image, (new_unpad_w, new_unpad_h), interpolation=cv2.INTER_LINEAR)
+
+    top = int(round(dh - 0.1))
+    bottom = int(round(dh + 0.1))
+    left = int(round(dw - 0.1))
+    right = int(round(dw + 0.1))
+    boxed = cv2.copyMakeBorder(
+        resized,
+        top,
+        bottom,
+        left,
+        right,
+        cv2.BORDER_CONSTANT,
+        value=(114, 114, 114),
+    )
+    return boxed, {"ratio": ratio, "pad_left": left, "pad_top": top}
+
+
+def _scale_xy_from_letterbox(
+    xy: np.ndarray,
+    *,
+    ratio: float,
+    pad_left: int,
+    pad_top: int,
+    orig_shape: Tuple[int, int],
+) -> np.ndarray:
+    orig_h, orig_w = orig_shape
+    scaled = np.asarray(xy, dtype=np.float32).copy()
+    scaled[..., 0] = (scaled[..., 0] - float(pad_left)) / float(ratio)
+    scaled[..., 1] = (scaled[..., 1] - float(pad_top)) / float(ratio)
+    scaled[..., 0] = np.clip(scaled[..., 0], 0.0, float(orig_w - 1))
+    scaled[..., 1] = np.clip(scaled[..., 1], 0.0, float(orig_h - 1))
+    return scaled
+
+
+def _scale_boxes_from_letterbox(
+    boxes_xyxy: np.ndarray,
+    *,
+    ratio: float,
+    pad_left: int,
+    pad_top: int,
+    orig_shape: Tuple[int, int],
+) -> np.ndarray:
+    orig_h, orig_w = orig_shape
+    scaled = np.asarray(boxes_xyxy, dtype=np.float32).copy()
+    if scaled.size == 0:
+        return scaled.reshape(0, 4)
+    scaled[:, [0, 2]] = (scaled[:, [0, 2]] - float(pad_left)) / float(ratio)
+    scaled[:, [1, 3]] = (scaled[:, [1, 3]] - float(pad_top)) / float(ratio)
+    scaled[:, [0, 2]] = np.clip(scaled[:, [0, 2]], 0.0, float(orig_w - 1))
+    scaled[:, [1, 3]] = np.clip(scaled[:, [1, 3]], 0.0, float(orig_h - 1))
+    return scaled
 
 
 def _has_ultralytics_engine_metadata(engine_path: Path) -> bool:
@@ -165,35 +329,29 @@ def _to_numpy_or_none(x: Any) -> Optional[np.ndarray]:
     return np.asarray(x)
 
 
-def _extract_box_centers_conf(r: Any) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def _extract_boxes_xyxy_conf(r: Any) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     if r is None or getattr(r, "boxes", None) is None:
-        return np.empty((0, 2), dtype=np.float32), None
+        return np.empty((0, 4), dtype=np.float32), None
 
     boxes_xyxy = _to_numpy_or_none(getattr(r.boxes, "xyxy", None))
     if boxes_xyxy is None:
-        return np.empty((0, 2), dtype=np.float32), None
+        return np.empty((0, 4), dtype=np.float32), None
     boxes_xyxy = np.asarray(boxes_xyxy, dtype=np.float32)
     if boxes_xyxy.ndim != 2 or boxes_xyxy.shape[0] == 0 or boxes_xyxy.shape[1] < 4:
-        return np.empty((0, 2), dtype=np.float32), None
+        return np.empty((0, 4), dtype=np.float32), None
 
     boxes_xyxy = boxes_xyxy[:, :4]
-    centers = np.column_stack(
-        (
-            0.5 * (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]),
-            0.5 * (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]),
-        )
-    ).astype(np.float32, copy=False)
 
     box_conf = _to_numpy_or_none(getattr(r.boxes, "conf", None))
     if box_conf is not None:
         box_conf = np.asarray(box_conf, dtype=np.float32).reshape(-1)
-        if box_conf.shape[0] < centers.shape[0]:
-            pad = centers.shape[0] - box_conf.shape[0]
+        if box_conf.shape[0] < boxes_xyxy.shape[0]:
+            pad = boxes_xyxy.shape[0] - box_conf.shape[0]
             box_conf = np.pad(box_conf, (0, pad), mode="constant", constant_values=np.nan)
-        elif box_conf.shape[0] > centers.shape[0]:
-            box_conf = box_conf[: centers.shape[0]]
+        elif box_conf.shape[0] > boxes_xyxy.shape[0]:
+            box_conf = box_conf[: boxes_xyxy.shape[0]]
 
-    return centers, box_conf
+    return boxes_xyxy, box_conf
 
 
 def select_person_idx(
@@ -238,7 +396,7 @@ def select_person_idx(
 class PosePipelineConfig:
     yolo_weights: Path
     device: str
-    imgsz: int = 640
+    imgsz: Optional[float] = 640
     yolo_conf: float = 0.25
     yolo_iou: Optional[float] = None
     max_det: int = 10
@@ -288,6 +446,15 @@ class PosePipeline:
             self._pose_model = YOLO(str(self._yolo_runtime_weights), task="pose")
         except TypeError:
             self._pose_model = YOLO(str(self._yolo_runtime_weights))
+        self._model_stride = extract_model_stride(self._pose_model)
+        self._predict_imgsz_runtime: Optional[Any] = None
+        self._predict_imgsz_info: Dict[str, Any] = {
+            "mode": "default",
+            "requested_value": None,
+            "applied_hw": None,
+            "applied_ratio": 1.0,
+        }
+        self._predict_imgsz_frame_shape: Optional[Tuple[int, int]] = None
 
         self.reset_tracking_state()
 
@@ -298,6 +465,19 @@ class PosePipeline:
     @property
     def yolo_predict_device(self) -> Any:
         return self._yolo_predict_device
+
+    @property
+    def predict_stride(self) -> int:
+        return int(self._model_stride)
+
+    @property
+    def predict_imgsz_info(self) -> Dict[str, Any]:
+        info = dict(self._predict_imgsz_info)
+        applied_hw = info.get("applied_hw")
+        if applied_hw is not None:
+            info["applied_hw"] = (int(applied_hw[0]), int(applied_hw[1]))
+        info["stride"] = int(self._model_stride)
+        return info
 
     def reset_tracking_state(self) -> None:
         self._sampled_count = 0
@@ -327,6 +507,33 @@ class PosePipeline:
         else:
             self._max_jump_px_runtime = float(self.config.track_max_jump_diag_frac) * float(frame_diag)
 
+    def _resolve_predict_imgsz_if_needed(self, frame: np.ndarray) -> None:
+        frame_shape = (int(frame.shape[0]), int(frame.shape[1]))
+        if self._predict_imgsz_frame_shape == frame_shape:
+            return
+
+        self._predict_imgsz_runtime, self._predict_imgsz_info = resolve_predict_imgsz(
+            imgsz_value=self.config.imgsz,
+            frame_shape=frame_shape,
+            stride=int(self._model_stride),
+        )
+        self._predict_imgsz_frame_shape = frame_shape
+
+        mode = str(self._predict_imgsz_info.get("mode", "default"))
+        if mode == "pixel_ratio":
+            applied_h, applied_w = self._predict_imgsz_info["applied_hw"]
+            print(
+                "[pose] using resized predict canvas: "
+                f"{int(applied_w)}x{int(applied_h)} "
+                f"(requested pixel ratio={float(self._predict_imgsz_info['requested_value']):.3f}, "
+                f"applied={float(self._predict_imgsz_info['applied_ratio']):.3f} relative to "
+                f"{int(frame_shape[1])}x{int(frame_shape[0])})"
+            )
+        elif mode == "square":
+            requested_square = int(self._predict_imgsz_info["requested_value"])
+            if requested_square != 640:
+                print(f"[pose] using explicit square predict imgsz: {requested_square}")
+
     def process_frame(self, frame_bgr: np.ndarray, raw_frame_idx: int, sync_cuda_timing: bool = False) -> PoseFrameOutput:
         do_sample = (int(raw_frame_idx) % int(self.config.frame_step)) == 0
         if not do_sample:
@@ -342,20 +549,31 @@ class PosePipeline:
             )
 
         self._init_geometry_if_needed(frame_bgr)
+        self._resolve_predict_imgsz_if_needed(frame_bgr)
         target_center = self._target_center
         max_jump_px = self._max_jump_px_runtime
         if target_center is None or max_jump_px is None:
             raise RuntimeError("Pose pipeline geometry failed to initialize.")
 
+        frame_for_model = frame_bgr
+        letterbox_info: Optional[Dict[str, Any]] = None
+        applied_hw = self._predict_imgsz_info.get("applied_hw")
+        if applied_hw is not None:
+            frame_for_model, letterbox_info = letterbox_image_to_shape(
+                frame_bgr,
+                (int(applied_hw[0]), int(applied_hw[1])),
+            )
+
         predict_kwargs = {
-            "source": frame_bgr,
-            "imgsz": int(self.config.imgsz),
+            "source": frame_for_model,
             "conf": float(self.config.yolo_conf),
             "verbose": False,
             "device": self._yolo_predict_device,
             "half": bool(self.config.use_half),
             "max_det": max(1, int(self.config.max_det)),
         }
+        if self._predict_imgsz_runtime is not None:
+            predict_kwargs["imgsz"] = self._predict_imgsz_runtime
         if self.config.yolo_iou is not None:
             predict_kwargs["iou"] = float(self.config.yolo_iou)
 
@@ -379,12 +597,35 @@ class PosePipeline:
             kpts = r.keypoints
             xy_all = kpts.xy.cpu().numpy() if hasattr(kpts.xy, "cpu") else np.asarray(kpts.xy)
             cf_all = kpts.conf.cpu().numpy() if (hasattr(kpts, "conf") and hasattr(kpts.conf, "cpu")) else None
-            box_centers, box_conf = _extract_box_centers_conf(r)
+            boxes_xyxy, box_conf = _extract_boxes_xyxy_conf(r)
+
+            if letterbox_info is not None:
+                xy_all = _scale_xy_from_letterbox(
+                    xy_all,
+                    ratio=float(letterbox_info["ratio"]),
+                    pad_left=int(letterbox_info["pad_left"]),
+                    pad_top=int(letterbox_info["pad_top"]),
+                    orig_shape=(int(frame_bgr.shape[0]), int(frame_bgr.shape[1])),
+                )
+                if boxes_xyxy.shape[0] > 0:
+                    boxes_xyxy = _scale_boxes_from_letterbox(
+                        boxes_xyxy,
+                        ratio=float(letterbox_info["ratio"]),
+                        pad_left=int(letterbox_info["pad_left"]),
+                        pad_top=int(letterbox_info["pad_top"]),
+                        orig_shape=(int(frame_bgr.shape[0]), int(frame_bgr.shape[1])),
+                    )
 
             if xy_all.ndim == 3 and xy_all.shape[0] > 0 and xy_all.shape[1] == K:
                 num_candidates = int(xy_all.shape[0])
-                if box_centers.shape[0] > 0:
-                    num_candidates = min(num_candidates, int(box_centers.shape[0]))
+                if boxes_xyxy.shape[0] > 0:
+                    num_candidates = min(num_candidates, int(boxes_xyxy.shape[0]))
+                    box_centers = np.column_stack(
+                        (
+                            0.5 * (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]),
+                            0.5 * (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]),
+                        )
+                    ).astype(np.float32, copy=False)
                 else:
                     box_centers = np.mean(xy_all, axis=1).astype(np.float32, copy=False)
 

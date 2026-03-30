@@ -23,6 +23,7 @@ This avoids misreporting a full window cost as if it were re-run on every frame.
   - YOLO confidence / IOU
   - YOLO FP16 policy (`--half`)
   - YOLO `max_det` parity (`--max-det` / `--max-people`)
+  - YOLO `--imgsz` parity, including fractional pixel-ratio inputs like `--imgsz 0.9`
   - shared target-lock tracking controls
 
 ## Warm-up exclusion

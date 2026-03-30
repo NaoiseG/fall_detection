@@ -499,12 +499,15 @@ def pick_profile_out_dir(
     save_path: Optional[Path],
     model_tag: str,
     yolo_weights_path: Path,
+    run_tag: Optional[str] = None,
 ) -> Path:
     base_root = Path(profile_out_arg).expanduser() if profile_out_arg else (save_path.parent if save_path is not None else Path("runs") / "profiling")
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     model_slug = _slugify_name(model_tag)
     yolo_slug = _slugify_name(Path(yolo_weights_path).name)
     run_name = f"{ts}__model_{model_slug}__kpts_{yolo_slug}"
+    if run_tag is not None and str(run_tag).strip() != "":
+        run_name = f"{run_name}__{_slugify_name(run_tag)}"
     out_dir = base_root / run_name
 
     suffix = 1
