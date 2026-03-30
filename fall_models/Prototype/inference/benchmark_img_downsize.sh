@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 
-# Benchmark resized-input YOLO pose pipelines.
+# Benchmark resized-input YOLO pose pipelines with CNN-LSTM only.
 #
 # Workflow:
 #   1) export dedicated FP32 TensorRT engines for the requested pose-model/imgsz pairs
-#   2) benchmark each exported engine with the standard classifier stack
+#   2) benchmark each exported engine with the CNN-LSTM pipeline
+#   3) resume cleanly by reusing existing exports and skipping completed runs
 #
 # Intended run location:
 #   /home/jetson/.../fall_detection/fall_models/Prototype
@@ -23,7 +24,6 @@ PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 BENCH_DIR="benchmarks/img_downsize"
 VIDEO_PATH="../../Datasets/test_vids/sitting.mp4"
-MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
 
 COMBINATIONS=(
   "yolo11m-pose:576"
@@ -33,14 +33,10 @@ COMBINATIONS=(
 
 CLASSIFIERS=(
   "cnnlstm"
-  "stgcn"
-  "motionbert"
 )
 
-# Fixed classification weights for ALL runs
+# Fixed classification weight for all runs
 CNNLSTM_WEIGHT="../../web_app/models/classification/cnnlstm/yolo11l-pose/cnnlstm_best.pt"
-STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/stgcn_best.pt"
-MOTIONBERT_WEIGHT="../../web_app/models/classification/MotionBERT/yolo11l-pose/checkpoint/action/FT_MB_release_MB_ft_UPFall_xsub/best_epoch.bin"
 
 TOTAL_RUNS=$(( ${#COMBINATIONS[@]} * ${#CLASSIFIERS[@]} ))
 
@@ -107,8 +103,6 @@ classifier_weight_for_arch() {
 
   case "$classifier" in
     cnnlstm)    printf '%s' "${CNNLSTM_WEIGHT}" ;;
-    stgcn)      printf '%s' "${STGCN_WEIGHT}" ;;
-    motionbert) printf '%s' "${MOTIONBERT_WEIGHT}" ;;
     *)
       return 1
       ;;
@@ -174,43 +168,22 @@ build_command() {
   local pose_weight="$3"
   local imgsz="$4"
 
-  if [[ "$classifier" == "motionbert" ]]; then
-    printf '%s\0' \
-      python -m inference.infer_motionbert_video \
-      --video "${VIDEO_PATH}" \
-      --model "${cls_weight}" \
-      --config "${MOTIONBERT_CONFIG}" \
-      --yolo-weights "${pose_weight}" \
-      --imgsz "${imgsz}" \
-      --device cuda \
-      --half 0 \
-      --max-people 10 \
-      --max-det 10 \
-      --warmup-frames 0 \
-      --warmup-windows 0 \
-      --benchmark 1 \
-      --profile-out "${BENCH_DIR}" \
-      --no-display 1 \
-      --out-csv "" \
-      --out-pkl ""
-  else
-    printf '%s\0' \
-      python -m inference.inference_on_video \
-      --video "${VIDEO_PATH}" \
-      --model "${cls_weight}" \
-      --yolo-weights "${pose_weight}" \
-      --imgsz "${imgsz}" \
-      --arch "${classifier}" \
-      --device cuda \
-      --half 0 \
-      --max-people 10 \
-      --max-det 10 \
-      --warmup-frames 0 \
-      --warmup-windows 0 \
-      --benchmark 1 \
-      --profile-out "${BENCH_DIR}" \
-      --no-display 1
-  fi
+  printf '%s\0' \
+    python -m inference.inference_on_video \
+    --video "${VIDEO_PATH}" \
+    --model "${cls_weight}" \
+    --yolo-weights "${pose_weight}" \
+    --imgsz "${imgsz}" \
+    --arch "${classifier}" \
+    --device cuda \
+    --half 0 \
+    --max-people 10 \
+    --max-det 10 \
+    --warmup-frames 0 \
+    --warmup-windows 0 \
+    --benchmark 1 \
+    --profile-out "${BENCH_DIR}" \
+    --no-display 1
 }
 
 export_one_engine() {
@@ -336,10 +309,6 @@ run_one_benchmark() {
   require_file_or_log "${VIDEO_PATH}" "${pose_model}" "${imgsz}" "${classifier}" "video" "${cmd_str}" "benchmark" || return 1
   require_file_or_log "${pose_weight}" "${pose_model}" "${imgsz}" "${classifier}" "pose_weight" "${cmd_str}" "benchmark" || return 1
   require_file_or_log "${cls_weight}" "${pose_model}" "${imgsz}" "${classifier}" "classification_weight" "${cmd_str}" "benchmark" || return 1
-
-  if [[ "${classifier}" == "motionbert" ]]; then
-    require_file_or_log "${MOTIONBERT_CONFIG}" "${pose_model}" "${imgsz}" "${classifier}" "motionbert_config" "${cmd_str}" "benchmark" || return 1
-  fi
 
   local before_file after_file new_run_dir
   before_file="$(mktemp)"
