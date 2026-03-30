@@ -154,6 +154,15 @@ def build_normalized_checkpoint(ckpt: dict[str, Any], model: Any) -> dict[str, A
     return normalized_ckpt
 
 
+def save_normalized_checkpoint(checkpoint: dict[str, Any], output_path: Path, *, torch_module: Any) -> None:
+    try:
+        torch_module.save(checkpoint, output_path, use_dill=False)
+    except TypeError as exc:
+        if "use_dill" not in str(exc):
+            raise
+        torch_module.save(checkpoint, output_path)
+
+
 def main() -> int:
     args = parse_args()
 
@@ -168,13 +177,14 @@ def main() -> int:
     prepend_sys_path(args.ultralytics_root)
 
     import torch
-    import ultralytics  # noqa: F401  # patches torch.save/torch.load for use_dill compatibility
+    import ultralytics
 
     mtn, mto, modelopt_source = import_modelopt_modules(args.modelopt_root)
 
     print(f"[normalize] input:  {input_path}")
     print(f"[normalize] output: {output_path}")
     print(f"[normalize] modelopt: {modelopt_source}")
+    print(f"[normalize] ultralytics: {Path(ultralytics.__file__).resolve()}")
 
     try:
         ckpt = torch.load(input_path, map_location="cpu", weights_only=False)
@@ -191,7 +201,7 @@ def main() -> int:
     normalized_ckpt = build_normalized_checkpoint(ckpt, model)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(normalized_ckpt, output_path, use_dill=False)
+    save_normalized_checkpoint(normalized_ckpt, output_path, torch_module=torch)
 
     print(f"[normalize] wrote:  {output_path}")
     return 0
