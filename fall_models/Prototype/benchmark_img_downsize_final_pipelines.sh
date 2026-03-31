@@ -30,7 +30,7 @@ PROJECT_DIR="${SCRIPT_DIR}"
 
 BENCH_DIR="${BENCH_DIR:-benchmarks/img_downsize/final_pipelines}"
 VIDEO_PATH="${VIDEO_PATH:-../../Datasets/test_vids/sitting.mp4}"
-MODEL_ROOT="${MODEL_ROOT:-../../quantisation/models/img_downsize/yolo11}"
+MODEL_ROOT="${MODEL_ROOT:-../../quantisation/models/img_downsize}"
 CLASSIFICATION_ROOT="${CLASSIFICATION_ROOT:-../../web_app/models/classification}"
 
 RUN_SPECS=(
