@@ -10,7 +10,7 @@ Runs:
 Model order:
 - yolo11m fp16 with imgsz 576
 - yolo11x pruned_80 fp16 with imgsz 448
-- yolo11x fp32 with imgsz 448
+- yolo11x fp16 with imgsz 448
 - yolo11l fp32 with imgsz 512
 
 Outputs:
@@ -95,22 +95,22 @@ VARIANT_SPECS: Tuple[VariantSpec, ...] = (
         output_relative_dir=Path("yolo11x/pruned_80_fp16_imgsz448"),
     ),
     VariantSpec(
-        run_name="yolo11x fp32 imgsz 448",
+        run_name="yolo11x fp16 imgsz 448",
         pose_model="yolo11x",
-        variant_name="fp32_imgsz448",
+        variant_name="fp16_imgsz448",
         imgsz=448,
         preferred_relative_paths=(
-            Path("yolo11x-pose/yolo11x-pose_imgsz448_fp32.engine"),
-            Path("yolo11x-pose_imgsz448_fp32.engine"),
+            Path("yolo11x-pose/yolo11x-pose_imgsz448_fp16.engine"),
+            Path("yolo11x-pose_imgsz448_fp16.engine"),
         ),
         search_patterns=(
-            "**/yolo11x-pose_imgsz448_fp32.engine",
-            "**/*yolo11x*imgsz448*fp32*.engine",
+            "**/yolo11x-pose_imgsz448_fp16.engine",
+            "**/*yolo11x*imgsz448*fp16*.engine",
         ),
         fallback_paths=(
-            Path("../../quantisation/models/ultralytics/yolo11x-pose/yolo11x-pose_imgsz448_fp32.engine"),
+            Path("../../quantisation/models/ultralytics/yolo11x-pose/yolo11x-pose_imgsz448_fp16.engine"),
         ),
-        output_relative_dir=Path("yolo11x/fp32_imgsz448"),
+        output_relative_dir=Path("yolo11x/fp16_imgsz448"),
     ),
     VariantSpec(
         run_name="yolo11l fp32 imgsz 512",
