@@ -13,6 +13,11 @@ If `urfall-cam0-falls.csv` is present, timing-aware window metrics treat CSV
 rows with phase label >= 0 as belonging to the annotated fall event. This
 matches the observed URFD CSV convention of `-1` for pre-fall, `0` for the
 transition/falling phase, and `1` for the post-fall phase.
+
+MotionBERT checkpoints are detected by `--arch motionbert` /
+`--arch motionbert_action`, by a `.bin` checkpoint suffix, or by `MotionBERT`
+appearing in the checkpoint path. Unless overridden, MotionBERT uses the repo's
+shared `configs/action/MB_ft_UPFall_xsub.yaml` config.
 """
 
 from __future__ import annotations
@@ -45,6 +50,8 @@ try:
     from inference.classifier_adapters import (
         GenericAdapterConfig,
         GenericTemporalAdapter,
+        MotionBERTAdapter,
+        MotionBERTAdapterConfig,
         Prediction,
         TemporalClassifierAdapter,
         _rf_predict_proba_aligned,
@@ -59,6 +66,8 @@ except Exception as exc:  # pragma: no cover - import depends on local runtime e
     _assemble_window = None  # type: ignore[assignment]
     GenericAdapterConfig = None  # type: ignore[assignment]
     GenericTemporalAdapter = None  # type: ignore[assignment]
+    MotionBERTAdapter = None  # type: ignore[assignment]
+    MotionBERTAdapterConfig = None  # type: ignore[assignment]
     Prediction = None  # type: ignore[assignment]
     TemporalClassifierAdapter = None  # type: ignore[assignment]
     _rf_predict_proba_aligned = None  # type: ignore[assignment]
@@ -85,6 +94,7 @@ DEFAULT_FRAME_EXTS = (".png", ".jpg", ".jpeg")
 DEFAULT_TEST_SEQUENCES_PER_CLASS = 5
 DEFAULT_DECISION_SEARCH_MIN_VALUES = (1, 2, 3, 4, 5)
 DEFAULT_DECISION_SEARCH_CSV_NAME = "decision_rule_search.csv"
+DEFAULT_MOTIONBERT_CONFIG = "configs/action/MB_ft_UPFall_xsub.yaml"
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -138,7 +148,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--classifier-model",
         type=Path,
         required=True,
-        help="Path to the existing trained temporal classifier checkpoint or model directory.",
+        help="Path to the existing trained temporal classifier checkpoint or model directory, including MotionBERT *.bin checkpoints.",
     )
     parser.add_argument(
         "--output-dir",
@@ -234,7 +244,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--arch",
         type=str,
         default=None,
-        help="Optional classifier architecture override. Usually inferred from --classifier-model.",
+        help="Optional classifier architecture override. Use motionbert for MotionBERT *.bin checkpoints if needed.",
+    )
+    parser.add_argument(
+        "--motionbert-config",
+        type=str,
+        default=DEFAULT_MOTIONBERT_CONFIG,
+        help=(
+            "MotionBERT config path, resolved relative to the repo root or MotionBERT root when needed. "
+            f"Default: {DEFAULT_MOTIONBERT_CONFIG}."
+        ),
     )
     parser.add_argument(
         "--imgsz",
@@ -647,7 +666,49 @@ def build_pose_pipeline(args: argparse.Namespace, *, device: str, keypoint_weigh
     )
 
 
-def build_classifier_adapter(args: argparse.Namespace, *, device: str) -> GenericTemporalAdapter:
+def normalize_classifier_arch_name(arch: Optional[str]) -> str:
+    return str(arch or "").strip().lower()
+
+
+def is_motionbert_classifier(model_path: Path, arch: Optional[str]) -> bool:
+    arch_name = normalize_classifier_arch_name(arch)
+    if arch_name in {"motionbert", "motionbert_action"}:
+        return True
+
+    if model_path.suffix.lower() == ".bin":
+        return True
+
+    tokens = [model_path.name.lower(), model_path.stem.lower()] + [part.lower() for part in model_path.parts]
+    return any("motionbert" in token for token in tokens)
+
+
+def get_classifier_name(adapter: TemporalClassifierAdapter) -> str:
+    name = getattr(adapter, "arch", None)
+    if name is not None and str(name).strip():
+        return str(name).strip()
+    fallback = getattr(adapter, "name", None)
+    if fallback is not None and str(fallback).strip():
+        return str(fallback).strip()
+    return "unknown"
+
+
+def build_classifier_adapter(args: argparse.Namespace, *, device: str) -> TemporalClassifierAdapter:
+    if is_motionbert_classifier(args.classifier_model, args.arch):
+        return MotionBERTAdapter(
+            MotionBERTAdapterConfig(
+                model_arg=str(args.classifier_model),
+                config_arg=str(args.motionbert_config),
+                device=device,
+                frame_step=max(1, int(args.frame_step)),
+                win_len_raw=int(args.window_size) if args.window_size is not None else None,
+                win_step_raw=int(args.stride) if args.stride is not None else 16,
+                labels_file=None,
+                no_merge_fall=False,
+                missing_conf_thres=0.0,
+                repo_root=_REPO_ROOT,
+            )
+        )
+
     return GenericTemporalAdapter(
         GenericAdapterConfig(
             model_arg=str(args.classifier_model),
@@ -1042,7 +1103,7 @@ def evaluate_sequence(
     sequence: URFDSequence,
     *,
     pose_pipeline: PosePipeline,
-    classifier: GenericTemporalAdapter,
+    classifier: TemporalClassifierAdapter,
     timing_annotation: Optional[URFDFallTimingAnnotation],
     fps: float,
     threshold: float,
@@ -1461,11 +1522,12 @@ def main() -> int:
     resolved_imgsz = float(args.imgsz) if args.imgsz is not None else float(infer_imgsz_from_path(keypoint_weights) or 640.0)
 
     classifier = build_classifier_adapter(args, device=device)
+    classifier_name = get_classifier_name(classifier)
     pose_pipeline = build_pose_pipeline(args, device=device, keypoint_weights=keypoint_weights, imgsz=resolved_imgsz)
 
     LOGGER.info(
         "Using classifier arch=%s | raw window=%d stride=%d | sampled window=%d stride=%d | frame_step=%d",
-        classifier.arch,
+        classifier_name,
         classifier.window_policy.raw_window_len,
         classifier.window_policy.raw_window_stride,
         classifier.window_policy.sampled_window_len,
@@ -1777,7 +1839,9 @@ def main() -> int:
         "optimize_video_decision": bool(args.optimize_video_decision),
         "decision_search_thresholds": decision_search_thresholds,
         "decision_search_min_consecutive_values": decision_search_min_values,
-        "arch": args.arch if args.arch is not None else classifier.arch,
+        "arch": args.arch if args.arch is not None else classifier_name,
+        "classifier_backend": classifier_name,
+        "motionbert_config": str(args.motionbert_config) if is_motionbert_classifier(classifier_model, args.arch) else None,
         "window_size_arg": args.window_size,
         "stride_arg": args.stride,
         "resolved_raw_window_len": int(classifier.window_policy.raw_window_len),
