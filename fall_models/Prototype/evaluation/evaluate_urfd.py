@@ -8,6 +8,11 @@ This script targets the same shared YOLO + GenericTemporalAdapter path used by
 `benchmarks/img_downsize/final_pipelines/...`. It therefore reuses the existing
 pose loader, tracking, feature construction, temporal window assembly, and
 classifier checkpoint loading already present in the repository.
+
+If `urfall-cam0-falls.csv` is present, timing-aware window metrics treat CSV
+rows with phase label >= 0 as belonging to the annotated fall event. This
+matches the observed URFD CSV convention of `-1` for pre-fall, `0` for the
+transition/falling phase, and `1` for the post-fall phase.
 """
 
 from __future__ import annotations
@@ -78,6 +83,8 @@ DEFAULT_MIN_CONSECUTIVE_POSITIVE = 3
 DEFAULT_OUTPUT_DIR = Path("outputs") / "urfd_eval"
 DEFAULT_FRAME_EXTS = (".png", ".jpg", ".jpeg")
 DEFAULT_TEST_SEQUENCES_PER_CLASS = 5
+DEFAULT_DECISION_SEARCH_MIN_VALUES = (1, 2, 3, 4, 5)
+DEFAULT_DECISION_SEARCH_CSV_NAME = "decision_rule_search.csv"
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -93,6 +100,19 @@ class URFDSequence:
     sequence_root: Path
     frame_dir: Path
     frame_paths: Tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class URFDFallTimingAnnotation:
+    csv_video_id: str
+    source_csv: Path
+    event_start_frame: int
+    event_end_frame: int
+    transition_start_frame: Optional[int]
+    transition_end_frame: Optional[int]
+    post_fall_start_frame: Optional[int]
+    post_fall_end_frame: Optional[int]
+    num_rows: int
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -167,6 +187,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MIN_CONSECUTIVE_POSITIVE,
         help="Minimum consecutive positive windows required to mark a sequence as detected_fall. Default: 3.",
+    )
+    parser.add_argument(
+        "--optimize-video-decision",
+        action="store_true",
+        help=(
+            "After inference, sweep threshold and min-consecutive-positive combinations on the saved window scores "
+            "and select the combination with the highest video-level accuracy."
+        ),
+    )
+    parser.add_argument(
+        "--search-thresholds",
+        nargs="*",
+        type=float,
+        default=None,
+        help=(
+            "Optional candidate fall-score thresholds for --optimize-video-decision. "
+            "Defaults to 0.00, 0.05, ..., 1.00."
+        ),
+    )
+    parser.add_argument(
+        "--search-min-consecutive-values",
+        nargs="*",
+        type=int,
+        default=None,
+        help=(
+            "Optional candidate min-consecutive-positive values for --optimize-video-decision. "
+            "Defaults to 1 2 3 4 5."
+        ),
     )
     parser.add_argument(
         "--frame-exts",
@@ -419,6 +467,80 @@ def select_test_sequences(
     return selected
 
 
+def infer_urfd_csv_video_id(video_id: str) -> str:
+    text = str(video_id).strip().lower()
+    match = re.match(r"((?:adl|fall)-\d+)", text)
+    if match is not None:
+        return str(match.group(1))
+    cam_idx = text.find("-cam")
+    if cam_idx > 0:
+        return text[:cam_idx]
+    return text
+
+
+def find_urfd_annotation_csv(urfd_root: Path, filename: str) -> Optional[Path]:
+    candidates = [
+        urfd_root / "Falls" / filename,
+        urfd_root / "falls" / filename,
+        urfd_root / filename,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    matches = sorted(urfd_root.rglob(filename), key=lambda p: natural_sort_key(p.as_posix()))
+    return matches[0] if matches else None
+
+
+def _safe_int_from_csv(value: str) -> Optional[int]:
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def load_urfd_fall_timing_annotations(urfd_root: Path) -> Tuple[Dict[str, URFDFallTimingAnnotation], Optional[Path]]:
+    csv_path = find_urfd_annotation_csv(urfd_root, "urfall-cam0-falls.csv")
+    if csv_path is None:
+        return {}, None
+
+    rows_by_video: Dict[str, List[Tuple[int, int]]] = {}
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.reader(handle):
+            if len(row) < 3:
+                continue
+            csv_video_id = infer_urfd_csv_video_id(row[0])
+            frame_idx = _safe_int_from_csv(row[1])
+            phase_label = _safe_int_from_csv(row[2])
+            if frame_idx is None or phase_label is None:
+                continue
+            rows_by_video.setdefault(csv_video_id, []).append((int(frame_idx), int(phase_label)))
+
+    annotations: Dict[str, URFDFallTimingAnnotation] = {}
+    for csv_video_id, values in rows_by_video.items():
+        values.sort(key=lambda item: item[0])
+        event_frames = [frame for frame, phase in values if phase >= 0]
+        if not event_frames:
+            continue
+        transition_frames = [frame for frame, phase in values if phase == 0]
+        post_fall_frames = [frame for frame, phase in values if phase == 1]
+        annotations[csv_video_id] = URFDFallTimingAnnotation(
+            csv_video_id=csv_video_id,
+            source_csv=csv_path,
+            event_start_frame=int(min(event_frames)),
+            event_end_frame=int(max(event_frames)),
+            transition_start_frame=int(min(transition_frames)) if transition_frames else None,
+            transition_end_frame=int(max(transition_frames)) if transition_frames else None,
+            post_fall_start_frame=int(min(post_fall_frames)) if post_fall_frames else None,
+            post_fall_end_frame=int(max(post_fall_frames)) if post_fall_frames else None,
+            num_rows=int(len(values)),
+        )
+    return annotations, csv_path
+
+
 def infer_imgsz_from_path(weights_path: Path) -> Optional[float]:
     text = weights_path.as_posix().lower()
     match = re.search(r"imgsz[_-]?(\d+)", text)
@@ -443,6 +565,43 @@ def safe_div(num: float, den: float) -> float:
     if den == 0:
         return 0.0
     return float(num) / float(den)
+
+
+def default_decision_search_thresholds() -> List[float]:
+    return [round(0.05 * idx, 4) for idx in range(21)]
+
+
+def normalize_search_thresholds(values: Optional[Sequence[float]], *, configured_threshold: float) -> List[float]:
+    raw_values = list(values) if values else default_decision_search_thresholds()
+    raw_values.append(float(configured_threshold))
+
+    deduped: Dict[float, float] = {}
+    for value in raw_values:
+        if (not math.isfinite(float(value))) or float(value) < 0.0 or float(value) > 1.0:
+            raise ValueError("All decision-search thresholds must be finite values in [0, 1].")
+        key = round(float(value), 6)
+        deduped[key] = float(value)
+
+    normalized = sorted(float(v) for v in deduped.values())
+    if not normalized:
+        raise ValueError("Decision-search threshold grid is empty.")
+    return normalized
+
+
+def normalize_search_min_consecutive_values(
+    values: Optional[Sequence[int]],
+    *,
+    configured_min_consecutive_positive: int,
+) -> List[int]:
+    raw_values = list(values) if values else list(DEFAULT_DECISION_SEARCH_MIN_VALUES)
+    raw_values.append(int(configured_min_consecutive_positive))
+
+    normalized = sorted({int(value) for value in raw_values})
+    if not normalized:
+        raise ValueError("Decision-search min-consecutive-positive grid is empty.")
+    if any(int(value) <= 0 for value in normalized):
+        raise ValueError("All decision-search min-consecutive-positive values must be >= 1.")
+    return normalized
 
 
 def jsonable(value: Any) -> Any:
@@ -591,6 +750,7 @@ def _append_window_row(
     rows: List[Dict[str, Any]],
     *,
     sequence: URFDSequence,
+    timing_annotation: Optional[URFDFallTimingAnnotation],
     window_id: int,
     window_data: Any,
     prediction: Prediction,
@@ -606,6 +766,45 @@ def _append_window_row(
 ) -> None:
     valid_pose_frames = int(np.sum(np.any(window_data.conf_seq > float(conf_thres), axis=1)))
     missing_pose_frames = int(window_data.conf_seq.shape[0] - valid_pose_frames)
+    start_frame_1based = to_human_frame(int(window_data.raw_start_idx))
+    end_frame_1based = to_human_frame(int(window_data.raw_end_idx))
+
+    has_timing_annotation = bool(sequence.video_label == "fall" and timing_annotation is not None)
+    annotated_event_start_frame = None
+    annotated_event_end_frame = None
+    overlaps_annotated_fall_event = False
+    annotated_positive_frames_in_window = 0
+    annotated_phase = "non_event"
+    overlaps_transition_phase = False
+    overlaps_post_fall_phase = False
+
+    if has_timing_annotation and timing_annotation is not None:
+        annotated_event_start_frame = int(timing_annotation.event_start_frame)
+        annotated_event_end_frame = int(timing_annotation.event_end_frame)
+        overlap_start = max(int(start_frame_1based), int(timing_annotation.event_start_frame))
+        overlap_end = min(int(end_frame_1based), int(timing_annotation.event_end_frame))
+        if overlap_start <= overlap_end:
+            overlaps_annotated_fall_event = True
+            annotated_positive_frames_in_window = int(overlap_end - overlap_start + 1)
+
+        if timing_annotation.transition_start_frame is not None and timing_annotation.transition_end_frame is not None:
+            transition_start = max(int(start_frame_1based), int(timing_annotation.transition_start_frame))
+            transition_end = min(int(end_frame_1based), int(timing_annotation.transition_end_frame))
+            overlaps_transition_phase = bool(transition_start <= transition_end)
+
+        if timing_annotation.post_fall_start_frame is not None and timing_annotation.post_fall_end_frame is not None:
+            post_start = max(int(start_frame_1based), int(timing_annotation.post_fall_start_frame))
+            post_end = min(int(end_frame_1based), int(timing_annotation.post_fall_end_frame))
+            overlaps_post_fall_phase = bool(post_start <= post_end)
+
+        if overlaps_transition_phase and overlaps_post_fall_phase:
+            annotated_phase = "mixed_event"
+        elif overlaps_transition_phase:
+            annotated_phase = "transition"
+        elif overlaps_post_fall_phase:
+            annotated_phase = "post_fall"
+        elif overlaps_annotated_fall_event:
+            annotated_phase = "event"
 
     row = {
         "dataset": sequence.dataset,
@@ -613,8 +812,8 @@ def _append_window_row(
         "video_path": str(sequence.frame_dir),
         "video_label": sequence.video_label,
         "window_id": int(window_id),
-        "start_frame": to_human_frame(int(window_data.raw_start_idx)),
-        "end_frame": to_human_frame(int(window_data.raw_end_idx)),
+        "start_frame": int(start_frame_1based),
+        "end_frame": int(end_frame_1based),
         "start_time_s": frame_time_seconds(int(window_data.raw_start_idx), fps),
         "end_time_s": frame_time_seconds(int(window_data.raw_end_idx), fps),
         "num_frames_in_window": int(window_data.raw_end_idx - window_data.raw_start_idx + 1),
@@ -639,10 +838,204 @@ def _append_window_row(
         "temporal_prep_ms": float(prep_metrics.get("temporal_prep_ms", 0.0)),
         "temporal_forward_ms": float(infer_metrics.get("temporal_forward_ms", 0.0)),
         "temporal_total_ms": float(prep_metrics.get("temporal_prep_ms", 0.0)) + float(infer_metrics.get("temporal_forward_ms", 0.0)),
+        "timing_annotation_available": bool(has_timing_annotation),
+        "annotated_event_start_frame": annotated_event_start_frame,
+        "annotated_event_end_frame": annotated_event_end_frame,
+        "annotated_event_start_time_s": (
+            frame_time_seconds(int(annotated_event_start_frame) - 1, fps) if annotated_event_start_frame is not None else None
+        ),
+        "annotated_event_end_time_s": (
+            frame_time_seconds(int(annotated_event_end_frame) - 1, fps) if annotated_event_end_frame is not None else None
+        ),
+        "overlaps_annotated_fall_event": bool(overlaps_annotated_fall_event),
+        "annotated_positive_frames_in_window": int(annotated_positive_frames_in_window),
+        "annotated_phase": str(annotated_phase),
+        "overlaps_transition_phase": bool(overlaps_transition_phase),
+        "overlaps_post_fall_phase": bool(overlaps_post_fall_phase),
     }
     if probs_np is not None:
         row["class_probs"] = json.dumps([float(x) for x in probs_np.tolist()])
     rows.append(row)
+
+
+def compute_video_decision_fields(
+    window_rows: Sequence[Dict[str, Any]],
+    *,
+    video_label: str,
+    annotated_event_start_frame: Optional[int],
+    annotated_event_start_time_s: Optional[float],
+    threshold: float,
+    min_consecutive_positive: int,
+    apply_to_rows: bool,
+) -> Dict[str, Any]:
+    ordered_rows = sorted(window_rows, key=lambda row: int(row.get("window_id", 0)))
+
+    consecutive_positive = 0
+    detected_fall = False
+    detection_run_start_row: Optional[Dict[str, Any]] = None
+    max_fall_score = 0.0
+    num_positive_windows = 0
+    first_positive_window_id: Optional[int] = None
+    timing_hit_row: Optional[Dict[str, Any]] = None
+
+    for idx, row in enumerate(ordered_rows):
+        fall_score = float(row.get("fall_score", 0.0))
+        is_positive = bool(fall_score >= float(threshold))
+
+        if is_positive:
+            num_positive_windows += 1
+            consecutive_positive += 1
+            if first_positive_window_id is None:
+                first_positive_window_id = int(row["window_id"])
+            if timing_hit_row is None and bool(row.get("overlaps_annotated_fall_event", False)):
+                timing_hit_row = row
+        else:
+            consecutive_positive = 0
+
+        max_fall_score = max(max_fall_score, fall_score)
+
+        if (not detected_fall) and consecutive_positive >= int(min_consecutive_positive):
+            detected_fall = True
+            start_idx = max(0, idx - int(min_consecutive_positive) + 1)
+            detection_run_start_row = ordered_rows[start_idx]
+
+        if apply_to_rows:
+            row["threshold"] = float(threshold)
+            row["is_positive"] = bool(is_positive)
+            row["consecutive_positive_count"] = int(consecutive_positive)
+            row["event_decision"] = bool(detected_fall)
+
+    first_detection_frame: Optional[int] = None
+    first_detection_time_s: Optional[float] = None
+    first_detection_window_id: Optional[int] = None
+    if detection_run_start_row is not None:
+        first_detection_window_id = int(detection_run_start_row["window_id"])
+        first_detection_frame = int(detection_run_start_row["start_frame"])
+        first_detection_time_s = float(detection_run_start_row["start_time_s"])
+
+    timing_hit = timing_hit_row is not None
+    first_timing_hit_window_id: Optional[int] = None
+    first_timing_hit_frame: Optional[int] = None
+    first_timing_hit_time_s: Optional[float] = None
+    first_timing_hit_delay_frames: Optional[int] = None
+    first_timing_hit_delay_s: Optional[float] = None
+
+    if timing_hit_row is not None:
+        first_timing_hit_window_id = int(timing_hit_row["window_id"])
+        first_timing_hit_frame = int(timing_hit_row["start_frame"])
+        first_timing_hit_time_s = float(timing_hit_row["start_time_s"])
+        if annotated_event_start_frame is not None and annotated_event_start_time_s is not None:
+            first_timing_hit_delay_frames = int(first_timing_hit_frame - int(annotated_event_start_frame))
+            first_timing_hit_delay_s = float(first_timing_hit_time_s - float(annotated_event_start_time_s))
+
+    is_true_fall = str(video_label) == "fall"
+    if is_true_fall and detected_fall:
+        outcome = "TP"
+    elif (not is_true_fall) and (not detected_fall):
+        outcome = "TN"
+    elif (not is_true_fall) and detected_fall:
+        outcome = "FP"
+    else:
+        outcome = "FN"
+
+    return {
+        "num_positive_windows": int(num_positive_windows),
+        "max_fall_score": float(max_fall_score),
+        "first_positive_window_id": first_positive_window_id,
+        "first_detection_frame": first_detection_frame,
+        "first_detection_time_s": first_detection_time_s,
+        "detected_fall": bool(detected_fall),
+        "outcome": outcome,
+        "first_detection_window_id": first_detection_window_id,
+        "timing_hit": bool(timing_hit),
+        "first_timing_hit_window_id": first_timing_hit_window_id,
+        "first_timing_hit_frame": first_timing_hit_frame,
+        "first_timing_hit_time_s": first_timing_hit_time_s,
+        "first_timing_hit_delay_frames": first_timing_hit_delay_frames,
+        "first_timing_hit_delay_s": first_timing_hit_delay_s,
+    }
+
+
+def build_video_summary_for_decision(
+    base_video_summary: Dict[str, Any],
+    *,
+    window_rows: Sequence[Dict[str, Any]],
+    threshold: float,
+    min_consecutive_positive: int,
+    apply_to_rows: bool,
+) -> Dict[str, Any]:
+    summary = dict(base_video_summary)
+    summary.update(
+        compute_video_decision_fields(
+            window_rows,
+            video_label=str(summary.get("video_label", "")),
+            annotated_event_start_frame=summary.get("annotated_event_start_frame"),
+            annotated_event_start_time_s=summary.get("annotated_event_start_time_s"),
+            threshold=float(threshold),
+            min_consecutive_positive=int(min_consecutive_positive),
+            apply_to_rows=apply_to_rows,
+        )
+    )
+    return summary
+
+
+def search_best_video_decision(
+    sequence_results: Sequence[Dict[str, Any]],
+    *,
+    thresholds: Sequence[float],
+    min_consecutive_values: Sequence[int],
+    configured_threshold: float,
+    configured_min_consecutive_positive: int,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    search_rows: List[Dict[str, Any]] = []
+
+    for threshold in thresholds:
+        for min_consecutive_positive in min_consecutive_values:
+            video_rows = [
+                build_video_summary_for_decision(
+                    dict(result["base_video_summary"]),
+                    window_rows=result["window_rows"],
+                    threshold=float(threshold),
+                    min_consecutive_positive=int(min_consecutive_positive),
+                    apply_to_rows=False,
+                )
+                for result in sequence_results
+            ]
+            metrics = compute_metrics(video_rows)
+            search_rows.append(
+                {
+                    "threshold": float(threshold),
+                    "min_consecutive_positive": int(min_consecutive_positive),
+                    "accuracy": float(metrics["accuracy"]),
+                    "balanced_accuracy": float(metrics["balanced_accuracy"]),
+                    "f1": float(metrics["f1"]),
+                    "precision": float(metrics["precision"]),
+                    "recall": float(metrics["recall"]),
+                    "specificity": float(metrics["specificity"]),
+                    "tp": int(metrics["tp"]),
+                    "tn": int(metrics["tn"]),
+                    "fp": int(metrics["fp"]),
+                    "fn": int(metrics["fn"]),
+                    "num_videos": int(metrics["num_videos"]),
+                }
+            )
+
+    if not search_rows:
+        raise RuntimeError("Decision-rule search produced no candidate combinations.")
+
+    best_row = max(
+        search_rows,
+        key=lambda row: (
+            float(row["accuracy"]),
+            float(row["balanced_accuracy"]),
+            float(row["f1"]),
+            -abs(float(row["threshold"]) - float(configured_threshold)),
+            -abs(int(row["min_consecutive_positive"]) - int(configured_min_consecutive_positive)),
+            -float(row["threshold"]),
+            -int(row["min_consecutive_positive"]),
+        ),
+    )
+    return dict(best_row), search_rows
 
 
 def evaluate_sequence(
@@ -650,6 +1043,7 @@ def evaluate_sequence(
     *,
     pose_pipeline: PosePipeline,
     classifier: GenericTemporalAdapter,
+    timing_annotation: Optional[URFDFallTimingAnnotation],
     fps: float,
     threshold: float,
     min_consecutive_positive: int,
@@ -722,6 +1116,7 @@ def evaluate_sequence(
             _append_window_row(
                 window_rows,
                 sequence=sequence,
+                timing_annotation=timing_annotation,
                 window_id=next_window_id,
                 window_data=window_data,
                 prediction=prediction,
@@ -761,6 +1156,7 @@ def evaluate_sequence(
             _append_window_row(
                 window_rows,
                 sequence=sequence,
+                timing_annotation=timing_annotation,
                 window_id=next_window_id,
                 window_data=window_data,
                 prediction=prediction,
@@ -777,70 +1173,29 @@ def evaluate_sequence(
             next_window_id += 1
             next_window_start += int(policy.sampled_window_stride)
 
-    consecutive_positive = 0
-    detected_fall = False
-    detection_run_start_row: Optional[Dict[str, Any]] = None
-    max_fall_score = 0.0
-    num_positive_windows = 0
+    annotated_event_start_frame: Optional[int] = None
+    annotated_event_end_frame: Optional[int] = None
+    annotated_event_start_time_s: Optional[float] = None
+    annotated_event_end_time_s: Optional[float] = None
 
-    for idx, row in enumerate(window_rows):
-        is_positive = bool(row["is_positive"])
-        if is_positive:
-            num_positive_windows += 1
-            consecutive_positive += 1
-        else:
-            consecutive_positive = 0
+    if timing_annotation is not None and sequence.video_label == "fall":
+        annotated_event_start_frame = int(timing_annotation.event_start_frame)
+        annotated_event_end_frame = int(timing_annotation.event_end_frame)
+        annotated_event_start_time_s = frame_time_seconds(int(annotated_event_start_frame) - 1, fps)
+        annotated_event_end_time_s = frame_time_seconds(int(annotated_event_end_frame) - 1, fps)
 
-        row["consecutive_positive_count"] = int(consecutive_positive)
-        max_fall_score = max(max_fall_score, float(row["fall_score"]))
-
-        if (not detected_fall) and consecutive_positive >= int(min_consecutive_positive):
-            detected_fall = True
-            start_idx = idx - int(min_consecutive_positive) + 1
-            if start_idx < 0:
-                start_idx = 0
-            detection_run_start_row = window_rows[start_idx]
-        row["event_decision"] = bool(detected_fall)
-
-    first_positive_window_id: Optional[int] = None
-    for row in window_rows:
-        if bool(row["is_positive"]):
-            first_positive_window_id = int(row["window_id"])
-            break
-
-    first_detection_frame: Optional[int] = None
-    first_detection_time_s: Optional[float] = None
-    first_detection_window_id: Optional[int] = None
-    if detection_run_start_row is not None:
-        first_detection_window_id = int(detection_run_start_row["window_id"])
-        first_detection_frame = int(detection_run_start_row["start_frame"])
-        first_detection_time_s = float(detection_run_start_row["start_time_s"])
-
-    is_true_fall = sequence.video_label == "fall"
-    if is_true_fall and detected_fall:
-        outcome = "TP"
-    elif (not is_true_fall) and (not detected_fall):
-        outcome = "TN"
-    elif (not is_true_fall) and detected_fall:
-        outcome = "FP"
-    else:
-        outcome = "FN"
-
-    video_summary = {
+    base_video_summary = {
         "dataset": sequence.dataset,
         "video_id": sequence.video_id,
         "video_path": str(sequence.frame_dir),
         "video_label": sequence.video_label,
         "num_frames": int(len(sequence.frame_paths)),
         "num_windows": int(len(window_rows)),
-        "num_positive_windows": int(num_positive_windows),
-        "max_fall_score": float(max_fall_score),
-        "first_positive_window_id": first_positive_window_id,
-        "first_detection_frame": first_detection_frame,
-        "first_detection_time_s": first_detection_time_s,
-        "detected_fall": bool(detected_fall),
-        "outcome": outcome,
-        "first_detection_window_id": first_detection_window_id,
+        "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
+        "annotated_event_start_frame": annotated_event_start_frame,
+        "annotated_event_end_frame": annotated_event_end_frame,
+        "annotated_event_start_time_s": annotated_event_start_time_s,
+        "annotated_event_end_time_s": annotated_event_end_time_s,
         "num_readable_frames": int(readable_frames),
         "num_unreadable_frames": int(unreadable_frames),
         "pose_found_frames": int(pose_found_frames),
@@ -848,6 +1203,13 @@ def evaluate_sequence(
         "sequence_root": str(sequence.sequence_root),
         "frame_dir": str(sequence.frame_dir),
     }
+    video_summary = build_video_summary_for_decision(
+        base_video_summary,
+        window_rows=window_rows,
+        threshold=float(threshold),
+        min_consecutive_positive=int(min_consecutive_positive),
+        apply_to_rows=True,
+    )
     return window_rows, video_summary
 
 
@@ -881,9 +1243,104 @@ def compute_metrics(video_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def print_metrics(metrics: Dict[str, Any]) -> None:
+def compute_timing_window_metrics(window_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    eligible_rows: List[Dict[str, Any]] = []
+    for row in window_rows:
+        video_label = str(row.get("video_label", ""))
+        if video_label == "non_fall":
+            eligible_rows.append(row)
+            continue
+        if bool(row.get("timing_annotation_available", False)):
+            eligible_rows.append(row)
+
+    tp = 0
+    tn = 0
+    fp = 0
+    fn = 0
+    positive_gt = 0
+    negative_gt = 0
+
+    for row in eligible_rows:
+        pred_positive = bool(row.get("is_positive", False))
+        gt_positive = bool(row.get("overlaps_annotated_fall_event", False))
+        if gt_positive:
+            positive_gt += 1
+        else:
+            negative_gt += 1
+
+        if pred_positive and gt_positive:
+            tp += 1
+        elif (not pred_positive) and (not gt_positive):
+            tn += 1
+        elif pred_positive and (not gt_positive):
+            fp += 1
+        else:
+            fn += 1
+
+    precision = safe_div(tp, tp + fp)
+    recall = safe_div(tp, tp + fn)
+    specificity = safe_div(tn, tn + fp)
+
+    metrics = {
+        "tp": int(tp),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "accuracy": float(safe_div(tp + tn, tp + tn + fp + fn)),
+        "precision": float(precision),
+        "recall": float(recall),
+        "specificity": float(specificity),
+        "f1": float(safe_div(2.0 * precision * recall, precision + recall)),
+        "balanced_accuracy": float(0.5 * (recall + specificity)),
+        "num_windows_scored": int(len(eligible_rows)),
+        "num_positive_gt_windows": int(positive_gt),
+        "num_negative_gt_windows": int(negative_gt),
+        "num_fall_windows_with_timing_annotations": int(
+            sum(
+                1
+                for row in eligible_rows
+                if str(row.get("video_label", "")) == "fall" and bool(row.get("timing_annotation_available", False))
+            )
+        ),
+        "num_non_fall_windows": int(
+            sum(1 for row in eligible_rows if str(row.get("video_label", "")) == "non_fall")
+        ),
+    }
+    return metrics
+
+
+def print_decision_search_summary(
+    *,
+    configured_threshold: float,
+    configured_min_consecutive_positive: int,
+    configured_metrics: Dict[str, Any],
+    best_search_row: Dict[str, Any],
+    num_combinations: int,
+) -> None:
     print()
-    print("URFD video-level metrics")
+    print("Decision-rule search")
+    print(f"  Evaluated {num_combinations} threshold/min-consecutive combinations.")
+    print(
+        "  Configured: "
+        f"threshold={float(configured_threshold):.4f} "
+        f"min_consecutive_positive={int(configured_min_consecutive_positive)} "
+        f"accuracy={float(configured_metrics['accuracy']):.4f}"
+    )
+    print(
+        "  Selected:   "
+        f"threshold={float(best_search_row['threshold']):.4f} "
+        f"min_consecutive_positive={int(best_search_row['min_consecutive_positive'])} "
+        f"accuracy={float(best_search_row['accuracy']):.4f}"
+    )
+    print(
+        "  Tie-breaks: balanced_accuracy, f1, closeness to the configured values, "
+        "then smaller threshold/min-consecutive."
+    )
+
+
+def print_metric_block(title: str, metrics: Dict[str, Any]) -> None:
+    print()
+    print(title)
     print(f"  TP: {metrics['tp']}  TN: {metrics['tn']}  FP: {metrics['fp']}  FN: {metrics['fn']}")
     print(f"  Accuracy:           {metrics['accuracy']:.4f}")
     print(f"  Precision:          {metrics['precision']:.4f}")
@@ -891,6 +1348,10 @@ def print_metrics(metrics: Dict[str, Any]) -> None:
     print(f"  Specificity:        {metrics['specificity']:.4f}")
     print(f"  F1:                 {metrics['f1']:.4f}")
     print(f"  Balanced accuracy:  {metrics['balanced_accuracy']:.4f}")
+
+
+def print_metrics(metrics: Dict[str, Any]) -> None:
+    print_metric_block("URFD video-level metrics", metrics)
 
 
 def main() -> int:
@@ -914,6 +1375,14 @@ def main() -> int:
         raise ValueError("--threshold must be a finite value in [0, 1].")
     if int(args.min_consecutive_positive) <= 0:
         raise ValueError("--min-consecutive-positive must be >= 1.")
+    if args.search_thresholds is not None:
+        for value in args.search_thresholds:
+            if (not math.isfinite(float(value))) or float(value) < 0.0 or float(value) > 1.0:
+                raise ValueError("--search-thresholds values must be finite values in [0, 1].")
+    if args.search_min_consecutive_values is not None:
+        for value in args.search_min_consecutive_values:
+            if int(value) <= 0:
+                raise ValueError("--search-min-consecutive-values values must be >= 1.")
     if int(args.frame_step) <= 0:
         raise ValueError("--frame-step must be >= 1.")
     if int(args.max_people) <= 0:
@@ -964,6 +1433,30 @@ def main() -> int:
             f"(limit {DEFAULT_TEST_SEQUENCES_PER_CLASS} per class)."
         )
 
+    timing_annotations, timing_annotation_csv = load_urfd_fall_timing_annotations(urfd_root)
+    if timing_annotation_csv is not None:
+        matched_timing_annotations_all = sum(
+            1
+            for seq in sequences_all
+            if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
+        )
+        matched_timing_annotations_selected = sum(
+            1
+            for seq in sequences
+            if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
+        )
+        print(
+            "Loaded fall timing annotations for "
+            f"{len(timing_annotations)} fall sequences from {timing_annotation_csv}"
+        )
+        print(
+            "Matched timing annotations for "
+            f"{matched_timing_annotations_selected}/{num_fall} selected Fall sequences "
+            f"({matched_timing_annotations_all}/{num_fall_all} across the full discovery set)."
+        )
+    else:
+        print("No URFD fall timing CSV was found. Timing-aware window metrics will be skipped.")
+
     device = pick_device(args.device)
     resolved_imgsz = float(args.imgsz) if args.imgsz is not None else float(infer_imgsz_from_path(keypoint_weights) or 640.0)
 
@@ -981,16 +1474,17 @@ def main() -> int:
     )
     LOGGER.info("Using pose imgsz=%s on device=%s", f"{resolved_imgsz:g}", device)
 
-    window_rows_all: List[Dict[str, Any]] = []
-    video_rows: List[Dict[str, Any]] = []
+    sequence_results: List[Dict[str, Any]] = []
 
     start_time = time.perf_counter()
     seq_iter: Iterable[URFDSequence] = iter_progress(sequences, desc="URFD sequences", total=len(sequences), leave=True)
     for sequence in seq_iter:
         if len(sequence.frame_paths) == 0:
             LOGGER.warning("Sequence has no frames: %s", sequence.frame_dir)
-            video_rows.append(
+            sequence_results.append(
                 {
+                    "window_rows": [],
+                    "base_video_summary": {
                     "dataset": sequence.dataset,
                     "video_id": sequence.video_id,
                     "video_path": str(sequence.frame_dir),
@@ -1011,6 +1505,7 @@ def main() -> int:
                     "sampled_pose_found_frames": 0,
                     "sequence_root": str(sequence.sequence_root),
                     "frame_dir": str(sequence.frame_dir),
+                    },
                 }
             )
             continue
@@ -1020,14 +1515,17 @@ def main() -> int:
                 sequence,
                 pose_pipeline=pose_pipeline,
                 classifier=classifier,
+                timing_annotation=timing_annotations.get(infer_urfd_csv_video_id(sequence.video_id)),
                 fps=float(args.fps),
                 threshold=float(args.threshold),
                 min_consecutive_positive=int(args.min_consecutive_positive),
             )
         except Exception as exc:
             LOGGER.warning("Failed to evaluate %s: %s", sequence.video_id, exc)
-            video_rows.append(
+            sequence_results.append(
                 {
+                    "window_rows": [],
+                    "base_video_summary": {
                     "dataset": sequence.dataset,
                     "video_id": sequence.video_id,
                     "video_path": str(sequence.frame_dir),
@@ -1049,23 +1547,83 @@ def main() -> int:
                     "sequence_root": str(sequence.sequence_root),
                     "frame_dir": str(sequence.frame_dir),
                     "warning": str(exc),
+                    },
                 }
             )
             continue
 
-        window_rows_all.extend(window_rows)
-        video_rows.append(video_summary)
+        sequence_results.append(
+            {
+                "window_rows": window_rows,
+                "base_video_summary": dict(video_summary),
+            }
+        )
 
     elapsed_s = time.perf_counter() - start_time
 
+    window_rows_all = [row for result in sequence_results for row in result["window_rows"]]
+    video_rows = [dict(result["base_video_summary"]) for result in sequence_results]
+    configured_metrics = compute_metrics(video_rows)
+    configured_metrics["elapsed_s"] = float(elapsed_s)
+
+    selected_threshold = float(args.threshold)
+    selected_min_consecutive_positive = int(args.min_consecutive_positive)
+    decision_search_rows: Optional[List[Dict[str, Any]]] = None
+    decision_search_best_row: Optional[Dict[str, Any]] = None
+    decision_search_thresholds: List[float] = normalize_search_thresholds(
+        args.search_thresholds,
+        configured_threshold=float(args.threshold),
+    )
+    decision_search_min_values: List[int] = normalize_search_min_consecutive_values(
+        args.search_min_consecutive_values,
+        configured_min_consecutive_positive=int(args.min_consecutive_positive),
+    )
+
+    if bool(args.optimize_video_decision):
+        decision_search_best_row, decision_search_rows = search_best_video_decision(
+            sequence_results,
+            thresholds=decision_search_thresholds,
+            min_consecutive_values=decision_search_min_values,
+            configured_threshold=float(args.threshold),
+            configured_min_consecutive_positive=int(args.min_consecutive_positive),
+        )
+        selected_threshold = float(decision_search_best_row["threshold"])
+        selected_min_consecutive_positive = int(decision_search_best_row["min_consecutive_positive"])
+
+        video_rows = []
+        for result in sequence_results:
+            video_rows.append(
+                build_video_summary_for_decision(
+                    dict(result["base_video_summary"]),
+                    window_rows=result["window_rows"],
+                    threshold=float(selected_threshold),
+                    min_consecutive_positive=int(selected_min_consecutive_positive),
+                    apply_to_rows=True,
+                )
+            )
+        window_rows_all = [row for result in sequence_results for row in result["window_rows"]]
+    else:
+        for result in sequence_results:
+            build_video_summary_for_decision(
+                dict(result["base_video_summary"]),
+                window_rows=result["window_rows"],
+                threshold=float(selected_threshold),
+                min_consecutive_positive=int(selected_min_consecutive_positive),
+                apply_to_rows=True,
+            )
+
     metrics = compute_metrics(video_rows)
     metrics["elapsed_s"] = float(elapsed_s)
+    timing_window_metrics: Optional[Dict[str, Any]] = None
+    if timing_annotation_csv is not None:
+        timing_window_metrics = compute_timing_window_metrics(window_rows_all)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     window_csv_path = output_dir / "window_predictions.csv"
     video_csv_path = output_dir / "video_summary.csv"
     metrics_json_path = output_dir / "metrics.json"
     run_config_path = output_dir / "run_config.json"
+    decision_search_csv_path = output_dir / DEFAULT_DECISION_SEARCH_CSV_NAME
 
     window_fieldnames = [
         "dataset",
@@ -1100,6 +1658,16 @@ def main() -> int:
         "temporal_forward_ms",
         "temporal_total_ms",
         "class_probs",
+        "timing_annotation_available",
+        "annotated_event_start_frame",
+        "annotated_event_end_frame",
+        "annotated_event_start_time_s",
+        "annotated_event_end_time_s",
+        "overlaps_annotated_fall_event",
+        "annotated_positive_frames_in_window",
+        "annotated_phase",
+        "overlaps_transition_phase",
+        "overlaps_post_fall_phase",
     ]
     video_fieldnames = [
         "dataset",
@@ -1116,6 +1684,17 @@ def main() -> int:
         "detected_fall",
         "outcome",
         "first_detection_window_id",
+        "timing_annotation_available",
+        "annotated_event_start_frame",
+        "annotated_event_end_frame",
+        "annotated_event_start_time_s",
+        "annotated_event_end_time_s",
+        "timing_hit",
+        "first_timing_hit_window_id",
+        "first_timing_hit_frame",
+        "first_timing_hit_time_s",
+        "first_timing_hit_delay_frames",
+        "first_timing_hit_delay_s",
         "num_readable_frames",
         "num_unreadable_frames",
         "pose_found_frames",
@@ -1127,9 +1706,60 @@ def main() -> int:
 
     write_csv(window_csv_path, window_rows_all, window_fieldnames)
     write_csv(video_csv_path, video_rows, video_fieldnames)
+    if decision_search_rows is not None:
+        write_csv(
+            decision_search_csv_path,
+            decision_search_rows,
+            [
+                "threshold",
+                "min_consecutive_positive",
+                "accuracy",
+                "balanced_accuracy",
+                "f1",
+                "precision",
+                "recall",
+                "specificity",
+                "tp",
+                "tn",
+                "fp",
+                "fn",
+                "num_videos",
+            ],
+        )
 
     with metrics_json_path.open("w", encoding="utf-8") as handle:
-        json.dump(metrics, handle, indent=2)
+        json.dump(
+            {
+                "video_level_metrics": metrics,
+                "timing_window_metrics": timing_window_metrics,
+                "configured_video_level_metrics": configured_metrics if bool(args.optimize_video_decision) else None,
+                "decision_rule_search": {
+                    "enabled": bool(args.optimize_video_decision),
+                    "selection_metric": "accuracy",
+                    "search_thresholds": decision_search_thresholds,
+                    "search_min_consecutive_values": decision_search_min_values,
+                    "configured_threshold": float(args.threshold),
+                    "configured_min_consecutive_positive": int(args.min_consecutive_positive),
+                    "selected_threshold": float(selected_threshold),
+                    "selected_min_consecutive_positive": int(selected_min_consecutive_positive),
+                    "num_combinations_evaluated": int(len(decision_search_rows or [])),
+                    "search_results_csv": (
+                        str(decision_search_csv_path) if decision_search_rows is not None else None
+                    ),
+                    "best_result": decision_search_best_row,
+                    "tie_breakers": [
+                        "balanced_accuracy",
+                        "f1",
+                        "closeness_to_configured_threshold",
+                        "closeness_to_configured_min_consecutive_positive",
+                        "lower_threshold",
+                        "lower_min_consecutive_positive",
+                    ],
+                },
+            },
+            handle,
+            indent=2,
+        )
 
     run_config = {
         "urfd_root": str(urfd_root),
@@ -1142,6 +1772,11 @@ def main() -> int:
         "fps": float(args.fps),
         "threshold": float(args.threshold),
         "min_consecutive_positive": int(args.min_consecutive_positive),
+        "selected_threshold": float(selected_threshold),
+        "selected_min_consecutive_positive": int(selected_min_consecutive_positive),
+        "optimize_video_decision": bool(args.optimize_video_decision),
+        "decision_search_thresholds": decision_search_thresholds,
+        "decision_search_min_consecutive_values": decision_search_min_values,
         "arch": args.arch if args.arch is not None else classifier.arch,
         "window_size_arg": args.window_size,
         "stride_arg": args.stride,
@@ -1162,6 +1797,23 @@ def main() -> int:
         "track_target_y_frac": float(args.track_target_y_frac),
         "classifier_class_names": list(classifier.class_names),
         "dataset_name": DATASET_NAME,
+        "timing_annotation_csv": None if timing_annotation_csv is None else str(timing_annotation_csv),
+        "num_timing_annotations_loaded": int(len(timing_annotations)),
+        "num_timing_annotations_matched_selected_fall_sequences": int(
+            sum(
+                1
+                for seq in sequences
+                if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
+            )
+        ),
+        "num_timing_annotations_matched_all_fall_sequences": int(
+            sum(
+                1
+                for seq in sequences_all
+                if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
+            )
+        ),
+        "timing_ground_truth_positive_rule": "window overlaps annotated frames where urfall-cam0-falls.csv phase_label >= 0",
         "test_mode": bool(args.test),
         "test_sequences_per_class": int(DEFAULT_TEST_SEQUENCES_PER_CLASS),
         "num_sequences_found_total": int(len(sequences_all)),
@@ -1174,13 +1826,29 @@ def main() -> int:
     with run_config_path.open("w", encoding="utf-8") as handle:
         json.dump(jsonable(run_config), handle, indent=2)
 
+    if bool(args.optimize_video_decision) and decision_search_best_row is not None:
+        print_decision_search_summary(
+            configured_threshold=float(args.threshold),
+            configured_min_consecutive_positive=int(args.min_consecutive_positive),
+            configured_metrics=configured_metrics,
+            best_search_row=decision_search_best_row,
+            num_combinations=int(len(decision_search_rows or [])),
+        )
     print_metrics(metrics)
+    if timing_window_metrics is not None:
+        print_metric_block("URFD timing-aware window metrics", timing_window_metrics)
+        print(
+            "  Timing GT positives are windows overlapping the annotated fall interval "
+            "from urfall-cam0-falls.csv."
+        )
     print()
     print("Outputs")
     print(f"  Window CSV:  {window_csv_path}")
     print(f"  Video CSV:   {video_csv_path}")
     print(f"  Metrics:     {metrics_json_path}")
     print(f"  Run config:  {run_config_path}")
+    if decision_search_rows is not None:
+        print(f"  Search CSV:  {decision_search_csv_path}")
     return 0
 
 
