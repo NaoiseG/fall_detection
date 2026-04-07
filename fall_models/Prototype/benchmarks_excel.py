@@ -6,20 +6,32 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
-from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
+try:
+    from openpyxl import load_workbook
+except ImportError as exc:  # pragma: no cover - environment-specific dependency
+    load_workbook = None
+    OPENPYXL_IMPORT_ERROR = exc
+else:
+    OPENPYXL_IMPORT_ERROR = None
+
+if TYPE_CHECKING:
+    from openpyxl.worksheet.worksheet import Worksheet
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-DEFAULT_BENCHMARK_ROOT = Path("benchmarks")
-DEFAULT_WORKBOOK_PATH = Path(r"..\..\..\Conference\Metrics.xlsx")
-PRUNED_BENCHMARK_ROOT = Path("benchmarks/pruned_models")
-PRUNED_WORKBOOK_PATH = Path(r"..\..\..\Conference\Pruning_Metrics.xlsx")
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_BENCHMARK_ROOT = SCRIPT_DIR / "benchmarks"
+DEFAULT_WORKBOOK_PATH = SCRIPT_DIR / Path(r"..\..\..\Conference\Metrics.xlsx")
+PRUNED_BENCHMARK_ROOT = SCRIPT_DIR / "benchmarks/pruned_models"
+PRUNED_WORKBOOK_PATH = SCRIPT_DIR / Path(r"..\..\..\Conference\Initial_Pruning_Metrics.xlsx")
+FULL_PRUNED_BENCHMARK_ROOT = SCRIPT_DIR / "benchmarks/pruned_models/full_pruned"
+FULL_PRUNED_WORKBOOK_PATH = SCRIPT_DIR / Path(r"..\..\..\Conference\Full_Metrics.xlsx")
 SHEET_NAME = "Metrics Tracker"
 HEADER_ROW = 4
 
@@ -61,6 +73,12 @@ PRUNED_VERSION_FOLDERS = {
     "pruned_90",
 }
 
+FULL_PRUNED_PRECISION_FOLDERS = {
+    "fp32",
+    "fp16",
+    "int8",
+}
+
 PRUNED_WRITABLE_METRIC_KEYS = {
     "fps",
     "inference_time",
@@ -70,6 +88,15 @@ PRUNED_WRITABLE_METRIC_KEYS = {
     "temperature",
     "power_draw",
 }
+
+FULL_PRUNED_MOTIONBERT_EXTRA_MS = 23.0
+FULL_PRUNED_MOTIONBERT_CLEAR_KEYS = (
+    "cpu_usage",
+    "gpu_usage",
+    "memory_usage",
+    "temperature",
+    "power_draw",
+)
 
 
 # =============================================================================
@@ -86,6 +113,8 @@ class BenchmarkRecord:
     classifier_excel: str
     run_dir: Path
     summary_json: Path
+    metric_strategy: str = "direct"
+    clear_metric_keys: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -128,6 +157,14 @@ def info(message: str) -> None:
 
 def warn(message: str) -> None:
     print(f"WARNING: {message}")
+
+
+def ensure_openpyxl_available() -> None:
+    if load_workbook is None:
+        raise RuntimeError(
+            "openpyxl is required to update the workbook. "
+            "Install it with: pip install openpyxl"
+        ) from OPENPYXL_IMPORT_ERROR
 
 
 # =============================================================================
@@ -289,6 +326,32 @@ def extract_metrics(summary: dict) -> Metrics:
     )
 
 
+def apply_metric_strategy(metrics: Metrics, strategy: str) -> Metrics:
+    if strategy == "direct":
+        return metrics
+
+    if strategy == "motionbert_from_cnnlstm":
+        inference_time = metrics.inference_time_per_frame_ms
+        if inference_time is None:
+            derived_inference_time = None
+            derived_fps = None
+        else:
+            derived_inference_time = inference_time + FULL_PRUNED_MOTIONBERT_EXTRA_MS
+            derived_fps = 1000.0 / derived_inference_time if derived_inference_time > 0.0 else None
+
+        return Metrics(
+            avg_fps=derived_fps,
+            inference_time_per_frame_ms=derived_inference_time,
+            avg_cpu_pct=None,
+            avg_gpu_pct=None,
+            avg_ram_pct=None,
+            avg_temp_c=None,
+            avg_power_w=None,
+        )
+
+    raise ValueError(f"Unsupported metric strategy: {strategy}")
+
+
 # =============================================================================
 # Folder parsing
 # =============================================================================
@@ -339,11 +402,105 @@ def map_version(version_folder_name: str, mode: str) -> Optional[str]:
     raise ValueError(f"Unsupported mode: {mode}")
 
 
+def parse_full_pruned_pose_folder(folder_name: str) -> Optional[Tuple[str, str]]:
+    match = re.fullmatch(r"(yolo11[nsmlx])_pruned_(80|90)", folder_name.strip().lower())
+    if match is None:
+        return None
+    pose_model = f"{match.group(1)}-pose"
+    prune_level = match.group(2)
+    return pose_model, prune_level
+
+
+def map_full_pruned_version(prune_level: str, precision_folder: str) -> Optional[str]:
+    precision = precision_folder.strip().lower()
+    if precision not in FULL_PRUNED_PRECISION_FOLDERS:
+        return None
+    return f"Pruned_{prune_level}\n{precision.upper()}"
+
+
+def scan_full_pruned_records(
+    benchmark_root: Path,
+    stats: Stats,
+) -> List[BenchmarkRecord]:
+    records: List[BenchmarkRecord] = []
+
+    if not benchmark_root.exists():
+        raise FileNotFoundError(f"Benchmark root not found: {benchmark_root}")
+    if not benchmark_root.is_dir():
+        raise NotADirectoryError(f"Benchmark root is not a directory: {benchmark_root}")
+
+    for pose_model_dir in sorted(p for p in benchmark_root.iterdir() if p.is_dir()):
+        parsed_pose = parse_full_pruned_pose_folder(pose_model_dir.name)
+        if parsed_pose is None:
+            warn(f"Skipping unknown pose model folder for mode=full-pruned: {pose_model_dir}")
+            stats.parse_failures += 1
+            continue
+
+        pose_model_excel, prune_level = parsed_pose
+
+        for precision_dir in sorted(p for p in pose_model_dir.iterdir() if p.is_dir()):
+            version_excel = map_full_pruned_version(prune_level, precision_dir.name)
+            if version_excel is None:
+                warn(f"Skipping unknown version folder for mode=full-pruned: {precision_dir}")
+                stats.parse_failures += 1
+                continue
+
+            for run_dir in sorted(p for p in precision_dir.iterdir() if p.is_dir()):
+                stats.folders_scanned += 1
+
+                summary_json = run_dir / "summary.json"
+                if not summary_json.exists():
+                    warn(f"Missing summary.json: {summary_json}")
+                    stats.missing_summary += 1
+                    continue
+
+                source_classifier_raw = parse_classifier(run_dir.name)
+                if source_classifier_raw != "cnnlstm":
+                    warn(
+                        "Full-pruned mode expects CNN-LSTM benchmark runs only, "
+                        f"but found {source_classifier_raw!r} in {run_dir.name}"
+                    )
+                    stats.parse_failures += 1
+                    continue
+
+                target_specs = (
+                    ("cnnlstm", "direct", ()),
+                    ("stgcn", "direct", ()),
+                    (
+                        "motionbert",
+                        "motionbert_from_cnnlstm",
+                        FULL_PRUNED_MOTIONBERT_CLEAR_KEYS,
+                    ),
+                )
+
+                for classifier_raw, metric_strategy, clear_metric_keys in target_specs:
+                    classifier_excel = CLASSIFIER_MAP[classifier_raw]
+                    records.append(
+                        BenchmarkRecord(
+                            pose_model_raw=pose_model_dir.name,
+                            pose_model_excel=pose_model_excel,
+                            version_folder=precision_dir.name,
+                            version_excel=version_excel,
+                            classifier_raw=classifier_raw,
+                            classifier_excel=classifier_excel,
+                            run_dir=run_dir,
+                            summary_json=summary_json,
+                            metric_strategy=metric_strategy,
+                            clear_metric_keys=clear_metric_keys,
+                        )
+                    )
+
+    return records
+
+
 def scan_benchmark_records(
     benchmark_root: Path,
     stats: Stats,
     mode: str,
 ) -> List[BenchmarkRecord]:
+    if mode == "full-pruned":
+        return scan_full_pruned_records(benchmark_root, stats)
+
     records: List[BenchmarkRecord] = []
 
     if not benchmark_root.exists():
@@ -511,11 +668,12 @@ def find_matching_row(
 
 
 def write_metrics_to_row(
-    ws: Worksheet,
+    ws: "Worksheet",
     columns: Dict[str, int],
     row_number: int,
     metrics: Metrics,
     writable_metric_keys: Optional[Set[str]] = None,
+    clear_metric_keys: Tuple[str, ...] = (),
 ) -> None:
     metric_values = {
         "fps": metrics.avg_fps,
@@ -526,6 +684,15 @@ def write_metrics_to_row(
         "temperature": metrics.avg_temp_c,
         "power_draw": metrics.avg_power_w,
     }
+
+    for key in clear_metric_keys:
+        if writable_metric_keys is not None and key not in writable_metric_keys:
+            continue
+        col = columns.get(key)
+        if col is None:
+            warn(f"Metric column not found in workbook header row for key: {key}")
+            continue
+        ws.cell(row=row_number, column=col).value = None
 
     for key, value in metric_values.items():
         if writable_metric_keys is not None and key not in writable_metric_keys:
@@ -544,6 +711,8 @@ def write_metrics_to_row(
 # =============================================================================
 
 def update_workbook(mode_config: ModeConfig) -> Stats:
+    ensure_openpyxl_available()
+
     stats = Stats()
     records = scan_benchmark_records(mode_config.benchmark_root, stats, mode_config.name)
     info(f"Found {len(records)} benchmark folders eligible for processing.")
@@ -592,13 +761,15 @@ def update_workbook(mode_config: ModeConfig) -> Stats:
             continue
 
         try:
-            metrics = extract_metrics(summary)
+            base_metrics = extract_metrics(summary)
+            metrics = apply_metric_strategy(base_metrics, record.metric_strategy)
             write_metrics_to_row(
                 ws,
                 columns,
                 row_number,
                 metrics,
                 writable_metric_keys=mode_config.writable_metric_keys,
+                clear_metric_keys=record.clear_metric_keys,
             )
             stats.rows_updated += 1
             info(
@@ -641,7 +812,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("regular", "pruned"),
+        choices=("regular", "pruned", "full-pruned"),
         default="regular",
         help="Workbook/update mode. 'regular' preserves the current default behavior.",
     )
@@ -661,6 +832,14 @@ def resolve_mode_config(mode: str) -> ModeConfig:
             name="pruned",
             benchmark_root=PRUNED_BENCHMARK_ROOT.resolve(),
             workbook_path=PRUNED_WORKBOOK_PATH.resolve(),
+            writable_metric_keys=PRUNED_WRITABLE_METRIC_KEYS,
+        )
+
+    if mode == "full-pruned":
+        return ModeConfig(
+            name="full-pruned",
+            benchmark_root=FULL_PRUNED_BENCHMARK_ROOT.resolve(),
+            workbook_path=FULL_PRUNED_WORKBOOK_PATH.resolve(),
             writable_metric_keys=PRUNED_WRITABLE_METRIC_KEYS,
         )
 

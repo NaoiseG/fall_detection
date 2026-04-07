@@ -114,8 +114,9 @@ benchmark_dest_dir() {
   printf '%s/%s/imgsz_%s/%s/%s' "${BENCH_DIR}" "${pose_model}" "${imgsz}" "${precision}" "${classifier}"
 }
 
-snapshot_top_level_dirs() {
-  find "${BENCH_DIR}" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort
+snapshot_child_dirs() {
+  local root_dir="$1"
+  find "${root_dir}" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort
 }
 
 find_new_run_dir() {
@@ -150,6 +151,8 @@ require_file_or_log() {
   local cmd_str="$7"
 
   if [[ ! -f "${path}" ]]; then
+    printf 'ERROR: %s %s + %s missing %s: %s\n' \
+      "${pose_model}" "${precision}" "${classifier}" "${description}" "${path}" >&2
     log_failure \
       "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=missing_file missing=${description} path=${path} cmd=\"${cmd_str}\""
     return 1
@@ -161,10 +164,15 @@ require_file_or_log() {
 combination_already_done() {
   local dest_dir="$1"
   local classifier="$2"
+  local run_dir
 
   [[ -d "${dest_dir}" ]] || return 1
 
-  find "${dest_dir}" -mindepth 1 -maxdepth 1 -type d -name "*__model_${classifier}__*" -print -quit 2>/dev/null | grep -q .
+  while IFS= read -r run_dir; do
+    [[ -f "${run_dir}/summary.json" ]] && return 0
+  done < <(find "${dest_dir}" -mindepth 1 -maxdepth 1 -type d -name "*__model_${classifier}__*" -print 2>/dev/null)
+
+  return 1
 }
 
 run_command_with_heartbeat() {
@@ -193,6 +201,15 @@ run_command_with_heartbeat() {
   local start_ts now elapsed
   start_ts="$(date +%s)"
 
+  trap '
+    if [[ -n "${cmd_pid:-}" ]] && kill -0 "${cmd_pid}" 2>/dev/null; then
+      printf "\nINTERRUPT: stopping %s (pid=%s)\n" "'"${run_label}"'" "${cmd_pid}" >&2
+      kill -INT "${cmd_pid}" 2>/dev/null || true
+      wait "${cmd_pid}" 2>/dev/null || true
+    fi
+    trap - INT TERM
+  ' INT TERM
+
   while kill -0 "${cmd_pid}" 2>/dev/null; do
     sleep "${interval_s}"
 
@@ -208,6 +225,9 @@ run_command_with_heartbeat() {
   done
 
   wait "${cmd_pid}"
+  local rc=$?
+  trap - INT TERM
+  return "${rc}"
 }
 
 build_command() {
@@ -216,6 +236,7 @@ build_command() {
   local pose_weight="$3"
   local imgsz="$4"
   local half_flag="$5"
+  local profile_out_dir="$6"
 
   printf '%s\0' \
     python -m inference.inference_on_video \
@@ -231,7 +252,7 @@ build_command() {
     --warmup-frames 0 \
     --warmup-windows 0 \
     --benchmark 1 \
-    --profile-out "${BENCH_DIR}" \
+    --profile-out "${profile_out_dir}" \
     --no-display 1
 }
 
@@ -251,11 +272,15 @@ run_one_benchmark() {
 
   pose_weight="$(pose_weight_path "${engine_name}")"
   cls_weight="$(classifier_weight_for_arch_pose "${classifier}" "${pose_checkpoint_tag}")" || {
+    printf 'ERROR: %s %s + %s invalid classifier mapping for checkpoint tag %s\n' \
+      "${pose_model}" "${precision}" "${classifier}" "${pose_checkpoint_tag}" >&2
     log_failure \
       "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=internal_error reason=invalid_classifier_mapping checkpoint_pose_tag=${pose_checkpoint_tag}"
     return 1
   }
   half_flag="$(half_flag_for_precision "${precision}")" || {
+    printf 'ERROR: %s %s + %s invalid precision mapping\n' \
+      "${pose_model}" "${precision}" "${classifier}" >&2
     log_failure \
       "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=internal_error reason=invalid_precision_mapping"
     return 1
@@ -275,7 +300,7 @@ run_one_benchmark() {
   local cmd=()
   while IFS= read -r -d '' token; do
     cmd+=("${token}")
-  done < <(build_command "${classifier}" "${cls_weight}" "${pose_weight}" "${imgsz}" "${half_flag}")
+  done < <(build_command "${classifier}" "${cls_weight}" "${pose_weight}" "${imgsz}" "${half_flag}" "${dest_dir}")
 
   cmd_str="$(join_cmd "${cmd[@]}")"
 
@@ -290,14 +315,16 @@ run_one_benchmark() {
   before_file="$(mktemp)"
   after_file="$(mktemp)"
 
-  snapshot_top_level_dirs > "${before_file}"
+  snapshot_child_dirs "${dest_dir}" > "${before_file}"
 
   run_command_with_heartbeat "${run_key} ${classifier}" "${cmd[@]}"
   rc=$?
 
-  snapshot_top_level_dirs > "${after_file}"
+  snapshot_child_dirs "${dest_dir}" > "${after_file}"
 
   if [[ "${rc}" -ne 0 ]]; then
+    printf 'ERROR: %s imgsz=%s %s + %s command failed with exit code %s\n' \
+      "${pose_model}" "${imgsz}" "${precision}" "${classifier}" "${rc}" >&2
     log_failure \
       "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
     rm -f "${before_file}" "${after_file}"
@@ -308,25 +335,21 @@ run_one_benchmark() {
     if [[ -d "${new_run_dir}" ]]; then
       local run_basename
       run_basename="$(basename "${new_run_dir}")"
-
-      if mv "${new_run_dir}" "${dest_dir}/"; then
-        log_success \
-          "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
-        rm -f "${before_file}" "${after_file}"
-        return 0
-      else
-        log_failure \
-          "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
-        rm -f "${before_file}" "${after_file}"
-        return 1
-      fi
+      log_success \
+        "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=ok output_dir=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
+      rm -f "${before_file}" "${after_file}"
+      return 0
     else
+      printf 'ERROR: %s imgsz=%s %s + %s returned a non-directory run artifact: %s\n' \
+        "${pose_model}" "${imgsz}" "${precision}" "${classifier}" "${new_run_dir}" >&2
       log_failure \
         "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=no_new_directory_found reason=diff_returned_non_directory path=${new_run_dir} cmd=\"${cmd_str}\""
       rm -f "${before_file}" "${after_file}"
       return 1
     fi
   else
+    printf 'ERROR: %s imgsz=%s %s + %s finished without a unique new run directory\n' \
+      "${pose_model}" "${imgsz}" "${precision}" "${classifier}" >&2
     log_failure \
       "run_key=${run_key} pose_model=${pose_model} version=${precision} classifier=${classifier} status=no_unique_new_directory_found cmd=\"${cmd_str}\""
     rm -f "${before_file}" "${after_file}"

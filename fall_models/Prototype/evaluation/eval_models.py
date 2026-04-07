@@ -100,6 +100,7 @@ from models.gru.simple_gru import GRUBaseline
 from models.gcn.simple_gcn import GCNBaseline
 from models.mlp.simple_mlp import MLPBaseline
 from models.stgcn.simple_stgcn import STGCNBaseline
+from models.complex_models import PaperLSTMClassifier, PaperSTGCNClassifier
 
 # NEW: CNN + LSTM two-head model
 from models.cnnlstm.cnn_lstm import CNNLSTMTwoHead
@@ -465,6 +466,16 @@ def get_model(
             pool="last",
         )
 
+    elif model_name == "paper_lstm":
+        model = PaperLSTMClassifier(
+            in_features=in_features,
+            num_classes=num_classes,
+            hidden_size=80,
+            num_layers=10,
+            dropout=0.2,
+            pool="last",
+        )
+
     elif model_name == "gru":
         model = GRUBaseline(
             in_features=in_features,
@@ -509,6 +520,18 @@ def get_model(
             num_blocks=4,
             t_kernel=9,
             dropout=0.1,
+        )
+
+    elif model_name == "paper_stgcn":
+        if node_features is None:
+            raise ValueError("node_features is required for paper_stgcn (load from ckpt).")
+        model = PaperSTGCNClassifier(
+            num_nodes=17,
+            node_features=node_features,
+            num_classes=num_classes,
+            channels=(64, 64, 64, 64, 128, 128, 128, 256, 256, 256),
+            t_kernel=9,
+            dropout=0.2,
         )
 
     elif model_name == "cnnlstm":
@@ -1328,7 +1351,7 @@ def make_html_report(
 
 def main():
     # NEW: added "cnnlstm"
-    ALL_MODELS = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm", "rf"]
+    ALL_MODELS = ["tcn", "lstm", "paper_lstm", "gru", "gcn", "mlp", "stgcn", "paper_stgcn", "cnnlstm", "rf"]
 
     parser = argparse.ArgumentParser(description="Evaluate trained models on UP-Fall windowed pose tensors.")
     parser.add_argument("--models", nargs="+", default=None, help="Models to evaluate, e.g. --models tcn lstm")

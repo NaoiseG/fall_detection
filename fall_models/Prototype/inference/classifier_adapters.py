@@ -25,6 +25,7 @@ from models.gcn.simple_gcn import GCNBaseline
 from models.gru.simple_gru import GRUBaseline
 from models.lstm.simple_lstm import LSTMBaseline
 from models.mlp.simple_mlp import MLPBaseline
+from models.complex_models import PaperLSTMClassifier, PaperSTGCNClassifier
 from models.rf.train_rf import windows_to_sklearn_features
 from models.stgcn.simple_stgcn import STGCNBaseline
 from models.tcn.simple_tcn import TCNBaseline
@@ -37,7 +38,7 @@ except Exception:
 
 K = 17
 
-KNOWN_ARCHES = ["tcn", "lstm", "gru", "gcn", "mlp", "stgcn", "cnnlstm", "rf"]
+KNOWN_ARCHES = ["tcn", "lstm", "paper_lstm", "gru", "gcn", "mlp", "stgcn", "paper_stgcn", "cnnlstm", "rf"]
 
 FALL_MERGED_CLASS_NAMES = [
     "Fall",
@@ -543,6 +544,15 @@ def build_temporal_model(
             bidirectional=False,
             pool="last",
         )
+    elif arch == "paper_lstm":
+        model = PaperLSTMClassifier(
+            in_features=in_features,
+            num_classes=num_classes,
+            hidden_size=80,
+            num_layers=10,
+            dropout=0.2,
+            pool="last",
+        )
     elif arch == "gru":
         model = GRUBaseline(
             in_features=in_features,
@@ -582,6 +592,17 @@ def build_temporal_model(
             num_blocks=4,
             t_kernel=9,
             dropout=0.1,
+        )
+    elif arch == "paper_stgcn":
+        if node_features is None:
+            raise ValueError("paper_stgcn requires node_features (in_features must be divisible by 17).")
+        model = PaperSTGCNClassifier(
+            num_nodes=17,
+            node_features=int(node_features),
+            num_classes=num_classes,
+            channels=(64, 64, 64, 64, 128, 128, 128, 256, 256, 256),
+            t_kernel=9,
+            dropout=0.2,
         )
     elif arch == "cnnlstm":
         if CNNLSTMTwoHead is None:
