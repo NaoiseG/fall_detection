@@ -42,6 +42,15 @@ class PoseExportConfig:
     target_y_frac: float = 0.5
     draw_kpt_threshold: float = 0.30
     draw_no_target_text: bool = True
+    no_suspicious: bool = False
+    allow_region1_start: bool = False
+    allow_region2_start: bool = False
+    suspicious_conf_thres: float = 0.30
+    suspicious_start_frames: int = 100
+    suspicious_region1_xyxy: Tuple[float, float, float, float] = (540.0, 160.0, 660.0, 230.0)
+    suspicious_region2_xyxy: Tuple[float, float, float, float] = (260.0, 100.0, 430.0, 190.0)
+    suspicious_switch_min_iou: float = 0.35
+    suspicious_switch_max_jump_frac: float = 0.25
 
 
 POSE_LOCK_SETTINGS_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -442,6 +451,12 @@ COCO_SKELETON = [
     (12, 14), (14, 16),
 ]
 
+L_SHOULDER = 5
+R_SHOULDER = 6
+L_HIP = 11
+R_HIP = 12
+TORSO_IDXS = (L_SHOULDER, R_SHOULDER, L_HIP, R_HIP)
+
 
 def _to_numpy_or_none(x: Any) -> Optional[np.ndarray]:
     if x is None:
@@ -531,6 +546,138 @@ def box_iou_xyxy(box1, box2) -> float:
     return float(inter / denom)
 
 
+def compute_pose_centers(
+    xy: np.ndarray,
+    kc: Optional[np.ndarray],
+    conf_thres: float,
+) -> np.ndarray:
+    xy = np.asarray(xy, dtype=np.float32)
+    if xy.ndim != 3 or xy.shape[-1] != 2:
+        return np.empty((0, 2), dtype=np.float32)
+
+    centers = np.full((xy.shape[0], 2), np.nan, dtype=np.float32)
+    visible = np.isfinite(xy[..., 0]) & np.isfinite(xy[..., 1])
+
+    if kc is not None:
+        kc_arr = np.asarray(kc, dtype=np.float32)
+        if kc_arr.shape[:2] == xy.shape[:2]:
+            visible &= np.isfinite(kc_arr) & (kc_arr >= float(conf_thres))
+
+    for person_idx in range(xy.shape[0]):
+        torso_vis = [kp_idx for kp_idx in TORSO_IDXS if kp_idx < xy.shape[1] and visible[person_idx, kp_idx]]
+        if len(torso_vis) >= 2:
+            centers[person_idx] = np.mean(xy[person_idx, torso_vis], axis=0)
+            continue
+
+        pts = xy[person_idx, visible[person_idx]]
+        if len(pts) >= 4:
+            centers[person_idx] = np.mean(pts, axis=0)
+
+    return centers
+
+
+def point_in_box(center: np.ndarray, box_xyxy: Tuple[float, float, float, float]) -> bool:
+    c = np.asarray(center, dtype=np.float32).reshape(-1)
+    if c.shape[0] < 2 or not np.all(np.isfinite(c[:2])):
+        return False
+    x1, y1, x2, y2 = [float(v) for v in box_xyxy]
+    return x1 <= float(c[0]) <= x2 and y1 <= float(c[1]) <= y2
+
+
+def classify_suspicious_candidates(
+    pose_centers: np.ndarray,
+    frame_idx: int,
+    config: PoseExportConfig,
+    region2_all_clip: bool = False,
+    allow_region1: bool = False,
+    allow_region2: bool = False,
+) -> np.ndarray:
+    centers = np.asarray(pose_centers, dtype=np.float32)
+    if centers.ndim != 2 or centers.shape[1] < 2:
+        return np.zeros((0,), dtype=bool)
+
+    if not bool(config.no_suspicious):
+        return np.zeros((centers.shape[0],), dtype=bool)
+
+    region2_active = bool(region2_all_clip) or int(frame_idx) < max(0, int(config.suspicious_start_frames))
+    suspicious = np.zeros((centers.shape[0],), dtype=bool)
+    for idx in range(centers.shape[0]):
+        if (not allow_region1) and point_in_box(centers[idx], config.suspicious_region1_xyxy):
+            suspicious[idx] = True
+            continue
+        if region2_active and (not allow_region2) and point_in_box(centers[idx], config.suspicious_region2_xyxy):
+            suspicious[idx] = True
+    return suspicious
+
+
+def choose_locked_candidate(
+    candidate_idx: np.ndarray,
+    dists: np.ndarray,
+    box_conf: Optional[np.ndarray],
+    conf_min: float,
+    boxes_xyxy: np.ndarray,
+    prev_box_xyxy: np.ndarray,
+    min_iou_same_track: float,
+    max_box_area_ratio: float,
+    strict_reacquire: bool,
+) -> Tuple[Optional[int], float, float]:
+    candidate_idx = np.asarray(candidate_idx, dtype=np.int32).reshape(-1)
+    if candidate_idx.size == 0:
+        return None, -1.0, float("inf")
+
+    if box_conf is not None:
+        conf_ok = []
+        for idx in candidate_idx.tolist():
+            if idx < box_conf.shape[0]:
+                conf_val = float(box_conf[idx])
+                if np.isfinite(conf_val) and conf_val < conf_min:
+                    continue
+            conf_ok.append(idx)
+        candidate_idx = np.asarray(conf_ok, dtype=np.int32)
+        if candidate_idx.size == 0:
+            return None, -1.0, float("inf")
+
+    if not strict_reacquire:
+        ranked = candidate_idx[np.argsort(dists[candidate_idx])]
+        best_idx = int(ranked[0])
+        return best_idx, -1.0, float(dists[best_idx])
+
+    prev_area = _box_area_xyxy(prev_box_xyxy)
+    if prev_area <= 0.0:
+        return None, -1.0, float("inf")
+
+    area_ratio_limit = max(1.0, float(max_box_area_ratio))
+    min_area_ratio = 1.0 / area_ratio_limit
+    min_iou = max(0.0, float(min_iou_same_track))
+
+    best_idx: Optional[int] = None
+    best_iou = -1.0
+    best_dist = float("inf")
+
+    for idx in candidate_idx.tolist():
+        cand_box = boxes_xyxy[idx]
+        iou = box_iou_xyxy(cand_box, prev_box_xyxy)
+        if iou < min_iou:
+            continue
+
+        cand_area = _box_area_xyxy(cand_box)
+        if cand_area <= 0.0:
+            continue
+        area_ratio = cand_area / prev_area
+        if area_ratio < min_area_ratio or area_ratio > area_ratio_limit:
+            continue
+
+        dist = float(dists[idx])
+        if (iou > best_iou + 1e-6) or (abs(iou - best_iou) <= 1e-6 and dist < best_dist):
+            best_idx = int(idx)
+            best_iou = iou
+            best_dist = dist
+
+    if best_idx is None:
+        return None, -1.0, float("inf")
+    return best_idx, best_iou, best_dist
+
+
 def select_person_idx(
     box_centers: np.ndarray,
     box_conf: Optional[np.ndarray],
@@ -544,6 +691,10 @@ def select_person_idx(
     max_box_area_ratio: float,
     locked: bool,
     strict_reacquire: bool = True,
+    candidate_is_suspicious: Optional[np.ndarray] = None,
+    prev_selected_was_suspicious: bool = False,
+    suspicious_switch_min_iou: float = 0.35,
+    suspicious_switch_max_jump_frac: float = 0.25,
 ) -> Tuple[Optional[int], Optional[np.ndarray]]:
     """
     Single-target selection:
@@ -560,11 +711,26 @@ def select_person_idx(
     boxes_xyxy = boxes_xyxy[:num_people]
     if box_conf is not None:
         box_conf = box_conf[:num_people]
+    if candidate_is_suspicious is None:
+        candidate_is_suspicious = np.zeros((num_people,), dtype=bool)
+    else:
+        candidate_is_suspicious = np.asarray(candidate_is_suspicious, dtype=bool).reshape(-1)
+        if candidate_is_suspicious.shape[0] < num_people:
+            pad = num_people - candidate_is_suspicious.shape[0]
+            candidate_is_suspicious = np.pad(candidate_is_suspicious, (0, pad), mode="constant", constant_values=False)
+        elif candidate_is_suspicious.shape[0] > num_people:
+            candidate_is_suspicious = candidate_is_suspicious[:num_people]
 
     if not locked:
         candidate_idx = np.arange(num_people, dtype=np.int32)
+        non_suspicious = candidate_idx[~candidate_is_suspicious[candidate_idx]]
+        if non_suspicious.size == 0:
+            return None, prev_center
+        candidate_idx = non_suspicious
         if box_conf is not None:
-            high_conf = np.where(np.isfinite(box_conf[:num_people]) & (box_conf[:num_people] >= conf_min))[0]
+            high_conf = candidate_idx[
+                np.isfinite(box_conf[candidate_idx]) & (box_conf[candidate_idx] >= conf_min)
+            ]
             if high_conf.size > 0:
                 candidate_idx = high_conf.astype(np.int32, copy=False)
 
@@ -588,51 +754,46 @@ def select_person_idx(
     if valid_jump.size == 0:
         return None, prev_center
 
-    if not strict_reacquire:
-        ranked = valid_jump[np.argsort(dists[valid_jump])]
-        best_idx = int(ranked[0])
+    allowed_idx = valid_jump[~candidate_is_suspicious[valid_jump]]
+    suspicious_idx = valid_jump[candidate_is_suspicious[valid_jump]]
+
+    best_idx, _, _ = choose_locked_candidate(
+        candidate_idx=allowed_idx,
+        dists=dists,
+        box_conf=box_conf,
+        conf_min=conf_min,
+        boxes_xyxy=boxes_xyxy,
+        prev_box_xyxy=prev_box_xyxy,
+        min_iou_same_track=min_iou_same_track,
+        max_box_area_ratio=max_box_area_ratio,
+        strict_reacquire=strict_reacquire,
+    )
+    if best_idx is not None:
         return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
 
-    prev_area = _box_area_xyxy(prev_box_xyxy)
-    if prev_area <= 0.0:
-        return None, prev_center
-
-    area_ratio_limit = max(1.0, float(max_box_area_ratio))
-    min_area_ratio = 1.0 / area_ratio_limit
-    min_iou = max(0.0, float(min_iou_same_track))
-
-    best_idx: Optional[int] = None
-    best_iou = -1.0
-    best_dist = float("inf")
-
-    for idx in valid_jump.tolist():
-        if box_conf is not None and idx < box_conf.shape[0]:
-            conf_val = float(box_conf[idx])
-            if np.isfinite(conf_val) and conf_val < conf_min:
-                continue
-
-        cand_box = boxes_xyxy[idx]
-        iou = box_iou_xyxy(cand_box, prev_box_xyxy)
-        if iou < min_iou:
-            continue
-
-        cand_area = _box_area_xyxy(cand_box)
-        if cand_area <= 0.0:
-            continue
-        area_ratio = cand_area / prev_area
-        if area_ratio < min_area_ratio or area_ratio > area_ratio_limit:
-            continue
-
-        dist = float(dists[idx])
-        if (iou > best_iou + 1e-6) or (abs(iou - best_iou) <= 1e-6 and dist < best_dist):
-            best_idx = int(idx)
-            best_iou = iou
-            best_dist = dist
-
+    best_idx, best_iou, best_dist = choose_locked_candidate(
+        candidate_idx=suspicious_idx,
+        dists=dists,
+        box_conf=box_conf,
+        conf_min=conf_min,
+        boxes_xyxy=boxes_xyxy,
+        prev_box_xyxy=prev_box_xyxy,
+        min_iou_same_track=min_iou_same_track,
+        max_box_area_ratio=max_box_area_ratio,
+        strict_reacquire=strict_reacquire,
+    )
     if best_idx is None:
         return None, prev_center
 
-    return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+    if prev_selected_was_suspicious:
+        return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+
+    required_iou = max(float(suspicious_switch_min_iou), float(min_iou_same_track))
+    allowed_jump = max(1.0, float(max_jump_px) * float(suspicious_switch_max_jump_frac))
+    if best_dist <= allowed_jump and (not strict_reacquire or best_iou >= required_iou):
+        return best_idx, box_centers[best_idx].astype(np.float32, copy=True)
+
+    return None, prev_center
 
 
 def draw_selected_pose(
@@ -854,6 +1015,7 @@ def run_pose_on_frames(
     max_jump_px = float(config.max_jump_px) if config.max_jump_px is not None else float(config.max_jump_diag_frac * frame_diag)
     prev_center: Optional[np.ndarray] = None
     prev_box_xyxy: Optional[np.ndarray] = None
+    prev_selected_was_suspicious = False
     track_locked = False
     lost_count = 0
 
@@ -932,6 +1094,22 @@ def run_pose_on_frames(
                         (prev_box_xyxy is not None)
                     )
                 )
+                pose_centers = compute_pose_centers(
+                    xy=xy,
+                    kc=kc,
+                    conf_thres=config.suspicious_conf_thres,
+                )
+                invalid_pose_centers = ~np.isfinite(pose_centers[:, 0]) | ~np.isfinite(pose_centers[:, 1])
+                if np.any(invalid_pose_centers):
+                    pose_centers[invalid_pose_centers] = box_centers[invalid_pose_centers]
+                candidate_is_suspicious = classify_suspicious_candidates(
+                    pose_centers=pose_centers,
+                    frame_idx=i,
+                    config=config,
+                    region2_all_clip=locked_for_selection,
+                    allow_region1=(not locked_for_selection) and bool(config.allow_region1_start),
+                    allow_region2=(not locked_for_selection) and bool(config.allow_region2_start),
+                )
                 idx, new_center = select_person_idx(
                     box_centers=box_centers,
                     box_conf=box_conf,
@@ -945,6 +1123,10 @@ def run_pose_on_frames(
                     max_box_area_ratio=config.max_box_area_ratio,
                     locked=locked_for_selection,
                     strict_reacquire=config.strict_reacquire,
+                    candidate_is_suspicious=candidate_is_suspicious,
+                    prev_selected_was_suspicious=prev_selected_was_suspicious,
+                    suspicious_switch_min_iou=config.suspicious_switch_min_iou,
+                    suspicious_switch_max_jump_frac=config.suspicious_switch_max_jump_frac,
                 )
 
                 if idx is None:
@@ -955,6 +1137,9 @@ def run_pose_on_frames(
                     if config.lock_first_target and not track_locked:
                         track_locked = True
                     lost_count = 0
+                    prev_selected_was_suspicious = bool(
+                        idx < candidate_is_suspicious.shape[0] and candidate_is_suspicious[idx]
+                    )
 
                     selected_xy = xy[idx]
                     selected_box_xyxy = prev_box_xyxy
@@ -989,6 +1174,7 @@ def run_pose_on_frames(
         if config.reset_on_max_lost and (not track_locked) and lost_count > config.max_lost:
             prev_center = None
             prev_box_xyxy = None
+            prev_selected_was_suspicious = False
 
         annotated = draw_selected_pose(
             frame=frame,

@@ -790,6 +790,11 @@ def _load_windows_from_npzs_core(
 
     window_camera_ids: List[np.ndarray] = []
     window_source_indices: List[np.ndarray] = []
+    window_candidate_indices: List[np.ndarray] = []
+    window_start_frames_sampled: List[np.ndarray] = []
+    window_end_frames_sampled: List[np.ndarray] = []
+    window_frame_counts_sampled: List[np.ndarray] = []
+    window_is_padded: List[np.ndarray] = []
     source_paths: List[str] = [p.as_posix() for p in npz_list]
     source_camera_ids = np.array([infer_camera_id_from_npz_path(p.as_posix()) for p in npz_list], dtype=np.int64)
 
@@ -807,7 +812,7 @@ def _load_windows_from_npzs_core(
 
     for i, p in enumerate(npz_list):
         if i == 0 and T_used is None:
-            X, y, T_used = make_window_tensors(
+            window_result = make_window_tensors(
                 p.as_posix(),
                 T=None,
                 use_conf=use_conf,
@@ -837,9 +842,10 @@ def _load_windows_from_npzs_core(
                 feature_mode=feature_mode,
                 motion_xy_scale=motion_xy_scale,
                 drop_empty_windows=drop_empty_windows,
+                collect_window_meta=bool(collect_source_meta),
             )
         else:
-            X, y, _ = make_window_tensors(
+            window_result = make_window_tensors(
                 p.as_posix(),
                 T=T_used,
                 use_conf=use_conf,
@@ -869,7 +875,19 @@ def _load_windows_from_npzs_core(
                 feature_mode=feature_mode,
                 motion_xy_scale=motion_xy_scale,
                 drop_empty_windows=drop_empty_windows,
+                collect_window_meta=bool(collect_source_meta),
             )
+
+        if bool(collect_source_meta):
+            X, y, T_curr, window_meta = window_result
+            if i == 0 and T_used is None:
+                T_used = int(T_curr)
+            if window_meta is None:
+                raise RuntimeError("collect_source_meta=True but make_window_tensors did not return metadata.")
+        else:
+            X, y, T_curr = window_result
+            if i == 0 and T_used is None:
+                T_used = int(T_curr)
 
         X_all.append(X)
         y_all.append(y)
@@ -878,6 +896,11 @@ def _load_windows_from_npzs_core(
             cam_id = int(infer_camera_id_from_npz_path(p.as_posix()))
             window_camera_ids.append(np.full((int(y.shape[0]),), cam_id, dtype=np.int64))
             window_source_indices.append(np.full((int(y.shape[0]),), int(i), dtype=np.int64))
+            window_candidate_indices.append(np.asarray(window_meta["window_candidate_indices"], dtype=np.int64))
+            window_start_frames_sampled.append(np.asarray(window_meta["window_start_frames_sampled"], dtype=np.int64))
+            window_end_frames_sampled.append(np.asarray(window_meta["window_end_frames_sampled"], dtype=np.int64))
+            window_frame_counts_sampled.append(np.asarray(window_meta["window_frame_counts_sampled"], dtype=np.int64))
+            window_is_padded.append(np.asarray(window_meta["window_is_padded"], dtype=bool))
 
     if not X_all:
         raise RuntimeError("No NPZs found / no windows loaded.")
@@ -897,6 +920,11 @@ def _load_windows_from_npzs_core(
     meta: Dict[str, Any] = {
         "window_camera_ids": np.concatenate(window_camera_ids, axis=0) if window_camera_ids else np.zeros((0,), dtype=np.int64),
         "window_source_indices": np.concatenate(window_source_indices, axis=0) if window_source_indices else np.zeros((0,), dtype=np.int64),
+        "window_candidate_indices": np.concatenate(window_candidate_indices, axis=0) if window_candidate_indices else np.zeros((0,), dtype=np.int64),
+        "window_start_frames_sampled": np.concatenate(window_start_frames_sampled, axis=0) if window_start_frames_sampled else np.zeros((0,), dtype=np.int64),
+        "window_end_frames_sampled": np.concatenate(window_end_frames_sampled, axis=0) if window_end_frames_sampled else np.zeros((0,), dtype=np.int64),
+        "window_frame_counts_sampled": np.concatenate(window_frame_counts_sampled, axis=0) if window_frame_counts_sampled else np.zeros((0,), dtype=np.int64),
+        "window_is_padded": np.concatenate(window_is_padded, axis=0) if window_is_padded else np.zeros((0,), dtype=bool),
         "source_npz_paths": source_paths,
         "source_camera_ids": source_camera_ids,
     }
@@ -1052,6 +1080,11 @@ def load_windows_with_source_meta_from_npzs(
         meta = {
             "window_camera_ids": np.zeros((0,), dtype=np.int64),
             "window_source_indices": np.zeros((0,), dtype=np.int64),
+            "window_candidate_indices": np.zeros((0,), dtype=np.int64),
+            "window_start_frames_sampled": np.zeros((0,), dtype=np.int64),
+            "window_end_frames_sampled": np.zeros((0,), dtype=np.int64),
+            "window_frame_counts_sampled": np.zeros((0,), dtype=np.int64),
+            "window_is_padded": np.zeros((0,), dtype=bool),
             "source_npz_paths": [],
             "source_camera_ids": np.zeros((0,), dtype=np.int64),
         }
@@ -1075,12 +1108,14 @@ def _make_sliding_windows(
     layout: dict,
     label_convention: str,
     drop_empty_windows: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, int]:
+    collect_window_meta: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, int] | Tuple[np.ndarray, np.ndarray, int, Dict[str, np.ndarray]]:
     """
     Returns:
       X_windows: (W, T, K, C(+1 if mask))
       y_windows: (W,) in merged 7-class space (0..6)
       T_used: int
+      window_meta: optional metadata aligned to kept windows
     """
     N, K, C = Xf.shape
     stride = max(1, int(stride))
@@ -1093,14 +1128,20 @@ def _make_sliding_windows(
     starts = list(range(0, max(1, N), stride))
     X_windows = []
     y_windows = []
+    kept_window_candidate_indices: List[int] = []
+    kept_window_start_frames: List[int] = []
+    kept_window_end_frames: List[int] = []
+    kept_window_frame_counts: List[int] = []
+    kept_window_is_padded: List[bool] = []
 
-    for s in starts:
+    for win_idx, s in enumerate(starts):
         e = s + T
         seq = Xf[s:e]                      # (L,K,C)
         labs_raw = labels_raw[s:e]         # (L,)
         valid = frame_valid[s:e]           # (L,)
 
         L = seq.shape[0]
+        frame_count_before_padding = int(L)
         if L < T:
             pad = np.repeat(seq[-1:, :, :], repeats=(T - L), axis=0) if L > 0 else np.zeros((T, K, C), np.float32)
 
@@ -1193,19 +1234,44 @@ def _make_sliding_windows(
 
         X_windows.append(seq)
         y_windows.append(y)
+        if bool(collect_window_meta):
+            kept_window_candidate_indices.append(int(win_idx))
+            kept_window_start_frames.append(int(s))
+            kept_window_end_frames.append(int(s + max(frame_count_before_padding - 1, 0)))
+            kept_window_frame_counts.append(int(frame_count_before_padding))
+            kept_window_is_padded.append(bool(frame_count_before_padding < T))
 
         if s + stride >= N and s >= N - 1:
             break
 
     out_channels = C + (1 if add_mask_channel else 0)
     if not X_windows:
-        return (
-            np.zeros((0, int(T), K, out_channels), dtype=np.float32),
-            np.zeros((0,), dtype=np.int64),
-            int(T),
-        )
+        empty_X = np.zeros((0, int(T), K, out_channels), dtype=np.float32)
+        empty_y = np.zeros((0,), dtype=np.int64)
+        if bool(collect_window_meta):
+            empty_meta = {
+                "window_candidate_indices": np.zeros((0,), dtype=np.int64),
+                "window_start_frames_sampled": np.zeros((0,), dtype=np.int64),
+                "window_end_frames_sampled": np.zeros((0,), dtype=np.int64),
+                "window_frame_counts_sampled": np.zeros((0,), dtype=np.int64),
+                "window_is_padded": np.zeros((0,), dtype=bool),
+            }
+            return empty_X, empty_y, int(T), empty_meta
+        return empty_X, empty_y, int(T)
 
-    return np.stack(X_windows), np.array(y_windows, dtype=np.int64), int(T)
+    X_stack = np.stack(X_windows)
+    y_stack = np.array(y_windows, dtype=np.int64)
+    if not bool(collect_window_meta):
+        return X_stack, y_stack, int(T)
+
+    window_meta = {
+        "window_candidate_indices": np.array(kept_window_candidate_indices, dtype=np.int64),
+        "window_start_frames_sampled": np.array(kept_window_start_frames, dtype=np.int64),
+        "window_end_frames_sampled": np.array(kept_window_end_frames, dtype=np.int64),
+        "window_frame_counts_sampled": np.array(kept_window_frame_counts, dtype=np.int64),
+        "window_is_padded": np.array(kept_window_is_padded, dtype=bool),
+    }
+    return X_stack, y_stack, int(T), window_meta
 
 
 def _global_features(xy: np.ndarray, conf: np.ndarray) -> np.ndarray:
@@ -1421,7 +1487,8 @@ def make_window_tensors(
     feature_mode: str = "full",
     motion_xy_scale: float = 0.25,
     drop_empty_windows: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, int]:
+    collect_window_meta: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, int] | Tuple[np.ndarray, np.ndarray, int, Dict[str, np.ndarray]]:
     """
     Converts frame-level pose data into window-level tensors.
 
@@ -1429,6 +1496,7 @@ def make_window_tensors(
         X: (W, T, K, C)
         y: (W,) merged 7-class labels (0..6)
         T: frames per window used
+        window_meta: optional metadata aligned to the returned windows
     """
     data = np.load(npz_path, allow_pickle=True)
 
@@ -1499,7 +1567,7 @@ def make_window_tensors(
     if T is None:
         T = 64
 
-    X_windows, y_windows, T_used = _make_sliding_windows(
+    window_result = _make_sliding_windows(
         Xf=Xf,
         labels_raw=labels_raw.astype(np.int64, copy=False),
         conf=conf_filled,
@@ -1516,9 +1584,14 @@ def make_window_tensors(
         layout=layout,
         label_convention=str(conv),
         drop_empty_windows=bool(drop_empty_windows),
+        collect_window_meta=bool(collect_window_meta),
     )
+    if not bool(collect_window_meta):
+        X_windows, y_windows, T_used = window_result
+        return X_windows, y_windows, T_used
 
-    return X_windows, y_windows, T_used
+    X_windows, y_windows, T_used, window_meta = window_result
+    return X_windows, y_windows, T_used, window_meta
 
 
 # ----------------------------

@@ -141,6 +141,33 @@ def main():
     ap.add_argument("--max-box-area-ratio", type=float, default=None, help="Override the allowed box-area ratio change when staying on the same track.")
     ap.add_argument("--target-x-frac", type=float, default=None, help="Override the horizontal target-acquisition anchor as a fraction of image width.")
     ap.add_argument("--target-y-frac", type=float, default=None, help="Override the vertical target-acquisition anchor as a fraction of image height.")
+    ap.add_argument(
+        "--no-suspicious",
+        action="store_true",
+        help=(
+            "Treat known Camera2 background regions as a switch barrier. "
+            "Tracking prefers candidates outside those regions, and will leave frames empty "
+            "instead of switching into them unless continuity is very strong."
+        ),
+    )
+    ap.add_argument(
+        "--allow-region1-start",
+        action="store_true",
+        help=(
+            "When --no-suspicious is enabled, allow initial target acquisition to start "
+            "inside suspicious Region 1 (the right-side box) instead of waiting for a "
+            "non-suspicious target."
+        ),
+    )
+    ap.add_argument(
+        "--allow-region2-start",
+        action="store_true",
+        help=(
+            "When --no-suspicious is enabled, allow initial target acquisition to start "
+            "inside suspicious Region 2 (the middle/early-clip box) instead of waiting for a "
+            "non-suspicious target."
+        ),
+    )
     ap.add_argument("--lock-first-target", dest="lock_first_target", action="store_true", help="Lock onto the first acquired target.")
     ap.add_argument("--no-lock-first-target", dest="lock_first_target", action="store_false", help="Disable permanent first-target locking.")
     ap.add_argument("--strict-reacquire", dest="strict_reacquire", action="store_true", help="Require IoU and area-ratio consistency when reacquiring the locked target.")
@@ -179,6 +206,9 @@ def main():
         imgsz=args.imgsz,
     )
     apply_pose_lock_settings(cfg, args.lock_settings)
+    cfg.no_suspicious = bool(args.no_suspicious and int(args.camera) == 2)
+    cfg.allow_region1_start = bool(args.allow_region1_start and int(args.camera) == 2)
+    cfg.allow_region2_start = bool(args.allow_region2_start and int(args.camera) == 2)
 
     overrides = {
         "conf_thres": args.conf_thres,
@@ -210,6 +240,9 @@ def main():
     print(f"Output root: {output_root}")
     print(f"Model path: {model_path}")
     print(f"Lock settings preset: {args.lock_settings}")
+    print(f"No suspicious switching: {cfg.no_suspicious}")
+    print(f"Allow Region1 start: {cfg.allow_region1_start}")
+    print(f"Allow Region2 start: {cfg.allow_region2_start}")
     print(f"Subjects: {args.subjects}")
     print("Camera folders found:", len(camera_folders))
     total = len(camera_folders)

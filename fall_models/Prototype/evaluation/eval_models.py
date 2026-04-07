@@ -10,6 +10,7 @@ Outputs (in --out-dir):
     * per-class (fall, no-fall) precision/recall
     * multi-class macro F1
 - f1_per_class.csv      : per-model/per-split, per-class F1 (multi-class)
+- misclassification_report.xlsx : per-video + per-window activity misclassifications
 - report.html           : tables + plots
 - plots/*.png           : quick comparison plots
 
@@ -85,6 +86,7 @@ from sklearn.metrics import precision_recall_fscore_support, precision_recall_cu
 from dataset_helpers.dataset import (
     find_keypoints_npzs_subjects,
     load_windows_from_npzs,
+    load_windows_with_source_meta_from_npzs,
     WindowTensorDataset,
     detect_label_convention_from_npzs,
     get_new_label_names,
@@ -1255,6 +1257,180 @@ def make_plots(summary_df: pd.DataFrame, plots_dir: Path):
     plt.close()
 
 
+def _relative_path_str(path_value: str | Path, root: Optional[Path] = None) -> str:
+    p = Path(path_value)
+    if root is not None:
+        try:
+            return p.relative_to(root).as_posix()
+        except Exception:
+            pass
+    return p.as_posix()
+
+
+def _video_id_from_npz_path(npz_path: str | Path) -> str:
+    p = Path(npz_path)
+    if p.name.lower() == "keypoints.npz" and p.parent.name:
+        return p.parent.name
+    return p.stem
+
+
+def _label_name(class_names: List[str], label_id: int) -> str:
+    if 0 <= int(label_id) < len(class_names):
+        return str(class_names[int(label_id)])
+    return str(int(label_id))
+
+
+def build_misclassification_video_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "model",
+        "eval_split",
+        "camera",
+        "video_id",
+        "source_npz_relpath",
+        "num_incorrect_windows",
+        "incorrect_windows",
+        "incorrect_window_spans",
+        "mistakes",
+    ]
+    if detail_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: List[Dict[str, object]] = []
+    group_cols = ["model", "eval_split", "camera", "video_id", "source_npz_relpath"]
+    grouped = detail_df.groupby(group_cols, sort=True, dropna=False)
+    for group_key, group in grouped:
+        group_sorted = group.sort_values(
+            ["window_index_in_video", "window_start_frame_sampled", "predicted_confidence"],
+            kind="stable",
+        ).reset_index(drop=True)
+        mistakes = "; ".join(
+            (
+                f"w{int(row.window_index_in_video)} ({row.window_span_sampled}): "
+                f"{row.true_label} -> {row.predicted_label}"
+            )
+            for row in group_sorted.itertuples(index=False)
+        )
+        rows.append({
+            "model": group_key[0],
+            "eval_split": group_key[1],
+            "camera": group_key[2],
+            "video_id": group_key[3],
+            "source_npz_relpath": group_key[4],
+            "num_incorrect_windows": int(len(group_sorted)),
+            "incorrect_windows": ", ".join(f"w{int(v)}" for v in group_sorted["window_index_in_video"].tolist()),
+            "incorrect_window_spans": ", ".join(group_sorted["window_span_sampled"].astype(str).tolist()),
+            "mistakes": mistakes,
+        })
+
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["eval_split", "model", "video_id"],
+        ascending=[True, True, True],
+    ).reset_index(drop=True)
+
+
+def write_misclassification_report(detail_df: pd.DataFrame, out_dir: Path) -> List[Path]:
+    detail_columns = [
+        "model",
+        "eval_split",
+        "camera",
+        "video_id",
+        "source_npz_relpath",
+        "window_index_in_video",
+        "window_span_sampled",
+        "window_start_frame_sampled",
+        "window_end_frame_sampled",
+        "window_frame_count_sampled",
+        "window_is_padded",
+        "true_label",
+        "predicted_label",
+        "true_label_id",
+        "predicted_label_id",
+        "predicted_confidence",
+        "fall_probability",
+    ]
+    detail_prepped = detail_df.copy()
+    for col in detail_columns:
+        if col not in detail_prepped.columns:
+            detail_prepped[col] = pd.Series(dtype="object")
+    detail_prepped = detail_prepped[detail_columns]
+
+    numeric_cols = ["predicted_confidence", "fall_probability"]
+    for col in numeric_cols:
+        if col in detail_prepped.columns:
+            detail_prepped[col] = pd.to_numeric(detail_prepped[col], errors="coerce").round(4)
+
+    detail_prepped = detail_prepped.sort_values(
+        ["eval_split", "model", "video_id", "window_index_in_video"],
+        ascending=[True, True, True, True],
+        kind="stable",
+    ).reset_index(drop=True)
+    video_summary_df = build_misclassification_video_summary(detail_prepped)
+
+    xlsx_path = out_dir / "misclassification_report.xlsx"
+    try:
+        from openpyxl.utils import get_column_letter
+
+        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+            video_summary_df.to_excel(writer, sheet_name="videos_with_errors", index=False)
+            detail_prepped.to_excel(writer, sheet_name="misclassified_windows", index=False)
+
+            for sheet_name, df in (
+                ("videos_with_errors", video_summary_df),
+                ("misclassified_windows", detail_prepped),
+            ):
+                ws = writer.sheets[sheet_name]
+                ws.freeze_panes = "A2"
+                ws.auto_filter.ref = ws.dimensions
+
+                for col_idx, column_name in enumerate(df.columns, start=1):
+                    values = [
+                        "" if pd.isna(v) else str(v)
+                        for v in df[column_name].tolist()
+                    ]
+                    max_len = len(str(column_name))
+                    if values:
+                        max_len = max(max_len, max(len(v) for v in values))
+                    ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 80)
+
+        return [xlsx_path]
+    except Exception as exc:
+        detail_csv = out_dir / "misclassified_windows.csv"
+        video_csv = out_dir / "misclassified_videos.csv"
+        html_path = out_dir / "misclassification_report.html"
+
+        detail_prepped.to_csv(detail_csv, index=False)
+        video_summary_df.to_csv(video_csv, index=False)
+
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Misclassification Report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; color: #222; }}
+    h1, h2 {{ margin-bottom: 8px; }}
+    p {{ margin-top: 0; color: #555; }}
+    table {{ border-collapse: collapse; width: 100%; margin-bottom: 24px; }}
+    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }}
+    th {{ background: #f5f5f5; position: sticky; top: 0; }}
+    tr:nth-child(even) {{ background: #fafafa; }}
+  </style>
+</head>
+<body>
+  <h1>Misclassification Report</h1>
+  <p>Generated by eval_models.py. The summary is grouped by video, and the detailed table lists one row per misclassified window.</p>
+  <h2>Videos With Errors</h2>
+  {video_summary_df.to_html(index=False)}
+  <h2>Misclassified Windows</h2>
+  {detail_prepped.to_html(index=False)}
+</body>
+</html>
+"""
+        html_path.write_text(html, encoding="utf-8")
+        print(f"[report][WARN] Could not write Excel report ({exc}). Wrote CSV/HTML fallback instead.")
+        return [html_path, video_csv, detail_csv]
+
+
 def make_html_report(
     summary_df: pd.DataFrame,
     overall_df: pd.DataFrame,
@@ -1657,6 +1833,7 @@ def main():
     summary_rows: List[Dict[str, object]] = []
     overall_rows: List[Dict[str, object]] = []
     f1_rows: List[Dict[str, object]] = []
+    misclassified_rows: List[Dict[str, object]] = []
 
     ckpt_root = Path(args.ckpt_root)
     ckpt_overrides = parse_ckpt_overrides(args.ckpt)
@@ -2016,7 +2193,7 @@ def main():
             )
 
             # Load windows using ckpt settings
-            X_test, y_test_tags, _T_used = load_windows_from_npzs(
+            X_test, y_test_tags, _T_used, test_meta = load_windows_with_source_meta_from_npzs(
                 split_test_npzs,
                 T=T_ckpt,
                 use_conf=use_conf_ckpt,
@@ -2048,6 +2225,11 @@ def main():
             print(f"[{m}][{split_name}] Window length (T):", T_used)
 
             y_test = y_test_tags.astype(np.int64, copy=False)
+            if int(y_test.shape[0]) != int(np.asarray(test_meta.get("window_source_indices", np.zeros((0,), dtype=np.int64))).shape[0]):
+                raise RuntimeError(
+                    f"[{m}][{split_name}] Source metadata length mismatch: "
+                    f"windows={int(y_test.shape[0])}, meta={int(np.asarray(test_meta.get('window_source_indices', [])).shape[0])}"
+                )
 
             if is_rf:
                 num_classes_eval = int(NUM_CLASSES_MERGED)
@@ -2195,6 +2377,62 @@ def main():
             else:
                 p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based).astype(np.float32)
                 p_fall_source = "rf_predict_proba" if is_rf else "activity_softmax"
+
+            pred_conf = probs_test[np.arange(len(y_pred)), y_pred].astype(np.float32, copy=False)
+            wrong_idx = np.flatnonzero(y_true != y_pred)
+            source_indices = np.asarray(test_meta.get("window_source_indices", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+            source_paths = [str(p) for p in test_meta.get("source_npz_paths", [])]
+            window_candidate_indices = np.asarray(
+                test_meta.get("window_candidate_indices", np.zeros((0,), dtype=np.int64)),
+                dtype=np.int64,
+            )
+            window_start_frames = np.asarray(
+                test_meta.get("window_start_frames_sampled", np.zeros((0,), dtype=np.int64)),
+                dtype=np.int64,
+            )
+            window_end_frames = np.asarray(
+                test_meta.get("window_end_frames_sampled", np.zeros((0,), dtype=np.int64)),
+                dtype=np.int64,
+            )
+            window_frame_counts = np.asarray(
+                test_meta.get("window_frame_counts_sampled", np.zeros((0,), dtype=np.int64)),
+                dtype=np.int64,
+            )
+            window_is_padded = np.asarray(
+                test_meta.get("window_is_padded", np.zeros((0,), dtype=bool)),
+                dtype=bool,
+            )
+            window_camera_ids = np.asarray(
+                test_meta.get("window_camera_ids", np.zeros((0,), dtype=np.int64)),
+                dtype=np.int64,
+            )
+
+            for idx in wrong_idx.tolist():
+                src_idx = int(source_indices[idx]) if idx < len(source_indices) else -1
+                src_path = source_paths[src_idx] if 0 <= src_idx < len(source_paths) else ""
+                true_id = int(y_true[idx])
+                pred_id = int(y_pred[idx])
+                start_frame = int(window_start_frames[idx]) if idx < len(window_start_frames) else -1
+                end_frame = int(window_end_frames[idx]) if idx < len(window_end_frames) else -1
+                misclassified_rows.append({
+                    "model": m,
+                    "eval_split": split_name,
+                    "camera": int(window_camera_ids[idx]) if idx < len(window_camera_ids) else ",".join(str(c) for c in split_camera_ids),
+                    "video_id": _video_id_from_npz_path(src_path) if src_path else "",
+                    "source_npz_relpath": _relative_path_str(src_path, OUTPUT_ROOT) if src_path else "",
+                    "window_index_in_video": int(window_candidate_indices[idx]) if idx < len(window_candidate_indices) else idx,
+                    "window_span_sampled": f"{start_frame}-{end_frame}",
+                    "window_start_frame_sampled": start_frame,
+                    "window_end_frame_sampled": end_frame,
+                    "window_frame_count_sampled": int(window_frame_counts[idx]) if idx < len(window_frame_counts) else None,
+                    "window_is_padded": bool(window_is_padded[idx]) if idx < len(window_is_padded) else None,
+                    "true_label": _label_name(cm_names, true_id),
+                    "predicted_label": _label_name(cm_names, pred_id),
+                    "true_label_id": true_id,
+                    "predicted_label_id": pred_id,
+                    "predicted_confidence": float(pred_conf[idx]),
+                    "fall_probability": float(p_fall_test[idx]),
+                })
 
             tuned_thr = None
             tuned_prec = None
@@ -2375,6 +2613,7 @@ def main():
     f1_csv = out_dir / "f1_per_class.csv"
     summary_df.to_csv(summary_csv, index=False)
     f1_long.to_csv(f1_csv, index=False)
+    misclassification_paths = write_misclassification_report(pd.DataFrame(misclassified_rows), out_dir)
 
     make_plots(summary_df, plots_dir)
     report_path = out_dir / "report.html"
@@ -2385,6 +2624,8 @@ def main():
 
     print(f"Saved: {summary_csv}")
     print(f"Saved: {f1_csv}")
+    for report_file in misclassification_paths:
+        print(f"Saved: {report_file}")
     print(f"Saved: {report_path}")
     print(f"Plots in: {plots_dir.as_posix()}")
 
