@@ -49,6 +49,7 @@ class PoseExportConfig:
     suspicious_start_frames: int = 100
     suspicious_region1_xyxy: Tuple[float, float, float, float] = (540.0, 160.0, 660.0, 230.0)
     suspicious_region2_xyxy: Tuple[float, float, float, float] = (260.0, 100.0, 430.0, 190.0)
+    suspicious_region3_xyxy: Tuple[float, float, float, float] = (465.0, 105.0, 515.0, 190.0)
     suspicious_switch_min_iou: float = 0.35
     suspicious_switch_max_jump_frac: float = 0.25
 
@@ -603,6 +604,9 @@ def classify_suspicious_candidates(
     suspicious = np.zeros((centers.shape[0],), dtype=bool)
     for idx in range(centers.shape[0]):
         if (not allow_region1) and point_in_box(centers[idx], config.suspicious_region1_xyxy):
+            suspicious[idx] = True
+            continue
+        if point_in_box(centers[idx], config.suspicious_region3_xyxy):
             suspicious[idx] = True
             continue
         if region2_active and (not allow_region2) and point_in_box(centers[idx], config.suspicious_region2_xyxy):
