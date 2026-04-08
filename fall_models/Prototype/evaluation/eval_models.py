@@ -1507,6 +1507,36 @@ def _build_transition_eval_info(
     }
 
 
+def _singleton_allowed_label_sets(labels: np.ndarray) -> List[Tuple[int, ...]]:
+    return [(int(v),) for v in np.asarray(labels, dtype=np.int64).reshape(-1).tolist()]
+
+
+def _build_strict_eval_info(
+    *,
+    y_window_labels: np.ndarray,
+    fall_class_ids_0based: List[int],
+    reference_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    y_default = np.asarray(y_window_labels, dtype=np.int64).reshape(-1).copy()
+    y_default_bin = collapse_to_binary(y_default, fall_class_ids_0based)
+
+    if reference_info is not None:
+        unique_counts = np.asarray(reference_info.get("window_unique_label_count", np.ones_like(y_default)), dtype=np.int64).copy()
+        center_labels = np.asarray(reference_info.get("window_center_label", y_default), dtype=np.int64).copy()
+    else:
+        unique_counts = np.ones_like(y_default, dtype=np.int64)
+        center_labels = y_default.copy()
+
+    return {
+        "eval_default_true_multi": y_default,
+        "eval_default_true_bin": y_default_bin,
+        "acceptable_multi_label_ids": _singleton_allowed_label_sets(y_default),
+        "acceptable_binary_labels": _singleton_allowed_label_sets(y_default_bin),
+        "window_unique_label_count": unique_counts,
+        "window_center_label": center_labels,
+    }
+
+
 def _effective_true_labels_from_allowed(
     default_true: np.ndarray,
     y_pred: np.ndarray,
@@ -1555,6 +1585,260 @@ def _binary_metrics_for_allowed_predictions(
         zero_division=0,
     )
     return y_true_eval_bin, pr, rc, f1b
+
+
+def _append_eval_variant_results(
+    *,
+    variant_key: str,
+    variant_cfg: Dict[str, Any],
+    variant_info: Dict[str, Any],
+    model_name: str,
+    split_name: str,
+    split_slug: str,
+    split_camera_ids: List[int],
+    y_model_true: np.ndarray,
+    y_pred: np.ndarray,
+    probs_test: np.ndarray,
+    p_fall_test: np.ndarray,
+    p_fall_source: str,
+    num_classes_eval: int,
+    test_meta: Dict[str, Any],
+    y_window_labels: np.ndarray,
+    output_root: Path,
+    ckpt_path: Path,
+    test_subjects: List[int],
+    frame_step: int,
+    T_ckpt_raw: int,
+    stride_ckpt_raw: int,
+    T_ckpt: int,
+    stride_ckpt: int,
+    normalize_mode_ckpt: str,
+    missing_mode_ckpt: str,
+    interp_mode_ckpt: str,
+    interp_group_ckpt: int,
+    rp_center_mode_ckpt: str,
+    rp_img_w_ckpt: Optional[int],
+    rp_img_h_ckpt: Optional[int],
+    feature_mode_ckpt: str,
+    motion_xy_scale_ckpt: float,
+    model_params_m: float,
+    binary_mode: str,
+    threshold_arg: Optional[float],
+    beta: float,
+    tune_subjects_arg: Optional[str],
+    fall_class_ids_0based: List[int],
+    skipped_test_windows: int,
+    skipped_tune_windows: int,
+    tune_variant_info: Optional[Dict[str, Any]],
+    p_fall_tune: Optional[np.ndarray],
+) -> None:
+    variant_out_dir = Path(variant_cfg["out_dir"])
+    variant_plots_dir = Path(variant_cfg["plots_dir"])
+
+    y_true_default_multi = np.asarray(variant_info["eval_default_true_multi"], dtype=np.int64)
+    y_model_true = np.asarray(y_model_true, dtype=np.int64)
+    y_pred = np.asarray(y_pred, dtype=np.int64)
+    if int(y_model_true.shape[0]) != int(y_true_default_multi.shape[0]):
+        raise RuntimeError(
+            f"[{model_name}][{split_name}][{variant_key}] Prediction/label length mismatch: "
+            f"predictions={int(y_model_true.shape[0])}, labels={int(y_true_default_multi.shape[0])}"
+        )
+
+    acceptable_multi_label_ids = list(variant_info["acceptable_multi_label_ids"])
+    y_true_eval = _effective_true_labels_from_allowed(
+        default_true=y_true_default_multi,
+        y_pred=y_pred,
+        acceptable_label_sets=acceptable_multi_label_ids,
+    )
+
+    labels_all = list(range(int(num_classes_eval)))
+    cm_counts = confusion_matrix(y_true_eval, y_pred, labels=labels_all).astype(np.float64)
+    row_sums = cm_counts.sum(axis=1, keepdims=True) + 1e-9
+    cm = cm_counts / row_sums
+
+    if len(NEW_LABEL_NAMES) >= int(num_classes_eval):
+        cm_names = NEW_LABEL_NAMES[:int(num_classes_eval)]
+    else:
+        cm_names = [str(i) for i in labels_all]
+
+    cm_csv = variant_out_dir / f"confusion_matrix_{model_name}_{split_slug}.csv"
+    pd.DataFrame(cm, index=cm_names, columns=cm_names).to_csv(cm_csv)
+    make_cm_plot(
+        cm,
+        cm_names,
+        variant_plots_dir / f"confusion_matrix_{model_name}_{split_slug}.png",
+        title=f"Confusion Matrix: {model_name} [{split_name}]",
+    )
+
+    eps = 1e-12
+    support = cm_counts.sum(axis=1)
+    valid = support > 0
+    tp = np.diag(cm_counts)
+    pred_support = cm_counts.sum(axis=0)
+    recall = tp / (support + eps)
+    precision = tp / (pred_support + eps)
+    f1 = 2.0 * precision * recall / (precision + recall + eps)
+    specificity = specificity_from_cm(cm_counts, eps=eps)
+
+    total = float(np.sum(cm_counts))
+    acc = float(np.sum(tp) / total) if total > 0 else 0.0
+    macro_recall = float(np.mean(recall[valid])) if np.any(valid) else 0.0
+    macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
+    macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
+    macro_f1 = float(np.mean(f1[valid])) if np.any(valid) else 0.0
+
+    for lab, f1v in zip(labels_all, f1):
+        name = cm_names[lab] if 0 <= lab < len(cm_names) else str(lab)
+        variant_cfg["f1_rows"].append({
+            "model": model_name,
+            "eval_split": split_name,
+            "class_id": int(lab),
+            "class_name": name,
+            "f1": float(f1v),
+        })
+
+    variant_cfg["overall_rows"].append({
+        "model": model_name,
+        "eval_split": split_name,
+        "camera": ",".join(str(c) for c in split_camera_ids),
+        "n_samples": int(len(y_true_eval)),
+        "activity6_majority_missing_skipped_windows": int(skipped_test_windows),
+        "accuracy": float(acc) * 100.0,
+        "recall": float(macro_recall) * 100.0,
+        "specificity": float(macro_specificity) * 100.0,
+        "precision": float(macro_precision) * 100.0,
+        "f1_score": float(macro_f1) * 100.0,
+    })
+
+    y_true_bin_default = np.asarray(variant_info["eval_default_true_bin"], dtype=np.int64)
+    acceptable_binary_labels = list(variant_info["acceptable_binary_labels"])
+    pred_conf = probs_test[np.arange(len(y_pred)), y_pred].astype(np.float32, copy=False)
+    wrong_idx = np.flatnonzero(y_true_eval != y_pred)
+
+    source_indices = np.asarray(test_meta.get("window_source_indices", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    source_paths = [str(p) for p in test_meta.get("source_npz_paths", [])]
+    window_candidate_indices = np.asarray(test_meta.get("window_candidate_indices", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    window_start_frames = np.asarray(test_meta.get("window_start_frames_sampled", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    window_end_frames = np.asarray(test_meta.get("window_end_frames_sampled", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    window_frame_counts = np.asarray(test_meta.get("window_frame_counts_sampled", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    window_is_padded = np.asarray(test_meta.get("window_is_padded", np.zeros((0,), dtype=bool)), dtype=bool)
+    window_camera_ids = np.asarray(test_meta.get("window_camera_ids", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    window_unique_label_counts = np.asarray(variant_info["window_unique_label_count"], dtype=np.int64)
+    window_center_labels = np.asarray(variant_info["window_center_label"], dtype=np.int64)
+
+    for idx in wrong_idx.tolist():
+        src_idx = int(source_indices[idx]) if idx < len(source_indices) else -1
+        src_path = source_paths[src_idx] if 0 <= src_idx < len(source_paths) else ""
+        true_id = int(y_true_default_multi[idx])
+        pred_id = int(y_pred[idx])
+        start_frame = int(window_start_frames[idx]) if idx < len(window_start_frames) else -1
+        end_frame = int(window_end_frames[idx]) if idx < len(window_end_frames) else -1
+        acceptable_ids = tuple(int(v) for v in acceptable_multi_label_ids[idx])
+        acceptable_label_display = _label_ids_to_display(acceptable_ids, cm_names)
+        variant_cfg["misclassified_rows"].append({
+            "model": model_name,
+            "eval_split": split_name,
+            "camera": int(window_camera_ids[idx]) if idx < len(window_camera_ids) else ",".join(str(c) for c in split_camera_ids),
+            "video_id": _video_id_from_npz_path(src_path) if src_path else "",
+            "source_npz_relpath": _relative_path_str(src_path, output_root) if src_path else "",
+            "window_index_in_video": int(window_candidate_indices[idx]) if idx < len(window_candidate_indices) else idx,
+            "window_span_sampled": f"{start_frame}-{end_frame}",
+            "window_start_frame_sampled": start_frame,
+            "window_end_frame_sampled": end_frame,
+            "window_frame_count_sampled": int(window_frame_counts[idx]) if idx < len(window_frame_counts) else None,
+            "window_is_padded": bool(window_is_padded[idx]) if idx < len(window_is_padded) else None,
+            "window_unique_label_count": int(window_unique_label_counts[idx]) if idx < len(window_unique_label_counts) else None,
+            "center_label": _label_name(cm_names, int(window_center_labels[idx])) if idx < len(window_center_labels) else "",
+            "center_label_id": int(window_center_labels[idx]) if idx < len(window_center_labels) else None,
+            "acceptable_true_labels": acceptable_label_display,
+            "acceptable_true_label_ids": ", ".join(str(int(v)) for v in acceptable_ids),
+            "original_true_label": _label_name(cm_names, int(y_window_labels[idx])),
+            "original_true_label_id": int(y_window_labels[idx]),
+            "true_label": acceptable_label_display,
+            "predicted_label": _label_name(cm_names, pred_id),
+            "true_label_id": true_id,
+            "predicted_label_id": pred_id,
+            "predicted_confidence": float(pred_conf[idx]),
+            "fall_probability": float(p_fall_test[idx]),
+        })
+
+    tuned_thr = None
+    tuned_prec = None
+    tuned_rec = None
+    tuned_fbeta = None
+
+    if str(binary_mode).lower() == "argmax":
+        y_pred_bin = collapse_to_binary(y_pred, fall_class_ids_0based)
+        thr = None
+    else:
+        if threshold_arg is not None:
+            thr = float(threshold_arg)
+        elif tune_variant_info is not None and p_fall_tune is not None:
+            y_tune_bin = np.asarray(tune_variant_info["eval_default_true_bin"], dtype=np.int64)
+            acceptable_tune_binary_labels = list(tune_variant_info["acceptable_binary_labels"])
+            thr, tuned_prec, tuned_rec, tuned_fbeta = pick_threshold_fbeta(
+                y_tune_bin,
+                p_fall_tune,
+                beta=float(beta),
+                acceptable_binary_labels=acceptable_tune_binary_labels,
+            )
+            tuned_thr = thr
+        else:
+            thr = 0.5
+
+        y_pred_bin = (p_fall_test >= float(thr)).astype(int)
+
+    chosen_thr = float(thr) if thr is not None else None
+    _, pr, rc, f1b = _binary_metrics_for_allowed_predictions(
+        default_true_bin=y_true_bin_default,
+        acceptable_binary_labels=acceptable_binary_labels,
+        y_pred_bin=y_pred_bin,
+    )
+
+    variant_cfg["summary_rows"].append({
+        "model": model_name,
+        "eval_split": split_name,
+        "n_samples": int(len(y_true_eval)),
+        "activity6_majority_missing_skipped_windows": int(skipped_test_windows),
+        "activity6_majority_missing_skipped_tune_windows": int(skipped_tune_windows),
+        "params_m": float(model_params_m),
+        "macro_f1": float(macro_f1),
+        "binary_mode": str(binary_mode).lower(),
+        "p_fall_source": p_fall_source,
+        "threshold": chosen_thr,
+        "beta": float(beta) if str(binary_mode).lower() == "threshold" else None,
+        "tune_subjects": str(tune_subjects_arg) if tune_subjects_arg is not None else None,
+        "tuned_threshold": tuned_thr,
+        "tuned_precision_fall": tuned_prec,
+        "tuned_recall_fall": tuned_rec,
+        "tuned_fbeta": tuned_fbeta,
+        "binary_precision_avg": float(np.mean(pr)),
+        "binary_sensitivity_avg": float(np.mean(rc)),
+        "binary_precision_fall": float(pr[1]),
+        "binary_sensitivity_fall": float(rc[1]),
+        "binary_precision_no_fall": float(pr[0]),
+        "binary_sensitivity_no_fall": float(rc[0]),
+        "binary_f1_avg": float(np.mean(f1b)),
+        "binary_f1_fall": float(f1b[1]),
+        "binary_f1_no_fall": float(f1b[0]),
+        "weights": ckpt_path.as_posix(),
+        "camera": ",".join(str(c) for c in split_camera_ids),
+        "subjects": ",".join(str(s) for s in test_subjects),
+        "frame_step": int(frame_step),
+        "window_T_raw": int(T_ckpt_raw),
+        "window_stride_raw": int(stride_ckpt_raw),
+        "window_T_sampled": int(T_ckpt),
+        "window_stride_sampled": int(stride_ckpt),
+        "normalize_mode": str(normalize_mode_ckpt),
+        "missing_mode": str(missing_mode_ckpt),
+        "interp_mode": str(interp_mode_ckpt),
+        "interp_group": int(interp_group_ckpt),
+        "rp_center_mode": str(rp_center_mode_ckpt),
+        "rp_img_w": rp_img_w_ckpt,
+        "rp_img_h": rp_img_h_ckpt,
+        "feature_mode": str(feature_mode_ckpt),
+        "motion_xy_scale": float(motion_xy_scale_ckpt),
+    })
 
 
 def pick_threshold_fbeta(
@@ -2287,11 +2571,36 @@ def main():
     base_out = Path(args.out_dir).resolve()
 
     out_dir = base_out / f"{ts}__models_{models_tag}"
-    plots_dir = out_dir / "plots"
     ensure_dir(out_dir)
-    ensure_dir(plots_dir)
 
     print("Eval output dir:", out_dir.as_posix())
+
+    report_variants: Dict[str, Dict[str, Any]] = {
+        "strict_label_mode": {
+            "out_dir": out_dir / "strict_label_mode",
+            "plots_dir": out_dir / "strict_label_mode" / "plots",
+            "summary_rows": [],
+            "overall_rows": [],
+            "f1_rows": [],
+            "misclassified_rows": [],
+            "description": "Only the window label produced by --label-mode is treated as correct.",
+        },
+        "two_label_transition_relaxed": {
+            "out_dir": out_dir / "two_label_transition_relaxed",
+            "plots_dir": out_dir / "two_label_transition_relaxed" / "plots",
+            "summary_rows": [],
+            "overall_rows": [],
+            "f1_rows": [],
+            "misclassified_rows": [],
+            "description": (
+                "If a window contains exactly two label types, predicting either is treated as correct; "
+                "for windows with three or more label types, only the center sampled-frame label is treated as correct."
+            ),
+        },
+    }
+    for variant_cfg in report_variants.values():
+        ensure_dir(Path(variant_cfg["out_dir"]))
+        ensure_dir(Path(variant_cfg["plots_dir"]))
 
     npz_subsample_cache: Dict[str, Path] = {}
     npz_subsample_ctx = None
@@ -2313,10 +2622,6 @@ def main():
         ]
         print(f"[window] --frame-step={frame_step}: using subsampled NPZ cache at {npz_cache_dir.as_posix()}")
 
-    summary_rows: List[Dict[str, object]] = []
-    overall_rows: List[Dict[str, object]] = []
-    f1_rows: List[Dict[str, object]] = []
-    misclassified_rows: List[Dict[str, object]] = []
     frame_has_pose_cache: Dict[Tuple[str, float], np.ndarray] = {}
     frame_label_cache: Dict[Tuple[str, str], np.ndarray] = {}
 
@@ -2812,92 +3117,21 @@ def main():
                     y_true, probs_test, fall_prob_test = predict_probs(model, test_loader, device=args.device)
                     y_pred = probs_test.argmax(axis=1).astype(int)
 
-            y_true_default_multi = np.asarray(test_eval_info["eval_default_true_multi"], dtype=np.int64)
-            if int(y_true.shape[0]) != int(y_true_default_multi.shape[0]):
-                raise RuntimeError(
-                    f"[{m}][{split_name}] Prediction/transition metadata length mismatch: "
-                    f"predictions={int(y_true.shape[0])}, transition_meta={int(y_true_default_multi.shape[0])}"
-                )
-            acceptable_multi_label_ids = list(test_eval_info["acceptable_multi_label_ids"])
-            y_true_eval = _effective_true_labels_from_allowed(
-                default_true=y_true_default_multi,
-                y_pred=y_pred,
-                acceptable_label_sets=acceptable_multi_label_ids,
-            )
-
-            # Confusion matrix
             if not is_rf:
                 if has_state_dict and num_classes is not None:
                     num_classes_eval = int(num_classes)
                 else:
                     num_classes_eval = int(probs_test.shape[1])
-            labels_all = list(range(num_classes_eval))
-            cm_counts = confusion_matrix(y_true_eval, y_pred, labels=labels_all).astype(np.float64)
 
-            # Normalized confusion matrix for CSV/plot
-            row_sums = cm_counts.sum(axis=1, keepdims=True) + 1e-9
-            cm = cm_counts / row_sums
+            test_variant_infos: Dict[str, Dict[str, Any]] = {
+                "strict_label_mode": _build_strict_eval_info(
+                    y_window_labels=y_test,
+                    fall_class_ids_0based=fall_class_ids_0based,
+                    reference_info=test_eval_info,
+                ),
+                "two_label_transition_relaxed": test_eval_info,
+            }
 
-            if len(NEW_LABEL_NAMES) >= num_classes_eval:
-                cm_names = NEW_LABEL_NAMES[:num_classes_eval]
-            else:
-                cm_names = [str(i) for i in labels_all]
-
-            cm_csv = out_dir / f"confusion_matrix_{m}_{split_slug}.csv"
-            pd.DataFrame(cm, index=cm_names, columns=cm_names).to_csv(cm_csv)
-            make_cm_plot(
-                cm,
-                cm_names,
-                plots_dir / f"confusion_matrix_{m}_{split_slug}.png",
-                title=f"Confusion Matrix: {m} [{split_name}]",
-            )
-
-            # Overall multi-class metrics (macro over classes present in this split)
-            eps = 1e-12
-            support = cm_counts.sum(axis=1)
-            valid = support > 0
-
-            tp = np.diag(cm_counts)
-            pred_support = cm_counts.sum(axis=0)
-            recall = tp / (support + eps)
-            precision = tp / (pred_support + eps)
-            f1 = 2.0 * precision * recall / (precision + recall + eps)
-            specificity = specificity_from_cm(cm_counts, eps=eps)
-
-            total = float(np.sum(cm_counts))
-            acc = float(np.sum(tp) / total) if total > 0 else 0.0
-            macro_recall = float(np.mean(recall[valid])) if np.any(valid) else 0.0
-            macro_precision = float(np.mean(precision[valid])) if np.any(valid) else 0.0
-            macro_specificity = float(np.mean(specificity[valid])) if np.any(valid) else 0.0
-            macro_f1 = float(np.mean(f1[valid])) if np.any(valid) else 0.0
-
-            for lab, f1v in zip(labels_all, f1):
-                name = cm_names[lab] if 0 <= lab < len(cm_names) else str(lab)
-                f1_rows.append({
-                    "model": m,
-                    "eval_split": split_name,
-                    "class_id": int(lab),
-                    "class_name": name,
-                    "f1": float(f1v),
-                })
-
-            overall_rows.append({
-                "model": m,
-                "eval_split": split_name,
-                "camera": ",".join(str(c) for c in split_camera_ids),
-                "n_samples": int(len(y_true_eval)),
-                "activity6_majority_missing_skipped_windows": int(skipped_test_windows),
-                "accuracy": float(acc) * 100.0,
-                "recall": float(macro_recall) * 100.0,
-                "specificity": float(macro_specificity) * 100.0,
-                "precision": float(macro_precision) * 100.0,
-                "f1_score": float(macro_f1) * 100.0,
-            })
-
-            y_true_bin_default = np.asarray(test_eval_info["eval_default_true_bin"], dtype=np.int64)
-            acceptable_binary_labels = list(test_eval_info["acceptable_binary_labels"])
-
-            # Binary fall score P(fall)
             if fall_prob_test is not None:
                 p_fall_test = fall_prob_test.astype(np.float32)
                 p_fall_source = "fall_head"
@@ -2905,306 +3139,215 @@ def main():
                 p_fall_test = p_fall_from_probs(probs_test, fall_class_ids_0based).astype(np.float32)
                 p_fall_source = "rf_predict_proba" if is_rf else "activity_softmax"
 
-            pred_conf = probs_test[np.arange(len(y_pred)), y_pred].astype(np.float32, copy=False)
-            wrong_idx = np.flatnonzero(y_true_eval != y_pred)
-            source_indices = np.asarray(test_meta.get("window_source_indices", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
-            source_paths = [str(p) for p in test_meta.get("source_npz_paths", [])]
-            window_candidate_indices = np.asarray(
-                test_meta.get("window_candidate_indices", np.zeros((0,), dtype=np.int64)),
-                dtype=np.int64,
-            )
-            window_start_frames = np.asarray(
-                test_meta.get("window_start_frames_sampled", np.zeros((0,), dtype=np.int64)),
-                dtype=np.int64,
-            )
-            window_end_frames = np.asarray(
-                test_meta.get("window_end_frames_sampled", np.zeros((0,), dtype=np.int64)),
-                dtype=np.int64,
-            )
-            window_frame_counts = np.asarray(
-                test_meta.get("window_frame_counts_sampled", np.zeros((0,), dtype=np.int64)),
-                dtype=np.int64,
-            )
-            window_is_padded = np.asarray(
-                test_meta.get("window_is_padded", np.zeros((0,), dtype=bool)),
-                dtype=bool,
-            )
-            window_camera_ids = np.asarray(
-                test_meta.get("window_camera_ids", np.zeros((0,), dtype=np.int64)),
-                dtype=np.int64,
-            )
-            window_unique_label_counts = np.asarray(
-                test_eval_info["window_unique_label_count"],
-                dtype=np.int64,
-            )
-            window_center_labels = np.asarray(
-                test_eval_info["window_center_label"],
-                dtype=np.int64,
-            )
-
-            for idx in wrong_idx.tolist():
-                src_idx = int(source_indices[idx]) if idx < len(source_indices) else -1
-                src_path = source_paths[src_idx] if 0 <= src_idx < len(source_paths) else ""
-                true_id = int(y_true_default_multi[idx])
-                pred_id = int(y_pred[idx])
-                start_frame = int(window_start_frames[idx]) if idx < len(window_start_frames) else -1
-                end_frame = int(window_end_frames[idx]) if idx < len(window_end_frames) else -1
-                acceptable_ids = tuple(int(v) for v in acceptable_multi_label_ids[idx])
-                acceptable_label_display = _label_ids_to_display(acceptable_ids, cm_names)
-                misclassified_rows.append({
-                    "model": m,
-                    "eval_split": split_name,
-                    "camera": int(window_camera_ids[idx]) if idx < len(window_camera_ids) else ",".join(str(c) for c in split_camera_ids),
-                    "video_id": _video_id_from_npz_path(src_path) if src_path else "",
-                    "source_npz_relpath": _relative_path_str(src_path, OUTPUT_ROOT) if src_path else "",
-                    "window_index_in_video": int(window_candidate_indices[idx]) if idx < len(window_candidate_indices) else idx,
-                    "window_span_sampled": f"{start_frame}-{end_frame}",
-                    "window_start_frame_sampled": start_frame,
-                    "window_end_frame_sampled": end_frame,
-                    "window_frame_count_sampled": int(window_frame_counts[idx]) if idx < len(window_frame_counts) else None,
-                    "window_is_padded": bool(window_is_padded[idx]) if idx < len(window_is_padded) else None,
-                    "window_unique_label_count": int(window_unique_label_counts[idx]) if idx < len(window_unique_label_counts) else None,
-                    "center_label": _label_name(cm_names, int(window_center_labels[idx])) if idx < len(window_center_labels) else "",
-                    "center_label_id": int(window_center_labels[idx]) if idx < len(window_center_labels) else None,
-                    "acceptable_true_labels": acceptable_label_display,
-                    "acceptable_true_label_ids": ", ".join(str(int(v)) for v in acceptable_ids),
-                    "original_true_label": _label_name(cm_names, int(y_test[idx])),
-                    "original_true_label_id": int(y_test[idx]),
-                    "true_label": acceptable_label_display,
-                    "predicted_label": _label_name(cm_names, pred_id),
-                    "true_label_id": true_id,
-                    "predicted_label_id": pred_id,
-                    "predicted_confidence": float(pred_conf[idx]),
-                    "fall_probability": float(p_fall_test[idx]),
-                })
-
-            tuned_thr = None
-            tuned_prec = None
-            tuned_rec = None
-            tuned_fbeta = None
             skipped_tune_windows = 0
-
-            if str(args.binary_mode).lower() == "argmax":
-                y_pred_bin = collapse_to_binary(y_pred, fall_class_ids_0based)
-                thr = None
-            else:
-                # Thresholded decision on P(fall)
-                if args.threshold is not None:
-                    thr = float(args.threshold)
-                elif args.tune_subjects is not None:
-                    tune_subjects = parse_range(args.tune_subjects)
-                    tune_npzs: List[Path] = []
-                    for camera_id in split_camera_ids:
-                        tune_npzs.extend(
-                            Path(p)
-                            for p in find_keypoints_npzs_subjects(
-                                OUTPUT_ROOT,
-                                camera=camera_id,
-                                subjects=tune_subjects,
-                            )
+            tune_variant_infos: Optional[Dict[str, Dict[str, Any]]] = None
+            p_fall_tune: Optional[np.ndarray] = None
+            if str(args.binary_mode).lower() == "threshold" and args.threshold is None and args.tune_subjects is not None:
+                tune_subjects = parse_range(args.tune_subjects)
+                tune_npzs: List[Path] = []
+                for camera_id in split_camera_ids:
+                    tune_npzs.extend(
+                        Path(p)
+                        for p in find_keypoints_npzs_subjects(
+                            OUTPUT_ROOT,
+                            camera=camera_id,
+                            subjects=tune_subjects,
                         )
-                    tune_npzs = sorted(set(tune_npzs), key=lambda p: p.as_posix())
-                    if not tune_npzs:
-                        raise RuntimeError(
-                            f"No tune NPZs found for split={split_name}. "
-                            f"Check OUTPUT_ROOT, camera(s)={split_camera_ids}, and tune subjects."
-                        )
-                    if frame_step > 1:
-                        tune_npzs = _materialize_frame_step_npzs(
-                            npz_paths=tune_npzs,
-                            frame_step=frame_step,
-                            cache_dir=npz_cache_dir,
-                            cache=npz_subsample_cache,
-                        )
-
-                    X_tune, y_tune_tags, _, tune_meta = load_windows_with_source_meta_from_npzs(
-                        tune_npzs,
-                        T=T_ckpt,
-                        use_conf=use_conf_ckpt,
-                        normalize=normalize_ckpt,
-                        normalize_mode=normalize_mode_ckpt,
-                        add_vel=add_vel_ckpt,
-                        add_acc=add_acc_ckpt,
-                        add_global=add_global_ckpt,
-                        feature_mode=feature_mode_ckpt,
-                        motion_xy_scale=motion_xy_scale_ckpt,
-                        conf_thres=conf_thres_ckpt,
-                        max_interp_gap=max_interp_gap_ckpt,
-                        missing_mode=missing_mode_ckpt,
-                        interp_mode=interp_mode_ckpt,
-                        interp_group=interp_group_ckpt,
-                        stride=stride_ckpt,
-                        label_mode=label_mode_ckpt,
-                        min_valid_frac=min_valid_frac_ckpt,
-                        add_mask_channel=add_mask_channel_ckpt,
-                        drop_ambig_share=drop_ambig_share_ckpt,
-                        drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
-                        rp_center_mode=rp_center_mode_ckpt,
-                        rp_img_w=rp_img_w_ckpt,
-                        rp_img_h=rp_img_h_ckpt,
-                        **extra,
-                        label_convention=label_convention,
+                    )
+                tune_npzs = sorted(set(tune_npzs), key=lambda p: p.as_posix())
+                if not tune_npzs:
+                    raise RuntimeError(
+                        f"No tune NPZs found for split={split_name}. "
+                        f"Check OUTPUT_ROOT, camera(s)={split_camera_ids}, and tune subjects."
+                    )
+                if frame_step > 1:
+                    tune_npzs = _materialize_frame_step_npzs(
+                        npz_paths=tune_npzs,
+                        frame_step=frame_step,
+                        cache_dir=npz_cache_dir,
+                        cache=npz_subsample_cache,
                     )
 
-                    y_tune = y_tune_tags.astype(np.int64, copy=False)
-                    X_tune, y_tune, tune_meta, skipped_tune_windows = _drop_activity6_majority_missing_windows(
-                        X_windows=X_tune,
-                        y_windows=y_tune,
-                        meta=tune_meta,
-                        conf_thres=float(conf_thres_ckpt),
-                        frame_has_pose_cache=frame_has_pose_cache,
+                X_tune, y_tune_tags, _, tune_meta = load_windows_with_source_meta_from_npzs(
+                    tune_npzs,
+                    T=T_ckpt,
+                    use_conf=use_conf_ckpt,
+                    normalize=normalize_ckpt,
+                    normalize_mode=normalize_mode_ckpt,
+                    add_vel=add_vel_ckpt,
+                    add_acc=add_acc_ckpt,
+                    add_global=add_global_ckpt,
+                    feature_mode=feature_mode_ckpt,
+                    motion_xy_scale=motion_xy_scale_ckpt,
+                    conf_thres=conf_thres_ckpt,
+                    max_interp_gap=max_interp_gap_ckpt,
+                    missing_mode=missing_mode_ckpt,
+                    interp_mode=interp_mode_ckpt,
+                    interp_group=interp_group_ckpt,
+                    stride=stride_ckpt,
+                    label_mode=label_mode_ckpt,
+                    min_valid_frac=min_valid_frac_ckpt,
+                    add_mask_channel=add_mask_channel_ckpt,
+                    drop_ambig_share=drop_ambig_share_ckpt,
+                    drop_ambig_nonfall_only=drop_ambig_nonfall_only_ckpt,
+                    rp_center_mode=rp_center_mode_ckpt,
+                    rp_img_w=rp_img_w_ckpt,
+                    rp_img_h=rp_img_h_ckpt,
+                    **extra,
+                    label_convention=label_convention,
+                )
+
+                y_tune = y_tune_tags.astype(np.int64, copy=False)
+                X_tune, y_tune, tune_meta, skipped_tune_windows = _drop_activity6_majority_missing_windows(
+                    X_windows=X_tune,
+                    y_windows=y_tune,
+                    meta=tune_meta,
+                    conf_thres=float(conf_thres_ckpt),
+                    frame_has_pose_cache=frame_has_pose_cache,
+                )
+                if skipped_tune_windows > 0:
+                    print(
+                        f"[{m}][{split_name}] skipped {skipped_tune_windows} Activity6 tuning windows "
+                        "with no detected keypoints in the majority of sampled frames"
                     )
-                    if skipped_tune_windows > 0:
-                        print(
-                            f"[{m}][{split_name}] skipped {skipped_tune_windows} Activity6 tuning windows "
-                            "with no detected keypoints in the majority of sampled frames"
-                        )
-                    if int(y_tune.shape[0]) == 0:
-                        raise RuntimeError(
-                            f"[{m}][{split_name}] No tuning windows remain after "
-                            "Activity6 majority-missing-keypoint filtering."
-                        )
-                    tune_eval_info = _build_transition_eval_info(
+                if int(y_tune.shape[0]) == 0:
+                    raise RuntimeError(
+                        f"[{m}][{split_name}] No tuning windows remain after "
+                        "Activity6 majority-missing-keypoint filtering."
+                    )
+
+                tune_transition_eval_info = _build_transition_eval_info(
+                    y_window_labels=y_tune,
+                    meta=tune_meta,
+                    label_convention=label_convention,
+                    fall_class_ids_0based=fall_class_ids_0based,
+                    frame_label_cache=frame_label_cache,
+                )
+                tune_variant_infos = {
+                    "strict_label_mode": _build_strict_eval_info(
                         y_window_labels=y_tune,
-                        meta=tune_meta,
-                        label_convention=label_convention,
                         fall_class_ids_0based=fall_class_ids_0based,
-                        frame_label_cache=frame_label_cache,
+                        reference_info=tune_transition_eval_info,
+                    ),
+                    "two_label_transition_relaxed": tune_transition_eval_info,
+                }
+
+                if is_rf:
+                    probs_tune = rf_predict_probs(
+                        rf_model,
+                        X_windows=X_tune,
+                        feature_mode=rf_feature_mode,
+                        num_classes=num_classes_eval,
+                        expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
                     )
-                    if is_rf:
-                        y_tune_true = y_tune
-                        probs_tune = rf_predict_probs(
-                            rf_model,
-                            X_windows=X_tune,
-                            feature_mode=rf_feature_mode,
-                            num_classes=num_classes_eval,
-                            expected_feature_dim=int(rf_feature_dim) if rf_feature_dim is not None else None,
-                        )
-                        fall_prob_tune = None
-                    elif is_engine:
-                        if engine_runner is None:
-                            raise RuntimeError(f"[{m}] Internal error: TensorRT engine runner was not initialised.")
-                        y_tune_true, probs_tune, fall_prob_tune = predict_probs_engine(
-                            engine_runner,
-                            X_windows=X_tune,
-                            y_true=y_tune,
-                            batch_size=int(args.batch_size),
-                        )
-                    else:
-                        tune_ds = WindowTensorDataset(X_tune, y_tune)
-                        tune_loader = DataLoader(
-                            tune_ds,
-                            batch_size=args.batch_size,
-                            shuffle=False,
-                            drop_last=False,
-                            num_workers=args.num_workers,
-                            pin_memory=True,
-                        )
-
-                        y_tune_true, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
-                    y_tune_bin = np.asarray(tune_eval_info["eval_default_true_bin"], dtype=np.int64)
-                    acceptable_tune_binary_labels = list(tune_eval_info["acceptable_binary_labels"])
-
-                    if fall_prob_tune is not None:
-                        p_fall_tune = fall_prob_tune.astype(np.float32)
-                    else:
-                        p_fall_tune = p_fall_from_probs(probs_tune, fall_class_ids_0based).astype(np.float32)
-
-                    thr, tuned_prec, tuned_rec, tuned_fbeta = pick_threshold_fbeta(
-                        y_tune_bin,
-                        p_fall_tune,
-                        beta=float(args.beta),
-                        acceptable_binary_labels=acceptable_tune_binary_labels,
+                    fall_prob_tune = None
+                elif is_engine:
+                    if engine_runner is None:
+                        raise RuntimeError(f"[{m}] Internal error: TensorRT engine runner was not initialised.")
+                    _y_tune_true_unused, probs_tune, fall_prob_tune = predict_probs_engine(
+                        engine_runner,
+                        X_windows=X_tune,
+                        y_true=y_tune,
+                        batch_size=int(args.batch_size),
                     )
-                    tuned_thr = thr
                 else:
-                    thr = 0.5
+                    tune_ds = WindowTensorDataset(X_tune, y_tune)
+                    tune_loader = DataLoader(
+                        tune_ds,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        drop_last=False,
+                        num_workers=args.num_workers,
+                        pin_memory=True,
+                    )
+                    _y_tune_true_unused, probs_tune, fall_prob_tune = predict_probs(model, tune_loader, device=args.device)
 
-                y_pred_bin = (p_fall_test >= float(thr)).astype(int)
+                if fall_prob_tune is not None:
+                    p_fall_tune = fall_prob_tune.astype(np.float32)
+                else:
+                    p_fall_tune = p_fall_from_probs(probs_tune, fall_class_ids_0based).astype(np.float32)
 
-            # Keep for reporting
-            chosen_thr = float(thr) if thr is not None else None
+            for variant_key, variant_info in test_variant_infos.items():
+                _append_eval_variant_results(
+                    variant_key=variant_key,
+                    variant_cfg=report_variants[variant_key],
+                    variant_info=variant_info,
+                    model_name=m,
+                    split_name=split_name,
+                    split_slug=split_slug,
+                    split_camera_ids=split_camera_ids,
+                    y_model_true=y_true,
+                    y_pred=y_pred,
+                    probs_test=probs_test,
+                    p_fall_test=p_fall_test,
+                    p_fall_source=p_fall_source,
+                    num_classes_eval=int(num_classes_eval),
+                    test_meta=test_meta,
+                    y_window_labels=y_test,
+                    output_root=OUTPUT_ROOT,
+                    ckpt_path=ckpt_path,
+                    test_subjects=test_subjects,
+                    frame_step=int(frame_step),
+                    T_ckpt_raw=int(T_ckpt_raw),
+                    stride_ckpt_raw=int(stride_ckpt_raw),
+                    T_ckpt=int(T_ckpt),
+                    stride_ckpt=int(stride_ckpt),
+                    normalize_mode_ckpt=str(normalize_mode_ckpt),
+                    missing_mode_ckpt=str(missing_mode_ckpt),
+                    interp_mode_ckpt=str(interp_mode_ckpt),
+                    interp_group_ckpt=int(interp_group_ckpt),
+                    rp_center_mode_ckpt=str(rp_center_mode_ckpt),
+                    rp_img_w_ckpt=rp_img_w_ckpt,
+                    rp_img_h_ckpt=rp_img_h_ckpt,
+                    feature_mode_ckpt=str(feature_mode_ckpt),
+                    motion_xy_scale_ckpt=float(motion_xy_scale_ckpt),
+                    model_params_m=float(model_params_m),
+                    binary_mode=str(args.binary_mode),
+                    threshold_arg=args.threshold,
+                    beta=float(args.beta),
+                    tune_subjects_arg=args.tune_subjects,
+                    fall_class_ids_0based=fall_class_ids_0based,
+                    skipped_test_windows=int(skipped_test_windows),
+                    skipped_tune_windows=int(skipped_tune_windows),
+                    tune_variant_info=tune_variant_infos.get(variant_key) if tune_variant_infos is not None else None,
+                    p_fall_tune=p_fall_tune,
+                )
 
-            _, pr, rc, f1b = _binary_metrics_for_allowed_predictions(
-                default_true_bin=y_true_bin_default,
-                acceptable_binary_labels=acceptable_binary_labels,
-                y_pred_bin=y_pred_bin,
-            )
-
-            summary_rows.append({
-                "model": m,
-                "eval_split": split_name,
-                "n_samples": int(len(y_true_eval)),
-                "activity6_majority_missing_skipped_windows": int(skipped_test_windows),
-                "activity6_majority_missing_skipped_tune_windows": int(skipped_tune_windows),
-                "params_m": float(model_params_m),
-                "macro_f1": float(macro_f1),
-                "binary_mode": str(args.binary_mode).lower(),
-                "p_fall_source": p_fall_source,  # records which score was used
-                "threshold": chosen_thr,
-                "beta": float(args.beta) if str(args.binary_mode).lower() == "threshold" else None,
-                "tune_subjects": str(args.tune_subjects) if args.tune_subjects is not None else None,
-                "tuned_threshold": tuned_thr,
-                "tuned_precision_fall": tuned_prec,
-                "tuned_recall_fall": tuned_rec,
-                "tuned_fbeta": tuned_fbeta,
-                "binary_precision_avg": float(np.mean(pr)),
-                "binary_sensitivity_avg": float(np.mean(rc)),
-                "binary_precision_fall": float(pr[1]),
-                "binary_sensitivity_fall": float(rc[1]),
-                "binary_precision_no_fall": float(pr[0]),
-                "binary_sensitivity_no_fall": float(rc[0]),
-                "binary_f1_avg": float(np.mean(f1b)),
-                "binary_f1_fall": float(f1b[1]),
-                "binary_f1_no_fall": float(f1b[0]),
-                "weights": ckpt_path.as_posix(),
-                "camera": ",".join(str(c) for c in split_camera_ids),
-                "subjects": ",".join(str(s) for s in test_subjects),
-                "frame_step": int(frame_step),
-                "window_T_raw": int(T_ckpt_raw),
-                "window_stride_raw": int(stride_ckpt_raw),
-                "window_T_sampled": int(T_ckpt),
-                "window_stride_sampled": int(stride_ckpt),
-                "normalize_mode": str(normalize_mode_ckpt),
-                "missing_mode": str(missing_mode_ckpt),
-                "interp_mode": str(interp_mode_ckpt),
-                "interp_group": int(interp_group_ckpt),
-                "rp_center_mode": str(rp_center_mode_ckpt),
-                "rp_img_w": rp_img_w_ckpt,
-                "rp_img_h": rp_img_h_ckpt,
-                "feature_mode": str(feature_mode_ckpt),
-                "motion_xy_scale": float(motion_xy_scale_ckpt),
-            })
-
-    if not summary_rows:
+    if not any(variant_cfg["summary_rows"] for variant_cfg in report_variants.values()):
         raise RuntimeError("No models were evaluated. Check --models/--all and --frame-step compatibility.")
 
-    summary_df = pd.DataFrame(summary_rows).sort_values(
-        ["eval_split", "macro_f1"],
-        ascending=[True, False],
-    ).reset_index(drop=True)
-    f1_long = pd.DataFrame(f1_rows).sort_values(["eval_split", "model", "class_id"]).reset_index(drop=True)
-    overall_df = pd.DataFrame(overall_rows).sort_values(["eval_split", "model"]).reset_index(drop=True).round(3)
+    for variant_key, variant_cfg in report_variants.items():
+        if not variant_cfg["summary_rows"]:
+            continue
 
-    summary_csv = out_dir / "metrics_summary.csv"
-    f1_csv = out_dir / "f1_per_class.csv"
-    summary_df.to_csv(summary_csv, index=False)
-    f1_long.to_csv(f1_csv, index=False)
-    misclassification_paths = write_misclassification_report(pd.DataFrame(misclassified_rows), out_dir)
+        variant_out_dir = Path(variant_cfg["out_dir"])
+        variant_plots_dir = Path(variant_cfg["plots_dir"])
+        summary_df = pd.DataFrame(variant_cfg["summary_rows"]).sort_values(
+            ["eval_split", "macro_f1"],
+            ascending=[True, False],
+        ).reset_index(drop=True)
+        f1_long = pd.DataFrame(variant_cfg["f1_rows"]).sort_values(["eval_split", "model", "class_id"]).reset_index(drop=True)
+        overall_df = pd.DataFrame(variant_cfg["overall_rows"]).sort_values(["eval_split", "model"]).reset_index(drop=True).round(3)
 
-    make_plots(summary_df, plots_dir)
-    report_path = out_dir / "report.html"
-    make_html_report(summary_df, overall_df, f1_long, plots_dir, report_path, model_list)
+        summary_csv = variant_out_dir / "metrics_summary.csv"
+        f1_csv = variant_out_dir / "f1_per_class.csv"
+        summary_df.to_csv(summary_csv, index=False)
+        f1_long.to_csv(f1_csv, index=False)
+        misclassification_paths = write_misclassification_report(pd.DataFrame(variant_cfg["misclassified_rows"]), variant_out_dir)
 
-    print("\nOverall metrics (%):")
-    print(overall_df.to_string(index=False))
+        make_plots(summary_df, variant_plots_dir)
+        report_path = variant_out_dir / "report.html"
+        make_html_report(summary_df, overall_df, f1_long, variant_plots_dir, report_path, model_list)
 
-    print(f"Saved: {summary_csv}")
-    print(f"Saved: {f1_csv}")
-    for report_file in misclassification_paths:
-        print(f"Saved: {report_file}")
-    print(f"Saved: {report_path}")
-    print(f"Plots in: {plots_dir.as_posix()}")
+        print(f"\nOverall metrics (%) [{variant_key}]:")
+        print(overall_df.to_string(index=False))
+        print(f"[{variant_key}] {variant_cfg['description']}")
+        print(f"Saved: {summary_csv}")
+        print(f"Saved: {f1_csv}")
+        for report_file in misclassification_paths:
+            print(f"Saved: {report_file}")
+        print(f"Saved: {report_path}")
+        print(f"Plots in: {variant_plots_dir.as_posix()}")
 
 
 if __name__ == "__main__":
