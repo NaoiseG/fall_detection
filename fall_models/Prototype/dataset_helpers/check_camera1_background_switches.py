@@ -362,7 +362,7 @@ def build_camera1_majority_flagged_window_mask(
     *,
     meta: Dict[str, object],
     frame_mask_cache: Dict[str, np.ndarray] | None = None,
-    majority_fraction: float = 0.5,
+    majority_fraction: float = 0.33,
     conf_thres: float = 0.3,
     reference_scale_percentile: float = 65.0,
     background_scale_ratio: float = 0.6,

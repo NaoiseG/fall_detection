@@ -967,7 +967,7 @@ def train_model_once(
                 "drop_ambig_share": float(drop_ambig_share),
                 "drop_ambig_nonfall_only": bool(drop_ambig_nonfall_only),
                 "drop_camera1_background_majority_windows": True,
-                "camera1_background_majority_fraction": 0.5,
+                "camera1_background_majority_fraction": 0.33,
                 "rp_center_mode": str(rp_center_mode),
                 "rp_img_w": int(rp_img_w) if rp_img_w is not None else None,
                 "rp_img_h": int(rp_img_h) if rp_img_h is not None else None,

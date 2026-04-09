@@ -123,6 +123,7 @@ import pickle
 # =============================================================================
 NUM_CLASSES_MERGED = 7
 FALL_CLASS_ID = 0
+CAMERA1_BACKGROUND_MAJORITY_FRACTION = 0.33
 
 # FALL_MERGE_SET and NEW_LABEL_NAMES are filled after we scan NPZ labels.
 FALL_MERGE_SET: set[int] = set()
@@ -447,6 +448,7 @@ def _drop_camera1_majority_background_windows(
     skip_mask = build_camera1_majority_flagged_window_mask(
         meta=meta,
         frame_mask_cache=frame_mask_cache,
+        majority_fraction=float(CAMERA1_BACKGROUND_MAJORITY_FRACTION),
     )
     skipped = int(np.count_nonzero(skip_mask))
     if skipped <= 0:
@@ -2261,6 +2263,10 @@ def make_html_report(
     def df_to_html(df: pd.DataFrame) -> str:
         return df.to_html(index=False, escape=False, classes="tbl")
 
+    f1_display_df = f1_long.copy()
+    if "class_name" in f1_display_df.columns and "class_id" in f1_display_df.columns:
+        f1_display_df = f1_display_df.drop(columns=["class_id"])
+
     css = """
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111;}
     h1,h2{margin:0.2em 0;}
@@ -2327,7 +2333,7 @@ def make_html_report(
   </div>
 
   <h2>F1 per class (multi-class)</h2>
-  {df_to_html(f1_long)}
+  {df_to_html(f1_display_df)}
 
   <h2>Confusion matrices</h2>
   <p>Rows are true labels, columns are predicted labels. Labels follow the merged 7-class scheme.</p>
@@ -2345,6 +2351,8 @@ def make_html_report(
 
 
 def main():
+    global FALL_MERGE_SET, NEW_LABEL_NAMES
+
     # NEW: added "cnnlstm"
     ALL_MODELS = ["tcn", "lstm", "paper_lstm", "gru", "gcn", "mlp", "stgcn", "paper_stgcn", "cnnlstm", "rf"]
 
