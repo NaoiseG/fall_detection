@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Flag Camera1 .npz files where the selected pose track appears to switch onto a
-small person in the upper/background area of the scene.
+Flag Camera1 .npz files where the selected pose track either:
+- switches onto a small person in the upper/background area, or
+- locks onto a small upper/background reflection/person from the start and
+  never meaningfully acquires the foreground subject.
 
 Behavior:
 - Only scans Camera1 files
 - Uses absolute pixel coordinates, not normalized coordinates
 - Measures both pose center and body scale from the selected track
 - Looks for sustained background-like runs after an initial guard period
+- Also looks for persistent reflection/background-like locking from the start
 - CSV output includes suspicious entries only
 - No CSV unless --output is provided
 
@@ -234,6 +237,13 @@ def first_run_start(runs: Sequence[Run]) -> int:
     return runs[0][0] if runs else -1
 
 
+def fraction_true(mask: np.ndarray, valid_mask: np.ndarray) -> float:
+    denom = int(np.sum(valid_mask))
+    if denom <= 0:
+        return 0.0
+    return float(np.sum(mask & valid_mask)) / float(denom)
+
+
 def analyze_npz(
     npz_path: Path,
     conf_thres: float,
@@ -246,6 +256,13 @@ def analyze_npz(
     min_valid_fraction: float,
     min_background_fraction: float,
     min_background_runs: int,
+    reflection_start_frames: int,
+    reflection_max_scale_px: float,
+    reflection_max_cy_px: float,
+    min_reflection_fraction: float,
+    min_reflection_start_fraction: float,
+    min_reflection_run_frames: int,
+    min_reflection_start_valid_frames: int,
 ) -> Dict[str, object]:
     data = np.load(npz_path, allow_pickle=True)
 
@@ -322,15 +339,47 @@ def analyze_npz(
     background_lengths = run_lengths(background_runs)
     qualifying_lengths = run_lengths(qualifying_runs)
 
-    suspicious = (
+    background_switch_suspicious = (
         valid_fraction >= min_valid_fraction
         and qualifying_background_fraction >= min_background_fraction
         and len(qualifying_runs) >= min_background_runs
     )
 
+    reflection_like_mask = (
+        valid_mask
+        & (scales <= float(reflection_max_scale_px))
+        & (centers[:, 1] <= float(reflection_max_cy_px))
+    )
+    reflection_like_mask = close_short_gaps(reflection_like_mask, gap_frames)
+    reflection_runs = find_runs(reflection_like_mask, min_reflection_run_frames)
+    reflection_lengths = run_lengths(reflection_runs)
+    reflection_fraction = fraction_from_runs(reflection_runs, valid_count)
+
+    start_n = min(len(reflection_like_mask), max(0, int(reflection_start_frames)))
+    start_valid_mask = valid_mask[:start_n]
+    start_reflection_mask = reflection_like_mask[:start_n]
+    start_valid_count = int(np.sum(start_valid_mask))
+    start_reflection_fraction = fraction_true(start_reflection_mask, start_valid_mask)
+    reflection_start_runs = find_runs(start_reflection_mask, min_reflection_run_frames)
+    reflection_start_lengths = run_lengths(reflection_start_runs)
+
+    persistent_reflection_lock = (
+        start_valid_count >= int(min_reflection_start_valid_frames)
+        and start_reflection_fraction >= float(min_reflection_start_fraction)
+        and reflection_fraction >= float(min_reflection_fraction)
+    )
+
+    suspicious = bool(background_switch_suspicious or persistent_reflection_lock)
+    suspicious_reasons = []
+    if background_switch_suspicious:
+        suspicious_reasons.append("background_switch")
+    if persistent_reflection_lock:
+        suspicious_reasons.append("persistent_reflection_lock")
+
     meta = parse_path_metadata(npz_path)
     first_background_frame = first_run_start(background_runs)
     first_qualifying_frame = first_run_start(qualifying_runs)
+    first_reflection_frame = first_run_start(reflection_runs)
 
     return {
         "file": str(npz_path),
@@ -357,6 +406,7 @@ def analyze_npz(
         "reference_frame_count": reference_count,
         "background_fraction": round(background_fraction, 4),
         "qualifying_background_fraction": round(qualifying_background_fraction, 4),
+        "background_switch_suspicious": bool(background_switch_suspicious),
         "background_run_count": len(background_runs),
         "qualifying_background_run_count": len(qualifying_runs),
         "longest_background_run_frames": max(background_lengths) if background_lengths else 0,
@@ -368,6 +418,16 @@ def analyze_npz(
         if first_qualifying_frame >= 0 else np.nan,
         "background_run_spans": spans_to_text(background_runs),
         "qualifying_background_run_spans": spans_to_text(qualifying_runs),
+        "reflection_like_fraction": round(reflection_fraction, 4),
+        "start_reflection_like_fraction": round(start_reflection_fraction, 4),
+        "reflection_run_count": len(reflection_runs),
+        "longest_reflection_run_frames": max(reflection_lengths) if reflection_lengths else 0,
+        "longest_start_reflection_run_frames": max(reflection_start_lengths) if reflection_start_lengths else 0,
+        "first_reflection_frame": first_reflection_frame,
+        "first_reflection_sec": round(first_reflection_frame / fps, 3) if first_reflection_frame >= 0 else np.nan,
+        "reflection_run_spans": spans_to_text(reflection_runs),
+        "persistent_reflection_lock": bool(persistent_reflection_lock),
+        "suspicious_reasons": ",".join(suspicious_reasons),
         "suspicious": bool(suspicious),
     }
 
@@ -461,6 +521,48 @@ def main() -> None:
         default=1,
         help="Minimum number of qualifying background runs required to flag a clip",
     )
+    parser.add_argument(
+        "--reflection-start-frames",
+        type=int,
+        default=120,
+        help="Frames from the start used to detect a persistent reflection/background lock",
+    )
+    parser.add_argument(
+        "--reflection-max-scale-px",
+        type=float,
+        default=140.0,
+        help="Reflection-like tracks must stay at or below this body-scale threshold",
+    )
+    parser.add_argument(
+        "--reflection-max-cy-px",
+        type=float,
+        default=240.0,
+        help="Reflection-like tracks must stay at or above this upper-frame center-y threshold",
+    )
+    parser.add_argument(
+        "--min-reflection-fraction",
+        type=float,
+        default=0.8,
+        help="Minimum fraction of valid frames that must look reflection-like to flag a persistent lock",
+    )
+    parser.add_argument(
+        "--min-reflection-start-fraction",
+        type=float,
+        default=0.8,
+        help="Minimum reflection-like fraction in the early clip to flag a persistent lock",
+    )
+    parser.add_argument(
+        "--min-reflection-run-frames",
+        type=int,
+        default=6,
+        help="Minimum contiguous reflection-like frames required for a reflection run",
+    )
+    parser.add_argument(
+        "--min-reflection-start-valid-frames",
+        type=int,
+        default=8,
+        help="Minimum number of valid early frames required before reflection-start checks apply",
+    )
 
     args = parser.parse_args()
 
@@ -484,16 +586,24 @@ def main() -> None:
                 min_valid_fraction=args.min_valid_fraction,
                 min_background_fraction=args.min_background_fraction,
                 min_background_runs=args.min_background_runs,
+                reflection_start_frames=args.reflection_start_frames,
+                reflection_max_scale_px=args.reflection_max_scale_px,
+                reflection_max_cy_px=args.reflection_max_cy_px,
+                min_reflection_fraction=args.min_reflection_fraction,
+                min_reflection_start_fraction=args.min_reflection_start_fraction,
+                min_reflection_run_frames=args.min_reflection_run_frames,
+                min_reflection_start_valid_frames=args.min_reflection_start_valid_frames,
             )
             rows.append(row)
 
             if row["suspicious"]:
                 print(
                     f"[{idx}/{len(files)}] SUSPICIOUS | "
+                    f"reasons={row['suspicious_reasons']} | "
                     f"bg_frac={row['qualifying_background_fraction']:.2f} | "
-                    f"runs={row['qualifying_background_run_count']} | "
+                    f"refl_frac={row['reflection_like_fraction']:.2f} | "
                     f"first_bg={row['first_qualifying_background_frame']} | "
-                    f"ref_scale={row['reference_scale_px']:.1f} | "
+                    f"first_refl={row['first_reflection_frame']} | "
                     f"{npz_path}"
                 )
 
@@ -509,9 +619,11 @@ def main() -> None:
         for row in suspicious_rows[:100]:
             print(
                 f"- {row['file']} | "
+                f"reasons={row['suspicious_reasons']} | "
                 f"bg_frac={row['qualifying_background_fraction']} | "
-                f"runs={row['qualifying_background_run_count']} | "
-                f"spans={row['qualifying_background_run_spans']}"
+                f"refl_frac={row['reflection_like_fraction']} | "
+                f"bg_spans={row['qualifying_background_run_spans']} | "
+                f"refl_spans={row['reflection_run_spans']}"
             )
 
     if failed:

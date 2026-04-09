@@ -126,6 +126,21 @@ def main():
             "'strict_lock' preserves the settings that were previously hard-coded here."
         ),
     )
+    ap.add_argument(
+        "--camera1-foreground-guard",
+        dest="camera1_foreground_guard",
+        action="store_true",
+        help=(
+            "For Camera1, prefer larger/lower foreground candidates before the track is "
+            "permanently locked, which helps avoid sticking to reflections."
+        ),
+    )
+    ap.add_argument(
+        "--no-camera1-foreground-guard",
+        dest="camera1_foreground_guard",
+        action="store_false",
+        help="Disable the Camera1 foreground-acquisition guard.",
+    )
     ap.add_argument("--conf-thres", type=float, default=None, help="Override detector confidence threshold.")
     ap.add_argument("--conf-min", type=float, default=None, help="Override minimum confidence used when selecting the tracked target.")
     ap.add_argument("--detector-max-det", type=int, default=None, help="Override the maximum number of detector candidates considered per frame.")
@@ -139,6 +154,24 @@ def main():
     ap.add_argument("--max-lost", type=int, default=None, help="Override the number of consecutive lost frames tolerated before reset logic applies.")
     ap.add_argument("--min-iou-same-track", type=float, default=None, help="Override the minimum IoU required to stay on the same track after lock.")
     ap.add_argument("--max-box-area-ratio", type=float, default=None, help="Override the allowed box-area ratio change when staying on the same track.")
+    ap.add_argument(
+        "--acquire-min-box-area-ratio",
+        type=float,
+        default=None,
+        help="Override the minimum prelock candidate box-area ratio used by the Camera1 foreground guard.",
+    )
+    ap.add_argument(
+        "--acquire-bottom-margin-px",
+        type=float,
+        default=None,
+        help="Override the bottom-edge margin used by the Camera1 foreground guard.",
+    )
+    ap.add_argument(
+        "--lock-delay-frames",
+        type=int,
+        default=None,
+        help="Override the number of initial frames to wait before making the first lock permanent.",
+    )
     ap.add_argument("--target-x-frac", type=float, default=None, help="Override the horizontal target-acquisition anchor as a fraction of image width.")
     ap.add_argument("--target-y-frac", type=float, default=None, help="Override the vertical target-acquisition anchor as a fraction of image height.")
     ap.add_argument(
@@ -174,7 +207,12 @@ def main():
     ap.add_argument("--no-strict-reacquire", dest="strict_reacquire", action="store_false", help="Disable strict locked-target reacquisition checks.")
     ap.add_argument("--reset-on-max-lost", dest="reset_on_max_lost", action="store_true", help="Reset the tracked target after too many consecutive lost frames.")
     ap.add_argument("--no-reset-on-max-lost", dest="reset_on_max_lost", action="store_false", help="Disable reset after too many consecutive lost frames.")
-    ap.set_defaults(lock_first_target=None, strict_reacquire=None, reset_on_max_lost=None)
+    ap.set_defaults(
+        lock_first_target=None,
+        strict_reacquire=None,
+        reset_on_max_lost=None,
+        camera1_foreground_guard=None,
+    )
     args = ap.parse_args()
 
     upfall_root = args.upfall_root.expanduser().resolve()
@@ -210,6 +248,14 @@ def main():
     cfg.allow_region1_start = bool(args.allow_region1_start and int(args.camera) == 2)
     cfg.allow_region2_start = bool(args.allow_region2_start and int(args.camera) == 2)
 
+    if int(args.camera) == 1:
+        if args.camera1_foreground_guard is None:
+            cfg.prefer_foreground_on_acquire = True
+            if args.lock_delay_frames is None:
+                cfg.lock_delay_frames = 30
+        else:
+            cfg.prefer_foreground_on_acquire = bool(args.camera1_foreground_guard)
+
     overrides = {
         "conf_thres": args.conf_thres,
         "conf_min": args.conf_min,
@@ -219,6 +265,9 @@ def main():
         "max_lost": args.max_lost,
         "min_iou_same_track": args.min_iou_same_track,
         "max_box_area_ratio": args.max_box_area_ratio,
+        "acquire_min_box_area_ratio": args.acquire_min_box_area_ratio,
+        "acquire_bottom_margin_px": args.acquire_bottom_margin_px,
+        "lock_delay_frames": args.lock_delay_frames,
         "target_x_frac": args.target_x_frac,
         "target_y_frac": args.target_y_frac,
         "lock_first_target": args.lock_first_target,
@@ -243,6 +292,10 @@ def main():
     print(f"No suspicious switching: {cfg.no_suspicious}")
     print(f"Allow Region1 start: {cfg.allow_region1_start}")
     print(f"Allow Region2 start: {cfg.allow_region2_start}")
+    print(f"Prefer foreground on acquire: {cfg.prefer_foreground_on_acquire}")
+    print(f"Acquire min box-area ratio: {cfg.acquire_min_box_area_ratio}")
+    print(f"Acquire bottom margin px: {cfg.acquire_bottom_margin_px}")
+    print(f"Lock delay frames: {cfg.lock_delay_frames}")
     print(f"Subjects: {args.subjects}")
     print("Camera folders found:", len(camera_folders))
     total = len(camera_folders)

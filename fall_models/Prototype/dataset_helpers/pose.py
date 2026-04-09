@@ -52,6 +52,10 @@ class PoseExportConfig:
     suspicious_region3_xyxy: Tuple[float, float, float, float] = (465.0, 105.0, 515.0, 190.0)
     suspicious_switch_min_iou: float = 0.35
     suspicious_switch_max_jump_frac: float = 0.25
+    prefer_foreground_on_acquire: bool = False
+    acquire_min_box_area_ratio: float = 0.35
+    acquire_bottom_margin_px: float = 60.0
+    lock_delay_frames: int = 0
 
 
 POSE_LOCK_SETTINGS_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -682,6 +686,57 @@ def choose_locked_candidate(
     return best_idx, best_iou, best_dist
 
 
+def choose_foreground_acquire_candidates(
+    candidate_idx: np.ndarray,
+    boxes_xyxy: np.ndarray,
+    box_conf: Optional[np.ndarray],
+    conf_min: float,
+    min_box_area_ratio: float,
+    bottom_margin_px: float,
+) -> np.ndarray:
+    candidate_idx = np.asarray(candidate_idx, dtype=np.int32).reshape(-1)
+    if candidate_idx.size == 0:
+        return candidate_idx
+
+    area_ratio = float(max(0.0, min_box_area_ratio))
+    bottom_margin = float(max(0.0, bottom_margin_px))
+
+    areas = np.asarray(
+        [_box_area_xyxy(boxes_xyxy[idx]) for idx in candidate_idx.tolist()],
+        dtype=np.float32,
+    )
+    bottoms = np.asarray(
+        [float(np.asarray(boxes_xyxy[idx], dtype=np.float32).reshape(-1)[3]) for idx in candidate_idx.tolist()],
+        dtype=np.float32,
+    )
+
+    finite_mask = np.isfinite(areas) & np.isfinite(bottoms)
+    if np.any(finite_mask):
+        max_area = float(np.max(areas[finite_mask]))
+        max_bottom = float(np.max(bottoms[finite_mask]))
+        keep_mask = finite_mask.copy()
+        if max_area > 0.0:
+            keep_mask &= areas >= (max_area * area_ratio)
+        keep_mask &= bottoms >= (max_bottom - bottom_margin)
+        if np.any(keep_mask):
+            candidate_idx = candidate_idx[keep_mask]
+
+    if candidate_idx.size == 0 or box_conf is None:
+        return candidate_idx
+
+    conf_ok = []
+    for idx in candidate_idx.tolist():
+        if idx >= box_conf.shape[0]:
+            continue
+        conf_val = float(box_conf[idx])
+        if np.isfinite(conf_val) and conf_val >= conf_min:
+            conf_ok.append(idx)
+
+    if conf_ok:
+        return np.asarray(conf_ok, dtype=np.int32)
+    return candidate_idx
+
+
 def select_person_idx(
     box_centers: np.ndarray,
     box_conf: Optional[np.ndarray],
@@ -699,6 +754,9 @@ def select_person_idx(
     prev_selected_was_suspicious: bool = False,
     suspicious_switch_min_iou: float = 0.35,
     suspicious_switch_max_jump_frac: float = 0.25,
+    prefer_foreground_on_acquire: bool = False,
+    acquire_min_box_area_ratio: float = 0.35,
+    acquire_bottom_margin_px: float = 60.0,
 ) -> Tuple[Optional[int], Optional[np.ndarray]]:
     """
     Single-target selection:
@@ -731,7 +789,19 @@ def select_person_idx(
         if non_suspicious.size == 0:
             return None, prev_center
         candidate_idx = non_suspicious
-        if box_conf is not None:
+
+        if prefer_foreground_on_acquire:
+            candidate_idx = choose_foreground_acquire_candidates(
+                candidate_idx=candidate_idx,
+                boxes_xyxy=boxes_xyxy,
+                box_conf=box_conf,
+                conf_min=conf_min,
+                min_box_area_ratio=acquire_min_box_area_ratio,
+                bottom_margin_px=acquire_bottom_margin_px,
+            )
+            if candidate_idx.size == 0:
+                return None, prev_center
+        elif box_conf is not None:
             high_conf = candidate_idx[
                 np.isfinite(box_conf[candidate_idx]) & (box_conf[candidate_idx] >= conf_min)
             ]
@@ -1131,6 +1201,9 @@ def run_pose_on_frames(
                     prev_selected_was_suspicious=prev_selected_was_suspicious,
                     suspicious_switch_min_iou=config.suspicious_switch_min_iou,
                     suspicious_switch_max_jump_frac=config.suspicious_switch_max_jump_frac,
+                    prefer_foreground_on_acquire=config.prefer_foreground_on_acquire,
+                    acquire_min_box_area_ratio=config.acquire_min_box_area_ratio,
+                    acquire_bottom_margin_px=config.acquire_bottom_margin_px,
                 )
 
                 if idx is None:
@@ -1138,7 +1211,11 @@ def run_pose_on_frames(
                 else:
                     prev_center = new_center
                     prev_box_xyxy = np.asarray(boxes_xyxy[idx], dtype=np.float32).copy()
-                    if config.lock_first_target and not track_locked:
+                    if (
+                        config.lock_first_target
+                        and not track_locked
+                        and i >= max(0, int(config.lock_delay_frames))
+                    ):
                         track_locked = True
                     lost_count = 0
                     prev_selected_was_suspicious = bool(
