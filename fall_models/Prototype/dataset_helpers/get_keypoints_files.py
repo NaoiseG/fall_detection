@@ -170,7 +170,16 @@ def main():
         "--lock-delay-frames",
         type=int,
         default=None,
-        help="Override the number of initial frames to wait before making the first lock permanent.",
+        help="Override an additional minimum frame index before making the first lock permanent.",
+    )
+    ap.add_argument(
+        "--lock-after-foreground-frames",
+        type=int,
+        default=None,
+        help=(
+            "Override the number of consecutive prelock foreground selections required "
+            "before making the first lock permanent."
+        ),
     )
     ap.add_argument("--target-x-frac", type=float, default=None, help="Override the horizontal target-acquisition anchor as a fraction of image width.")
     ap.add_argument("--target-y-frac", type=float, default=None, help="Override the vertical target-acquisition anchor as a fraction of image height.")
@@ -251,8 +260,8 @@ def main():
     if int(args.camera) == 1:
         if args.camera1_foreground_guard is None:
             cfg.prefer_foreground_on_acquire = True
-            if args.lock_delay_frames is None:
-                cfg.lock_delay_frames = 30
+            if args.lock_after_foreground_frames is None:
+                cfg.lock_after_foreground_frames = 10
         else:
             cfg.prefer_foreground_on_acquire = bool(args.camera1_foreground_guard)
 
@@ -268,6 +277,7 @@ def main():
         "acquire_min_box_area_ratio": args.acquire_min_box_area_ratio,
         "acquire_bottom_margin_px": args.acquire_bottom_margin_px,
         "lock_delay_frames": args.lock_delay_frames,
+        "lock_after_foreground_frames": args.lock_after_foreground_frames,
         "target_x_frac": args.target_x_frac,
         "target_y_frac": args.target_y_frac,
         "lock_first_target": args.lock_first_target,
@@ -296,6 +306,7 @@ def main():
     print(f"Acquire min box-area ratio: {cfg.acquire_min_box_area_ratio}")
     print(f"Acquire bottom margin px: {cfg.acquire_bottom_margin_px}")
     print(f"Lock delay frames: {cfg.lock_delay_frames}")
+    print(f"Lock after foreground frames: {cfg.lock_after_foreground_frames}")
     print(f"Subjects: {args.subjects}")
     print("Camera folders found:", len(camera_folders))
     total = len(camera_folders)

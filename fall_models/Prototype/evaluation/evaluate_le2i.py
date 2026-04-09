@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-URFD one-shot evaluation for the repo's shared final temporal pipeline.
+LE2I one-shot evaluation for the repo's shared final temporal pipeline.
 
 Assumption:
 This script targets the same shared YOLO + GenericTemporalAdapter path used by
@@ -9,10 +9,14 @@ This script targets the same shared YOLO + GenericTemporalAdapter path used by
 pose loader, tracking, feature construction, temporal window assembly, and
 classifier checkpoint loading already present in the repository.
 
-If `urfall-cam0-falls.csv` is present, timing-aware window metrics treat CSV
-rows with phase label >= 0 as belonging to the annotated fall event. This
-matches the observed URFD CSV convention of `-1` for pre-fall, `0` for the
-transition/falling phase, and `1` for the post-fall phase.
+The evaluator expects the LE2I subset layout:
+  <subset>/Videos/video (i).avi
+  <subset>/Annotation_files/video (i).txt
+
+The first two annotation lines are interpreted as the annotated fall start and
+fall end frames. When both values are `0`, the clip is treated as `non_fall`.
+Subsets without annotation files are skipped by default because they cannot be
+scored fairly for either loose clip-level or strict timing-aware metrics.
 
 MotionBERT checkpoints are detected by `--arch motionbert` /
 `--arch motionbert_action`, by a `.bin` checkpoint suffix, or by `MotionBERT`
@@ -83,14 +87,13 @@ else:  # pragma: no cover - used only when runtime deps are missing
             return fn
         return decorator
 
-LOGGER = logging.getLogger("evaluate_urfd")
+LOGGER = logging.getLogger("evaluate_le2i")
 
-DATASET_NAME = "URFD"
-DEFAULT_FPS = 30.0
+DATASET_NAME = "LE2I"
+DEFAULT_FPS = 25.0
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_MIN_CONSECUTIVE_POSITIVE = 3
-DEFAULT_OUTPUT_DIR = Path("outputs") / "urfd_eval"
-DEFAULT_FRAME_EXTS = (".png", ".jpg", ".jpeg")
+DEFAULT_OUTPUT_DIR = Path("outputs") / "le2i_eval"
 DEFAULT_TEST_SEQUENCES_PER_CLASS = 5
 DEFAULT_DECISION_SEARCH_MIN_VALUES = (1, 2, 3, 4, 5)
 DEFAULT_DECISION_SEARCH_CSV_NAME = "decision_rule_search.csv"
@@ -104,40 +107,39 @@ except Exception:
 
 
 @dataclass(frozen=True)
-class URFDSequence:
+class LE2ISequence:
     dataset: str
+    subset_name: str
     video_id: str
     video_label: str
-    sequence_root: Path
-    frame_dir: Path
-    frame_paths: Tuple[Path, ...]
+    subset_root: Path
+    video_path: Path
+    annotation_path: Path
 
 
 @dataclass(frozen=True)
-class URFDFallTimingAnnotation:
-    csv_video_id: str
-    source_csv: Path
+class LE2IFallTimingAnnotation:
+    annotation_path: Path
     event_start_frame: int
     event_end_frame: int
-    transition_start_frame: Optional[int]
-    transition_end_frame: Optional[int]
-    post_fall_start_frame: Optional[int]
-    post_fall_end_frame: Optional[int]
-    num_rows: int
+    num_lines: int
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run one-shot inference-only evaluation of the existing final keypoint + "
-            "temporal classifier pipeline on the URFD dataset."
+            "temporal classifier pipeline on the LE2I dataset."
         )
     )
     parser.add_argument(
-        "--urfd-root",
+        "--le2i-root",
         type=Path,
         required=True,
-        help="Path to the URFD root containing ADLs/, Falls/, and optionally cvat/.",
+        help=(
+            "Path to the LE2I root containing annotated subsets such as Home_01/, Home_02/, "
+            "Coffee_room_01/, and Coffee_room_02/."
+        ),
     )
     parser.add_argument(
         "--keypoint-weights",
@@ -246,16 +248,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--frame-exts",
-        nargs="*",
-        default=None,
-        help="Optional frame extensions to search for. Defaults to: png jpg jpeg.",
-    )
-    parser.add_argument(
         "--test",
         action="store_true",
         help=(
-            "Run a small sanity-check subset using up to 5 ADL and 5 Fall sequences "
+            "Run a small sanity-check subset using up to 5 non-fall and 5 fall sequences "
             f"(or fewer if the dataset contains less)."
         ),
     )
@@ -355,21 +351,6 @@ def configure_logging(level: str) -> None:
     logging.basicConfig(level=getattr(logging, str(level).upper(), logging.INFO), format="[%(levelname)s] %(message)s")
 
 
-def normalize_frame_exts(values: Optional[Sequence[str]]) -> Tuple[str, ...]:
-    if not values:
-        return DEFAULT_FRAME_EXTS
-    normalized: List[str] = []
-    for raw in values:
-        item = str(raw).strip().lower()
-        if not item:
-            continue
-        if not item.startswith("."):
-            item = f".{item}"
-        if item not in normalized:
-            normalized.append(item)
-    return tuple(normalized or DEFAULT_FRAME_EXTS)
-
-
 def natural_sort_key(value: Any) -> List[Any]:
     text = str(value)
     parts = re.split(r"(\d+)", text.lower())
@@ -390,93 +371,78 @@ def iter_progress(iterable: Iterable[Any], *, desc: str, total: Optional[int] = 
     return tqdm(iterable, desc=desc, total=total, leave=leave, dynamic_ncols=True)
 
 
-def path_has_images(path: Path, frame_exts: Sequence[str]) -> bool:
-    ext_set = {ext.lower() for ext in frame_exts}
+def _safe_int_from_text(value: str) -> Optional[int]:
+    text = str(value).strip()
+    if not text:
+        return None
     try:
-        for child in path.iterdir():
-            if child.is_file() and child.suffix.lower() in ext_set:
-                return True
-    except OSError:
-        return False
-    return False
-
-
-def collect_frame_paths(frame_dir: Path, frame_exts: Sequence[str]) -> List[Path]:
-    ext_set = {ext.lower() for ext in frame_exts}
-    frames = [p for p in frame_dir.iterdir() if p.is_file() and p.suffix.lower() in ext_set]
-    frames.sort(key=lambda p: natural_sort_key(p.name))
-    return frames
-
-
-def resolve_sequence_frame_dir(sequence_root: Path, frame_exts: Sequence[str]) -> Optional[Path]:
-    current = sequence_root
-    seen: set[Path] = set()
-    while True:
-        repeated = current / current.name
-        if repeated in seen or (not repeated.is_dir()):
-            break
-        seen.add(repeated)
-        current = repeated
-
-    if current.is_dir() and path_has_images(current, frame_exts):
-        return current
-    if sequence_root.is_dir() and path_has_images(sequence_root, frame_exts):
-        return sequence_root
-
-    candidates: List[Path] = []
-    try:
-        for path in sequence_root.rglob("*"):
-            if path.is_dir() and path_has_images(path, frame_exts):
-                candidates.append(path)
-    except OSError:
+        return int(float(text))
+    except (TypeError, ValueError):
         return None
 
-    if not candidates:
-        return None
 
-    candidates.sort(
-        key=lambda p: (
-            len(p.relative_to(sequence_root).parts),
-            1 if p.name == sequence_root.name else 0,
-            natural_sort_key(p.as_posix()),
-        )
-    )
-    return candidates[-1]
+def _read_nonempty_text_lines(path: Path) -> List[str]:
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        return [str(line).strip() for line in handle if str(line).strip()]
 
 
-def discover_urfd_sequences(urfd_root: Path, frame_exts: Sequence[str]) -> List[URFDSequence]:
-    label_dirs = (("ADLs", "non_fall"), ("Falls", "fall"))
-    sequences: List[URFDSequence] = []
+def parse_le2i_annotation(annotation_path: Path) -> Tuple[str, Optional[LE2IFallTimingAnnotation]]:
+    lines = _read_nonempty_text_lines(annotation_path)
+    if len(lines) >= 2:
+        event_start_frame = _safe_int_from_text(lines[0])
+        event_end_frame = _safe_int_from_text(lines[1])
+        if event_start_frame is not None and event_end_frame is not None:
+            if int(event_start_frame) > 0 and int(event_end_frame) >= int(event_start_frame):
+                return (
+                    "fall",
+                    LE2IFallTimingAnnotation(
+                        annotation_path=annotation_path,
+                        event_start_frame=int(event_start_frame),
+                        event_end_frame=int(event_end_frame),
+                        num_lines=int(len(lines)),
+                    ),
+                )
+            return "non_fall", None
 
-    for dirname, video_label in label_dirs:
-        root = urfd_root / dirname
-        if not root.exists():
-            LOGGER.warning("Missing expected directory: %s", root)
+    LOGGER.warning("Could not parse fall start/end from annotation header: %s", annotation_path)
+    return "non_fall", None
+
+
+def discover_le2i_sequences(le2i_root: Path) -> List[LE2ISequence]:
+    sequences: List[LE2ISequence] = []
+
+    subset_roots = [path for path in le2i_root.iterdir() if path.is_dir()]
+    subset_roots.sort(key=lambda path: natural_sort_key(path.name))
+
+    for subset_root in subset_roots:
+        annotation_dir = subset_root / "Annotation_files"
+        video_dir = subset_root / "Videos"
+        if not annotation_dir.is_dir():
+            LOGGER.info("Skipping unannotated LE2I subset: %s", subset_root)
             continue
-        if not root.is_dir():
-            LOGGER.warning("Expected directory but found non-directory: %s", root)
+        if not video_dir.is_dir():
+            LOGGER.warning("Annotated subset is missing Videos/: %s", subset_root)
             continue
 
-        children = [p for p in root.iterdir() if p.is_dir()]
-        children.sort(key=lambda p: natural_sort_key(p.name))
-        for sequence_root in children:
-            frame_dir = resolve_sequence_frame_dir(sequence_root, frame_exts)
-            if frame_dir is None:
-                LOGGER.warning("No frame directory found for sequence: %s", sequence_root)
+        annotation_paths = [path for path in annotation_dir.iterdir() if path.is_file() and path.suffix.lower() == ".txt"]
+        annotation_paths.sort(key=lambda path: natural_sort_key(path.name))
+
+        for annotation_path in annotation_paths:
+            video_path = video_dir / f"{annotation_path.stem}.avi"
+            if not video_path.is_file():
+                LOGGER.warning("Missing LE2I video for annotation %s: expected %s", annotation_path, video_path)
                 continue
-            try:
-                frame_paths = tuple(collect_frame_paths(frame_dir, frame_exts))
-            except OSError as exc:
-                LOGGER.warning("Failed to list frames for %s: %s", frame_dir, exc)
-                continue
+
+            video_label, _ = parse_le2i_annotation(annotation_path)
             sequences.append(
-                URFDSequence(
+                LE2ISequence(
                     dataset=DATASET_NAME,
-                    video_id=sequence_root.name,
+                    subset_name=subset_root.name,
+                    video_id=f"{subset_root.name}/{annotation_path.stem}",
                     video_label=video_label,
-                    sequence_root=sequence_root,
-                    frame_dir=frame_dir,
-                    frame_paths=frame_paths,
+                    subset_root=subset_root,
+                    video_path=video_path,
+                    annotation_path=annotation_path,
                 )
             )
 
@@ -485,12 +451,12 @@ def discover_urfd_sequences(urfd_root: Path, frame_exts: Sequence[str]) -> List[
 
 
 def select_test_sequences(
-    sequences: Sequence[URFDSequence],
+    sequences: Sequence[LE2ISequence],
     *,
     max_per_label: int = DEFAULT_TEST_SEQUENCES_PER_CLASS,
-) -> List[URFDSequence]:
+) -> List[LE2ISequence]:
     limit = max(1, int(max_per_label))
-    selected: List[URFDSequence] = []
+    selected: List[LE2ISequence] = []
     seen_per_label = {"non_fall": 0, "fall": 0}
 
     for sequence in sequences:
@@ -505,78 +471,13 @@ def select_test_sequences(
     return selected
 
 
-def infer_urfd_csv_video_id(video_id: str) -> str:
-    text = str(video_id).strip().lower()
-    match = re.match(r"((?:adl|fall)-\d+)", text)
-    if match is not None:
-        return str(match.group(1))
-    cam_idx = text.find("-cam")
-    if cam_idx > 0:
-        return text[:cam_idx]
-    return text
-
-
-def find_urfd_annotation_csv(urfd_root: Path, filename: str) -> Optional[Path]:
-    candidates = [
-        urfd_root / "Falls" / filename,
-        urfd_root / "falls" / filename,
-        urfd_root / filename,
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-
-    matches = sorted(urfd_root.rglob(filename), key=lambda p: natural_sort_key(p.as_posix()))
-    return matches[0] if matches else None
-
-
-def _safe_int_from_csv(value: str) -> Optional[int]:
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return int(float(text))
-    except (TypeError, ValueError):
-        return None
-
-
-def load_urfd_fall_timing_annotations(urfd_root: Path) -> Tuple[Dict[str, URFDFallTimingAnnotation], Optional[Path]]:
-    csv_path = find_urfd_annotation_csv(urfd_root, "urfall-cam0-falls.csv")
-    if csv_path is None:
-        return {}, None
-
-    rows_by_video: Dict[str, List[Tuple[int, int]]] = {}
-    with csv_path.open("r", encoding="utf-8", newline="") as handle:
-        for row in csv.reader(handle):
-            if len(row) < 3:
-                continue
-            csv_video_id = infer_urfd_csv_video_id(row[0])
-            frame_idx = _safe_int_from_csv(row[1])
-            phase_label = _safe_int_from_csv(row[2])
-            if frame_idx is None or phase_label is None:
-                continue
-            rows_by_video.setdefault(csv_video_id, []).append((int(frame_idx), int(phase_label)))
-
-    annotations: Dict[str, URFDFallTimingAnnotation] = {}
-    for csv_video_id, values in rows_by_video.items():
-        values.sort(key=lambda item: item[0])
-        event_frames = [frame for frame, phase in values if phase >= 0]
-        if not event_frames:
-            continue
-        transition_frames = [frame for frame, phase in values if phase == 0]
-        post_fall_frames = [frame for frame, phase in values if phase == 1]
-        annotations[csv_video_id] = URFDFallTimingAnnotation(
-            csv_video_id=csv_video_id,
-            source_csv=csv_path,
-            event_start_frame=int(min(event_frames)),
-            event_end_frame=int(max(event_frames)),
-            transition_start_frame=int(min(transition_frames)) if transition_frames else None,
-            transition_end_frame=int(max(transition_frames)) if transition_frames else None,
-            post_fall_start_frame=int(min(post_fall_frames)) if post_fall_frames else None,
-            post_fall_end_frame=int(max(post_fall_frames)) if post_fall_frames else None,
-            num_rows=int(len(values)),
-        )
-    return annotations, csv_path
+def load_le2i_fall_timing_annotations(sequences: Sequence[LE2ISequence]) -> Dict[str, LE2IFallTimingAnnotation]:
+    annotations: Dict[str, LE2IFallTimingAnnotation] = {}
+    for sequence in sequences:
+        video_label, annotation = parse_le2i_annotation(sequence.annotation_path)
+        if video_label == "fall" and annotation is not None:
+            annotations[sequence.video_id] = annotation
+    return annotations
 
 
 def infer_imgsz_from_path(weights_path: Path) -> Optional[float]:
@@ -855,8 +756,8 @@ def to_human_frame(frame_idx_0based: int) -> int:
 def _append_window_row(
     rows: List[Dict[str, Any]],
     *,
-    sequence: URFDSequence,
-    timing_annotation: Optional[URFDFallTimingAnnotation],
+    sequence: LE2ISequence,
+    timing_annotation: Optional[LE2IFallTimingAnnotation],
     window_id: int,
     window_data: Any,
     prediction: Prediction,
@@ -881,8 +782,6 @@ def _append_window_row(
     overlaps_annotated_fall_event = False
     annotated_positive_frames_in_window = 0
     annotated_phase = "non_event"
-    overlaps_transition_phase = False
-    overlaps_post_fall_phase = False
 
     if has_timing_annotation and timing_annotation is not None:
         annotated_event_start_frame = int(timing_annotation.event_start_frame)
@@ -892,31 +791,16 @@ def _append_window_row(
         if overlap_start <= overlap_end:
             overlaps_annotated_fall_event = True
             annotated_positive_frames_in_window = int(overlap_end - overlap_start + 1)
-
-        if timing_annotation.transition_start_frame is not None and timing_annotation.transition_end_frame is not None:
-            transition_start = max(int(start_frame_1based), int(timing_annotation.transition_start_frame))
-            transition_end = min(int(end_frame_1based), int(timing_annotation.transition_end_frame))
-            overlaps_transition_phase = bool(transition_start <= transition_end)
-
-        if timing_annotation.post_fall_start_frame is not None and timing_annotation.post_fall_end_frame is not None:
-            post_start = max(int(start_frame_1based), int(timing_annotation.post_fall_start_frame))
-            post_end = min(int(end_frame_1based), int(timing_annotation.post_fall_end_frame))
-            overlaps_post_fall_phase = bool(post_start <= post_end)
-
-        if overlaps_transition_phase and overlaps_post_fall_phase:
-            annotated_phase = "mixed_event"
-        elif overlaps_transition_phase:
-            annotated_phase = "transition"
-        elif overlaps_post_fall_phase:
-            annotated_phase = "post_fall"
-        elif overlaps_annotated_fall_event:
+        if overlaps_annotated_fall_event:
             annotated_phase = "event"
 
     row = {
         "dataset": sequence.dataset,
         "video_id": sequence.video_id,
-        "video_path": str(sequence.frame_dir),
+        "video_path": str(sequence.video_path),
         "video_label": sequence.video_label,
+        "subset_name": sequence.subset_name,
+        "annotation_path": str(sequence.annotation_path),
         "window_id": int(window_id),
         "start_frame": int(start_frame_1based),
         "end_frame": int(end_frame_1based),
@@ -956,8 +840,8 @@ def _append_window_row(
         "overlaps_annotated_fall_event": bool(overlaps_annotated_fall_event),
         "annotated_positive_frames_in_window": int(annotated_positive_frames_in_window),
         "annotated_phase": str(annotated_phase),
-        "overlaps_transition_phase": bool(overlaps_transition_phase),
-        "overlaps_post_fall_phase": bool(overlaps_post_fall_phase),
+        "overlaps_transition_phase": None,
+        "overlaps_post_fall_phase": None,
     }
     if probs_np is not None:
         row["class_probs"] = json.dumps([float(x) for x in probs_np.tolist()])
@@ -1279,11 +1163,11 @@ def search_best_video_decision(
 
 
 def evaluate_sequence(
-    sequence: URFDSequence,
+    sequence: LE2ISequence,
     *,
     pose_pipeline: PosePipeline,
     classifier: TemporalClassifierAdapter,
-    timing_annotation: Optional[URFDFallTimingAnnotation],
+    timing_annotation: Optional[LE2IFallTimingAnnotation],
     fps: float,
     threshold: float,
     min_consecutive_positive: int,
@@ -1297,7 +1181,6 @@ def evaluate_sequence(
     sampled_cf: List[np.ndarray] = []
     sampled_raw_idx: List[int] = []
 
-    last_frame_shape: Optional[Tuple[int, int, int]] = None
     readable_frames = 0
     unreadable_frames = 0
     pose_found_frames = 0
@@ -1307,73 +1190,87 @@ def evaluate_sequence(
     image_shape_hw: Optional[Tuple[int, int]] = None
     policy = classifier.window_policy
     conf_thres = float(getattr(classifier, "conf_thres", 0.0))
+    raw_frame_idx = 0
 
-    frame_iter: Iterable[Tuple[int, Path]] = enumerate(sequence.frame_paths)
-    frame_iter = iter_progress(frame_iter, desc=f"{sequence.video_id}", total=len(sequence.frame_paths), leave=False)
+    cap = cv2.VideoCapture(str(sequence.video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {sequence.video_path}")
 
-    for raw_frame_idx, frame_path in frame_iter:
-        frame, used_blank_fallback = read_frame_with_fallback(frame_path, last_frame_shape)
-        if frame is None:
-            unreadable_frames += 1
-            LOGGER.warning("Unreadable frame with no known shape; skipping %s", frame_path)
-            continue
+    progress = None
+    total_frames_hint = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if tqdm is not None:
+        progress = tqdm(
+            total=total_frames_hint if total_frames_hint > 0 else None,
+            desc=f"{sequence.video_id}",
+            leave=False,
+            dynamic_ncols=True,
+        )
 
-        if used_blank_fallback:
-            unreadable_frames += 1
-            LOGGER.warning("Unreadable frame; substituting a blank frame for %s", frame_path)
-        else:
-            readable_frames += 1
-            last_frame_shape = tuple(int(v) for v in frame.shape)
-            image_shape_hw = (int(frame.shape[0]), int(frame.shape[1]))
-
-        pose_out = pose_pipeline.process_frame(frame_bgr=frame, raw_frame_idx=int(raw_frame_idx), sync_cuda_timing=False)
-        if pose_out.found:
-            pose_found_frames += 1
-        if pose_out.sampled:
-            sampled_xy.append(pose_out.keypoints_xy.copy())
-            sampled_cf.append(pose_out.keypoints_conf.copy())
-            sampled_raw_idx.append(int(raw_frame_idx))
-            if pose_out.found:
-                sampled_pose_found_frames += 1
-
+    try:
         while True:
-            assembled = _assemble_window(
-                sampled_xy=sampled_xy,
-                sampled_cf=sampled_cf,
-                sampled_raw_idx=sampled_raw_idx,
-                sampled_start=int(next_window_start),
-                sampled_len=int(policy.sampled_window_len),
-                cap_done=False,
-                pad_tail=False,
-                image_shape=(int(image_shape_hw[0]), int(image_shape_hw[1])) if image_shape_hw is not None else (0, 0),
-                video_stem=sequence.video_id,
-            )
-            if assembled is None:
+            ok, frame = cap.read()
+            if not ok:
                 break
 
-            window_data, assembly_ms = assembled
-            prepared_input, prep_metrics = classifier.prepare_window(window_data=window_data, sync_cuda_timing=False)
-            prediction, infer_metrics = classifier.infer(prepared_input=prepared_input, sync_cuda_timing=False)
-            fall_score, probs_np, fall_score_source = resolve_fall_score(classifier, prepared_input, prediction)
-            _append_window_row(
-                window_rows,
-                sequence=sequence,
-                timing_annotation=timing_annotation,
-                window_id=next_window_id,
-                window_data=window_data,
-                prediction=prediction,
-                fall_score=fall_score,
-                probs_np=probs_np,
-                fall_score_source=fall_score_source,
-                threshold=threshold,
-                prep_metrics=prep_metrics,
-                infer_metrics=infer_metrics,
-                assembly_ms=assembly_ms,
-                fps=fps,
-                conf_thres=conf_thres,
-            )
-            next_window_id += 1
-            next_window_start += int(policy.sampled_window_stride)
+            readable_frames += 1
+            image_shape_hw = (int(frame.shape[0]), int(frame.shape[1]))
+
+            pose_out = pose_pipeline.process_frame(frame_bgr=frame, raw_frame_idx=int(raw_frame_idx), sync_cuda_timing=False)
+            if pose_out.found:
+                pose_found_frames += 1
+            if pose_out.sampled:
+                sampled_xy.append(pose_out.keypoints_xy.copy())
+                sampled_cf.append(pose_out.keypoints_conf.copy())
+                sampled_raw_idx.append(int(raw_frame_idx))
+                if pose_out.found:
+                    sampled_pose_found_frames += 1
+
+            while True:
+                assembled = _assemble_window(
+                    sampled_xy=sampled_xy,
+                    sampled_cf=sampled_cf,
+                    sampled_raw_idx=sampled_raw_idx,
+                    sampled_start=int(next_window_start),
+                    sampled_len=int(policy.sampled_window_len),
+                    cap_done=False,
+                    pad_tail=False,
+                    image_shape=(int(image_shape_hw[0]), int(image_shape_hw[1])) if image_shape_hw is not None else (0, 0),
+                    video_stem=sequence.video_id,
+                )
+                if assembled is None:
+                    break
+
+                window_data, assembly_ms = assembled
+                prepared_input, prep_metrics = classifier.prepare_window(window_data=window_data, sync_cuda_timing=False)
+                prediction, infer_metrics = classifier.infer(prepared_input=prepared_input, sync_cuda_timing=False)
+                fall_score, probs_np, fall_score_source = resolve_fall_score(classifier, prepared_input, prediction)
+                _append_window_row(
+                    window_rows,
+                    sequence=sequence,
+                    timing_annotation=timing_annotation,
+                    window_id=next_window_id,
+                    window_data=window_data,
+                    prediction=prediction,
+                    fall_score=fall_score,
+                    probs_np=probs_np,
+                    fall_score_source=fall_score_source,
+                    threshold=threshold,
+                    prep_metrics=prep_metrics,
+                    infer_metrics=infer_metrics,
+                    assembly_ms=assembly_ms,
+                    fps=fps,
+                    conf_thres=conf_thres,
+                )
+                next_window_id += 1
+                next_window_start += int(policy.sampled_window_stride)
+
+            raw_frame_idx += 1
+            if progress is not None:
+                progress.update(1)
+    finally:
+        if progress is not None:
+            progress.close()
+        cap.release()
 
     if image_shape_hw is not None:
         while True:
@@ -1429,10 +1326,12 @@ def evaluate_sequence(
     base_video_summary = {
         "dataset": sequence.dataset,
         "video_id": sequence.video_id,
-        "video_path": str(sequence.frame_dir),
+        "video_path": str(sequence.video_path),
         "video_label": sequence.video_label,
+        "subset_name": sequence.subset_name,
+        "annotation_path": str(sequence.annotation_path),
         "fps": float(fps),
-        "num_frames": int(len(sequence.frame_paths)),
+        "num_frames": int(raw_frame_idx),
         "num_windows": int(len(window_rows)),
         "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
         "annotated_event_start_frame": annotated_event_start_frame,
@@ -1443,8 +1342,8 @@ def evaluate_sequence(
         "num_unreadable_frames": int(unreadable_frames),
         "pose_found_frames": int(pose_found_frames),
         "sampled_pose_found_frames": int(sampled_pose_found_frames),
-        "sequence_root": str(sequence.sequence_root),
-        "frame_dir": str(sequence.frame_dir),
+        "sequence_root": str(sequence.subset_root),
+        "video_file": str(sequence.video_path),
     }
     video_summary = build_video_summary_for_decision(
         base_video_summary,
@@ -1616,7 +1515,7 @@ def main() -> int:
 
     if IMPORT_ERROR is not None:
         raise RuntimeError(
-            "Missing runtime dependency needed for URFD evaluation. "
+            "Missing runtime dependency needed for LE2I evaluation. "
             "Make sure OpenCV, Ultralytics, PyTorch, and the repo inference dependencies are installed. "
             f"Original import error: {IMPORT_ERROR}"
         ) from IMPORT_ERROR
@@ -1650,29 +1549,28 @@ def main() -> int:
     if int(args.max_det) < 0:
         raise ValueError("--max-det must be >= 0.")
 
-    urfd_root = args.urfd_root.expanduser().resolve()
+    le2i_root = args.le2i_root.expanduser().resolve()
     keypoint_weights = args.keypoint_weights.expanduser().resolve()
     classifier_model = args.classifier_model.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
-    frame_exts = normalize_frame_exts(args.frame_exts)
 
-    args.urfd_root = urfd_root
+    args.le2i_root = le2i_root
     args.keypoint_weights = keypoint_weights
     args.classifier_model = classifier_model
     args.output_dir = output_dir
 
-    if not urfd_root.exists():
-        raise FileNotFoundError(f"--urfd-root not found: {urfd_root}")
+    if not le2i_root.exists():
+        raise FileNotFoundError(f"--le2i-root not found: {le2i_root}")
     if not keypoint_weights.exists():
         raise FileNotFoundError(f"--keypoint-weights not found: {keypoint_weights}")
     if not classifier_model.exists():
         raise FileNotFoundError(f"--classifier-model not found: {classifier_model}")
 
-    sequences_all = discover_urfd_sequences(urfd_root, frame_exts)
+    sequences_all = discover_le2i_sequences(le2i_root)
     if not sequences_all:
         raise RuntimeError(
-            f"No URFD sequences were found under {urfd_root}. "
-            "Expected nested frame folders under ADLs/ and Falls/."
+            f"No annotated LE2I sequences were found under {le2i_root}. "
+            "Expected subsets containing both Videos/ and Annotation_files/."
         )
 
     num_adl_all = sum(1 for seq in sequences_all if seq.video_label == "non_fall")
@@ -1685,37 +1583,35 @@ def main() -> int:
     num_adl = sum(1 for seq in sequences if seq.video_label == "non_fall")
     num_fall = sum(1 for seq in sequences if seq.video_label == "fall")
 
-    print(f"Found {num_adl_all} ADL sequences and {num_fall_all} Fall sequences under {urfd_root}")
+    print(f"Found {num_adl_all} non-fall videos and {num_fall_all} fall videos under {le2i_root}")
     if bool(args.test):
         print(
             "Test mode enabled: "
-            f"running {num_adl} ADL and {num_fall} Fall sequences "
+            f"running {num_adl} non-fall and {num_fall} fall sequences "
             f"(limit {DEFAULT_TEST_SEQUENCES_PER_CLASS} per class)."
         )
 
-    timing_annotations, timing_annotation_csv = load_urfd_fall_timing_annotations(urfd_root)
-    if timing_annotation_csv is not None:
-        matched_timing_annotations_all = sum(
-            1
-            for seq in sequences_all
-            if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
-        )
-        matched_timing_annotations_selected = sum(
-            1
-            for seq in sequences
-            if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
-        )
-        print(
-            "Loaded fall timing annotations for "
-            f"{len(timing_annotations)} fall sequences from {timing_annotation_csv}"
-        )
-        print(
-            "Matched timing annotations for "
-            f"{matched_timing_annotations_selected}/{num_fall} selected Fall sequences "
-            f"({matched_timing_annotations_all}/{num_fall_all} across the full discovery set)."
-        )
-    else:
-        print("No URFD fall timing CSV was found. Timing-aware window metrics will be skipped.")
+    timing_annotations = load_le2i_fall_timing_annotations(sequences_all)
+    timing_annotation_source = "Annotation_files/video (i).txt headers"
+    matched_timing_annotations_all = sum(
+        1
+        for seq in sequences_all
+        if seq.video_label == "fall" and seq.video_id in timing_annotations
+    )
+    matched_timing_annotations_selected = sum(
+        1
+        for seq in sequences
+        if seq.video_label == "fall" and seq.video_id in timing_annotations
+    )
+    print(
+        "Loaded fall timing annotations for "
+        f"{len(timing_annotations)} fall videos from LE2I annotation headers."
+    )
+    print(
+        "Matched timing annotations for "
+        f"{matched_timing_annotations_selected}/{num_fall} selected fall videos "
+        f"({matched_timing_annotations_all}/{num_fall_all} across the full discovery set)."
+    )
 
     device = pick_device(args.device)
     resolved_imgsz = float(args.imgsz) if args.imgsz is not None else float(infer_imgsz_from_path(keypoint_weights) or 640.0)
@@ -1748,9 +1644,9 @@ def main() -> int:
     sequence_results: List[Dict[str, Any]] = []
 
     start_time = time.perf_counter()
-    seq_iter: Iterable[URFDSequence] = iter_progress(sequences, desc="URFD sequences", total=len(sequences), leave=True)
+    seq_iter: Iterable[LE2ISequence] = iter_progress(sequences, desc="LE2I videos", total=len(sequences), leave=True)
     for sequence in seq_iter:
-        timing_annotation = timing_annotations.get(infer_urfd_csv_video_id(sequence.video_id))
+        timing_annotation = timing_annotations.get(sequence.video_id)
         annotated_event_start_frame: Optional[int] = None
         annotated_event_end_frame: Optional[int] = None
         annotated_event_start_time_s: Optional[float] = None
@@ -1760,44 +1656,6 @@ def main() -> int:
             annotated_event_end_frame = int(timing_annotation.event_end_frame)
             annotated_event_start_time_s = frame_time_seconds(int(annotated_event_start_frame) - 1, float(args.fps))
             annotated_event_end_time_s = frame_time_seconds(int(annotated_event_end_frame) - 1, float(args.fps))
-
-        if len(sequence.frame_paths) == 0:
-            LOGGER.warning("Sequence has no frames: %s", sequence.frame_dir)
-            sequence_results.append(
-                {
-                    "window_rows": [],
-                    "base_video_summary": build_video_summary_for_decision(
-                        {
-                            "dataset": sequence.dataset,
-                            "video_id": sequence.video_id,
-                            "video_path": str(sequence.frame_dir),
-                            "video_label": sequence.video_label,
-                            "fps": float(args.fps),
-                            "num_frames": 0,
-                            "num_windows": 0,
-                            "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
-                            "annotated_event_start_frame": annotated_event_start_frame,
-                            "annotated_event_end_frame": annotated_event_end_frame,
-                            "annotated_event_start_time_s": annotated_event_start_time_s,
-                            "annotated_event_end_time_s": annotated_event_end_time_s,
-                            "num_readable_frames": 0,
-                            "num_unreadable_frames": 0,
-                            "pose_found_frames": 0,
-                            "sampled_pose_found_frames": 0,
-                            "sequence_root": str(sequence.sequence_root),
-                            "frame_dir": str(sequence.frame_dir),
-                            "warning": "Sequence has no frames.",
-                        },
-                        window_rows=[],
-                        threshold=float(args.threshold),
-                        min_consecutive_positive=int(args.min_consecutive_positive),
-                        strict_early_tolerance_frames=int(strict_early_tolerance_frames),
-                        strict_late_tolerance_frames=int(strict_late_tolerance_frames),
-                        apply_to_rows=True,
-                    ),
-                }
-            )
-            continue
 
         try:
             window_rows, video_summary = evaluate_sequence(
@@ -1820,10 +1678,12 @@ def main() -> int:
                         {
                             "dataset": sequence.dataset,
                             "video_id": sequence.video_id,
-                            "video_path": str(sequence.frame_dir),
+                            "video_path": str(sequence.video_path),
                             "video_label": sequence.video_label,
+                            "subset_name": sequence.subset_name,
+                            "annotation_path": str(sequence.annotation_path),
                             "fps": float(args.fps),
-                            "num_frames": int(len(sequence.frame_paths)),
+                            "num_frames": 0,
                             "num_windows": 0,
                             "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
                             "annotated_event_start_frame": annotated_event_start_frame,
@@ -1834,8 +1694,8 @@ def main() -> int:
                             "num_unreadable_frames": 0,
                             "pose_found_frames": 0,
                             "sampled_pose_found_frames": 0,
-                            "sequence_root": str(sequence.sequence_root),
-                            "frame_dir": str(sequence.frame_dir),
+                            "sequence_root": str(sequence.subset_root),
+                            "video_file": str(sequence.video_path),
                             "warning": str(exc),
                         },
                         window_rows=[],
@@ -1950,7 +1810,7 @@ def main() -> int:
             eligible_key="strict_eligible",
         )
     timing_window_metrics: Optional[Dict[str, Any]] = None
-    if timing_annotation_csv is not None:
+    if timing_annotations:
         timing_window_metrics = compute_timing_window_metrics(window_rows_all)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1965,6 +1825,8 @@ def main() -> int:
         "video_id",
         "video_path",
         "video_label",
+        "subset_name",
+        "annotation_path",
         "window_id",
         "start_frame",
         "end_frame",
@@ -2010,6 +1872,8 @@ def main() -> int:
         "video_id",
         "video_path",
         "video_label",
+        "subset_name",
+        "annotation_path",
         "num_frames",
         "num_windows",
         "num_positive_windows",
@@ -2056,7 +1920,7 @@ def main() -> int:
         "pose_found_frames",
         "sampled_pose_found_frames",
         "sequence_root",
-        "frame_dir",
+        "video_file",
         "warning",
     ]
 
@@ -2122,13 +1986,12 @@ def main() -> int:
         )
 
     run_config = {
-        "urfd_root": str(urfd_root),
+        "le2i_root": str(le2i_root),
         "keypoint_weights": str(keypoint_weights),
         "classifier_model": str(classifier_model),
         "device": str(device),
         "resolved_pose_imgsz": float(resolved_imgsz),
         "resolved_pose_half": bool(resolve_pose_half_arg(args.half, keypoint_weights, device)),
-        "frame_exts": list(frame_exts),
         "fps": float(args.fps),
         "threshold": float(args.threshold),
         "min_consecutive_positive": int(args.min_consecutive_positive),
@@ -2162,23 +2025,23 @@ def main() -> int:
         "track_target_y_frac": float(args.track_target_y_frac),
         "classifier_class_names": list(classifier.class_names),
         "dataset_name": DATASET_NAME,
-        "timing_annotation_csv": None if timing_annotation_csv is None else str(timing_annotation_csv),
+        "timing_annotation_source": str(timing_annotation_source),
         "num_timing_annotations_loaded": int(len(timing_annotations)),
         "num_timing_annotations_matched_selected_fall_sequences": int(
             sum(
                 1
                 for seq in sequences
-                if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
+                if seq.video_label == "fall" and seq.video_id in timing_annotations
             )
         ),
         "num_timing_annotations_matched_all_fall_sequences": int(
             sum(
                 1
                 for seq in sequences_all
-                if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
+                if seq.video_label == "fall" and seq.video_id in timing_annotations
             )
         ),
-        "timing_ground_truth_positive_rule": "window overlaps annotated frames where urfall-cam0-falls.csv phase_label >= 0",
+        "timing_ground_truth_positive_rule": "window overlaps the LE2I annotated fall interval from the annotation header",
         "test_mode": bool(args.test),
         "test_sequences_per_class": int(DEFAULT_TEST_SEQUENCES_PER_CLASS),
         "num_sequences_found_total": int(len(sequences_all)),
@@ -2211,10 +2074,10 @@ def main() -> int:
         )
         print(f"  Strict outcome reasons: {json.dumps(strict_video_metrics.get('outcome_reason_counts', {}), sort_keys=True)}")
     if timing_window_metrics is not None:
-        print_metric_block("URFD timing-aware window metrics", timing_window_metrics)
+        print_metric_block(f"{DATASET_NAME} timing-aware window metrics", timing_window_metrics)
         print(
             "  Timing GT positives are windows overlapping the annotated fall interval "
-            "from urfall-cam0-falls.csv."
+            "from the LE2I annotation header."
         )
     print()
     print("Outputs")

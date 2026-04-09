@@ -56,6 +56,7 @@ class PoseExportConfig:
     acquire_min_box_area_ratio: float = 0.35
     acquire_bottom_margin_px: float = 60.0
     lock_delay_frames: int = 0
+    lock_after_foreground_frames: int = 0
 
 
 POSE_LOCK_SETTINGS_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -1092,6 +1093,7 @@ def run_pose_on_frames(
     prev_selected_was_suspicious = False
     track_locked = False
     lost_count = 0
+    foreground_lock_streak = 0
 
     for i, p in enumerate(frame_paths):
         frame = cv2.imread(p)
@@ -1138,6 +1140,8 @@ def run_pose_on_frames(
                 orig_shape=(h, w),
             )
         if pose is None:
+            if not track_locked:
+                foreground_lock_streak = 0
             lost_count += 1
         else:
             xy = pose["xy"]
@@ -1149,6 +1153,8 @@ def run_pose_on_frames(
             # Match pose rows to bbox rows before selection.
             num_candidates = min(int(xy.shape[0]), int(box_centers.shape[0]), int(boxes_xyxy.shape[0]))
             if num_candidates <= 0:
+                if not track_locked:
+                    foreground_lock_streak = 0
                 lost_count += 1
             else:
                 xy = xy[:num_candidates]
@@ -1207,13 +1213,21 @@ def run_pose_on_frames(
                 )
 
                 if idx is None:
+                    if not track_locked:
+                        foreground_lock_streak = 0
                     lost_count += 1
                 else:
                     prev_center = new_center
                     prev_box_xyxy = np.asarray(boxes_xyxy[idx], dtype=np.float32).copy()
+                    if not track_locked:
+                        if bool(config.prefer_foreground_on_acquire):
+                            foreground_lock_streak += 1
+                        else:
+                            foreground_lock_streak = 0
                     if (
                         config.lock_first_target
                         and not track_locked
+                        and foreground_lock_streak >= max(0, int(config.lock_after_foreground_frames))
                         and i >= max(0, int(config.lock_delay_frames))
                     ):
                         track_locked = True
