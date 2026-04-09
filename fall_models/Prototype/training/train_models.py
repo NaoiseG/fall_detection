@@ -38,7 +38,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dataset_helpers.dataset import (
-    load_windows_from_npzs,
     load_windows_with_source_meta_from_npzs,
     find_keypoints_npzs_subjects,
     WindowTensorDataset,
@@ -47,6 +46,9 @@ from dataset_helpers.dataset import (
     detect_label_convention as _detect_label_convention,
     remap_label as _remap_label,
     get_fall_merge_set as _get_fall_merge_set,
+)
+from dataset_helpers.check_camera1_background_switches import (
+    build_camera1_majority_flagged_window_mask,
 )
 
 from models.tcn.simple_tcn import TCNBaseline
@@ -78,6 +80,15 @@ RARE_CLASS_IDS_MERGED = [0, 4]
 # FALL_MERGE_SET and NEW_LABEL_NAMES are filled after we scan NPZ labels.
 FALL_MERGE_SET: set[int] = set()
 NEW_LABEL_NAMES: list[str] = []
+_WINDOW_ALIGNED_META_KEYS = (
+    "window_camera_ids",
+    "window_source_indices",
+    "window_candidate_indices",
+    "window_start_frames_sampled",
+    "window_end_frames_sampled",
+    "window_frame_counts_sampled",
+    "window_is_padded",
+)
 
 def detect_label_convention(observed_labels) -> str:
     """Wrapper that calls the shared implementation in dataset.py."""
@@ -90,6 +101,56 @@ def remap_label(original_label: int, convention: str) -> int:
 def fall_merge_set(convention: str) -> set[int]:
     """Return the raw fall ID set for the detected convention."""
     return _get_fall_merge_set(convention)
+
+
+def _window_count_from_meta(meta: Dict[str, Any]) -> int:
+    return int(np.asarray(meta.get("window_source_indices", np.zeros((0,), dtype=np.int64))).shape[0])
+
+
+def _filter_window_aligned_meta(meta: Dict[str, Any], keep_mask: np.ndarray) -> Dict[str, Any]:
+    filtered = dict(meta)
+    n_windows = int(keep_mask.shape[0])
+    for key in _WINDOW_ALIGNED_META_KEYS:
+        if key not in meta:
+            continue
+        arr = np.asarray(meta[key])
+        if arr.shape[0] != n_windows:
+            raise RuntimeError(
+                f"Window metadata key '{key}' has length {int(arr.shape[0])}, expected {n_windows}."
+            )
+        filtered[key] = arr[keep_mask]
+    return filtered
+
+
+def _drop_camera1_majority_background_windows(
+    *,
+    X_windows: np.ndarray,
+    y_windows: np.ndarray,
+    meta: Dict[str, Any],
+    frame_mask_cache: Dict[str, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], int]:
+    n_windows = _window_count_from_meta(meta)
+    if int(X_windows.shape[0]) != n_windows or int(y_windows.shape[0]) != n_windows:
+        raise RuntimeError(
+            "Window array length mismatch while applying Camera1 background filtering: "
+            f"X={int(X_windows.shape[0])}, y={int(y_windows.shape[0])}, meta={n_windows}"
+        )
+
+    skip_mask = build_camera1_majority_flagged_window_mask(
+        meta=meta,
+        frame_mask_cache=frame_mask_cache,
+    )
+    skipped = int(np.count_nonzero(skip_mask))
+    if skipped <= 0:
+        return X_windows, y_windows, meta, 0
+
+    keep_mask = ~skip_mask
+    return (
+        X_windows[keep_mask],
+        y_windows[keep_mask],
+        _filter_window_aligned_meta(meta, keep_mask),
+        skipped,
+    )
 
 # ----------------------------
 # Config
@@ -905,6 +966,8 @@ def train_model_once(
                 "add_mask_channel": bool(add_mask_channel),
                 "drop_ambig_share": float(drop_ambig_share),
                 "drop_ambig_nonfall_only": bool(drop_ambig_nonfall_only),
+                "drop_camera1_background_majority_windows": True,
+                "camera1_background_majority_fraction": 0.5,
                 "rp_center_mode": str(rp_center_mode),
                 "rp_img_w": int(rp_img_w) if rp_img_w is not None else None,
                 "rp_img_h": int(rp_img_h) if rp_img_h is not None else None,
@@ -1430,6 +1493,7 @@ if __name__ == "__main__":
     FALL_MERGE_SET = fall_merge_set(label_convention)
     print(f"[labels] Using raw convention: {label_convention} | New labels: {NEW_LABEL_NAMES}")
     fall_ids_0based = [int(FALL_CLASS_ID)]
+    camera1_frame_mask_cache: Dict[str, np.ndarray] = {}
     X_train, y_train_tags, T_used, train_meta = load_windows_with_source_meta_from_npzs(
         train_npzs,
         T=int(args.T),
@@ -1460,8 +1524,19 @@ if __name__ == "__main__":
         rp_img_w=args.rp_img_w,
         rp_img_h=args.rp_img_h,
     )
+    X_train, y_train_tags, train_meta, skipped_train_camera1_windows = _drop_camera1_majority_background_windows(
+        X_windows=X_train,
+        y_windows=y_train_tags,
+        meta=train_meta,
+        frame_mask_cache=camera1_frame_mask_cache,
+    )
+    if skipped_train_camera1_windows > 0:
+        print(
+            f"[train] skipped {skipped_train_camera1_windows} Camera1 windows "
+            "where background/reflection frames were the majority"
+        )
 
-    X_val, y_val_tags, _ = load_windows_from_npzs(
+    X_val, y_val_tags, _, val_meta = load_windows_with_source_meta_from_npzs(
         val_npzs,
         T=int(T_used),
         use_conf=use_conf,
@@ -1491,10 +1566,25 @@ if __name__ == "__main__":
         rp_img_w=args.rp_img_w,
         rp_img_h=args.rp_img_h,
     )
+    X_val, y_val_tags, val_meta, skipped_val_camera1_windows = _drop_camera1_majority_background_windows(
+        X_windows=X_val,
+        y_windows=y_val_tags,
+        meta=val_meta,
+        frame_mask_cache=camera1_frame_mask_cache,
+    )
+    if skipped_val_camera1_windows > 0:
+        print(
+            f"[val] skipped {skipped_val_camera1_windows} Camera1 windows "
+            "where background/reflection frames were the majority"
+        )
 
     # Labels are already remapped to the merged 7-class space (0..6)
     y_train = y_train_tags.astype(np.int64, copy=False)
     y_val   = y_val_tags.astype(np.int64, copy=False)
+    if int(y_train.shape[0]) == 0:
+        raise RuntimeError("No training windows remain after Camera1 background/reflection filtering.")
+    if int(y_val.shape[0]) == 0:
+        raise RuntimeError("No validation windows remain after Camera1 background/reflection filtering.")
     train_camera_ids = np.asarray(train_meta.get("window_camera_ids", np.zeros((len(y_train),), dtype=np.int64)), dtype=np.int64)
     if int(train_camera_ids.shape[0]) != int(y_train.shape[0]):
         raise RuntimeError(

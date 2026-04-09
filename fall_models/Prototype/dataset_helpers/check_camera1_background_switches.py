@@ -199,6 +199,35 @@ def spans_to_text(runs: Sequence[Run]) -> str:
     return ";".join(f"{start}-{end}" for start, end in runs)
 
 
+def is_camera1_npz(npz_path: str | Path) -> bool:
+    return any("Camera1" in str(part) for part in Path(npz_path).parts)
+
+
+def runs_to_mask(frame_count: int, runs: Sequence[Run]) -> np.ndarray:
+    mask = np.zeros((max(0, int(frame_count)),), dtype=bool)
+    if mask.size == 0:
+        return mask
+
+    last_idx = int(mask.size - 1)
+    for start, end in runs:
+        start_i = max(0, int(start))
+        end_i = min(int(end), last_idx)
+        if start_i <= end_i:
+            mask[start_i : end_i + 1] = True
+    return mask
+
+
+def _scalar_text(value: object) -> str:
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            value = value.item()
+        elif int(value.size) == 1:
+            value = value.reshape(-1)[0]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore").strip()
+    return str(value).strip()
+
+
 def summarize_reference(
     centers: np.ndarray,
     scales: np.ndarray,
@@ -242,6 +271,176 @@ def fraction_true(mask: np.ndarray, valid_mask: np.ndarray) -> float:
     if denom <= 0:
         return 0.0
     return float(np.sum(mask & valid_mask)) / float(denom)
+
+
+def compute_camera1_flagged_frame_mask(
+    npz_path: str | Path,
+    *,
+    conf_thres: float = 0.3,
+    reference_scale_percentile: float = 65.0,
+    background_scale_ratio: float = 0.6,
+    background_y_margin: float = 45.0,
+    gap_frames: int = 3,
+    min_run_frames: int = 6,
+    start_guard_frames: int = 45,
+    reflection_max_scale_px: float = 140.0,
+    reflection_max_cy_px: float = 240.0,
+    min_reflection_run_frames: int = 6,
+) -> np.ndarray:
+    """
+    Returns a per-frame boolean mask for frames that look like the Camera1
+    background-switch / reflection failure modes used by this script.
+
+    The returned mask marks frames belonging to:
+    - background-like runs that meet the minimum run length and start after the
+      background-switch guard period, or
+    - reflection-like runs that meet the minimum run length.
+    """
+    npz_path = Path(npz_path)
+    with np.load(npz_path, allow_pickle=True) as data:
+        required = {"kpts_xy", "kpts_conf", "person_conf"}
+        missing = required - set(data.files)
+        if missing:
+            raise ValueError(f"Missing keys {missing}")
+
+        kpts_xy = data["kpts_xy"]
+        kpts_conf = data["kpts_conf"]
+        person_conf = data["person_conf"]
+        source_npz_path = _scalar_text(data["source_npz_path"]) if "source_npz_path" in data.files else ""
+
+    if not is_camera1_npz(npz_path) and not is_camera1_npz(source_npz_path):
+        return np.zeros((int(kpts_xy.shape[0]),), dtype=bool)
+
+    if kpts_xy.ndim != 4 or kpts_conf.ndim != 3 or person_conf.ndim != 2:
+        raise ValueError(
+            f"Unexpected shapes: "
+            f"kpts_xy={kpts_xy.shape}, "
+            f"kpts_conf={kpts_conf.shape}, "
+            f"person_conf={person_conf.shape}"
+        )
+
+    person_idx = choose_person_track(person_conf)
+    xy = kpts_xy[:, person_idx, :, :]
+    conf = kpts_conf[:, person_idx, :]
+
+    centers = compute_centers(xy, conf, conf_thres=conf_thres)
+    scales = compute_body_scales(xy, conf, conf_thres=conf_thres)
+
+    valid_mask = np.isfinite(centers[:, 0]) & np.isfinite(scales)
+    reference_scale, reference_cy, _reference_count = summarize_reference(
+        centers=centers,
+        scales=scales,
+        valid_mask=valid_mask,
+        reference_scale_percentile=reference_scale_percentile,
+    )
+
+    background_like_mask = np.zeros((len(centers),), dtype=bool)
+    if np.isfinite(reference_scale) and np.isfinite(reference_cy):
+        background_like_mask = (
+            valid_mask
+            & (scales <= float(reference_scale) * float(background_scale_ratio))
+            & (centers[:, 1] <= float(reference_cy) - float(background_y_margin))
+        )
+    background_like_mask = close_short_gaps(background_like_mask, int(gap_frames))
+    background_runs = find_runs(background_like_mask, int(min_run_frames))
+    qualifying_background_runs = [run for run in background_runs if int(run[0]) >= int(start_guard_frames)]
+    background_flag_mask = runs_to_mask(len(centers), qualifying_background_runs)
+
+    reflection_like_mask = (
+        valid_mask
+        & (scales <= float(reflection_max_scale_px))
+        & (centers[:, 1] <= float(reflection_max_cy_px))
+    )
+    reflection_like_mask = close_short_gaps(reflection_like_mask, int(gap_frames))
+    reflection_runs = find_runs(reflection_like_mask, int(min_reflection_run_frames))
+    reflection_flag_mask = runs_to_mask(len(centers), reflection_runs)
+
+    return np.asarray(background_flag_mask | reflection_flag_mask, dtype=bool)
+
+
+def build_camera1_majority_flagged_window_mask(
+    *,
+    meta: Dict[str, object],
+    frame_mask_cache: Dict[str, np.ndarray] | None = None,
+    majority_fraction: float = 0.5,
+    conf_thres: float = 0.3,
+    reference_scale_percentile: float = 65.0,
+    background_scale_ratio: float = 0.6,
+    background_y_margin: float = 45.0,
+    gap_frames: int = 3,
+    min_run_frames: int = 6,
+    start_guard_frames: int = 45,
+    reflection_max_scale_px: float = 140.0,
+    reflection_max_cy_px: float = 240.0,
+    min_reflection_run_frames: int = 6,
+) -> np.ndarray:
+    """
+    Returns a boolean mask aligned to dataset window metadata.
+
+    A window is marked True when strictly more than ``majority_fraction`` of its
+    sampled frames belong to the Camera1 background/reflection failure mask.
+    """
+    source_indices = np.asarray(meta.get("window_source_indices", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    start_frames = np.asarray(meta.get("window_start_frames_sampled", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    frame_counts = np.asarray(meta.get("window_frame_counts_sampled", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+    source_paths = [str(p) for p in meta.get("source_npz_paths", [])]
+
+    n_windows = int(source_indices.shape[0])
+    if start_frames.shape[0] != n_windows or frame_counts.shape[0] != n_windows:
+        raise RuntimeError(
+            "Window metadata length mismatch while applying Camera1 background filtering: "
+            f"source_indices={n_windows}, start_frames={int(start_frames.shape[0])}, "
+            f"frame_counts={int(frame_counts.shape[0])}"
+        )
+
+    if frame_mask_cache is None:
+        frame_mask_cache = {}
+
+    skip_mask = np.zeros((n_windows,), dtype=bool)
+    for idx in range(n_windows):
+        src_idx = int(source_indices[idx])
+        if not (0 <= src_idx < len(source_paths)):
+            raise RuntimeError(
+                "Window source index out of range while applying Camera1 background filtering: "
+                f"window={idx}, source_index={src_idx}, num_sources={len(source_paths)}"
+            )
+
+        src_path = source_paths[src_idx]
+        frame_count = int(frame_counts[idx])
+        if frame_count <= 0:
+            continue
+
+        cache_key = Path(src_path).resolve().as_posix()
+        frame_mask = frame_mask_cache.get(cache_key)
+        if frame_mask is None:
+            frame_mask = compute_camera1_flagged_frame_mask(
+                src_path,
+                conf_thres=float(conf_thres),
+                reference_scale_percentile=float(reference_scale_percentile),
+                background_scale_ratio=float(background_scale_ratio),
+                background_y_margin=float(background_y_margin),
+                gap_frames=int(gap_frames),
+                min_run_frames=int(min_run_frames),
+                start_guard_frames=int(start_guard_frames),
+                reflection_max_scale_px=float(reflection_max_scale_px),
+                reflection_max_cy_px=float(reflection_max_cy_px),
+                min_reflection_run_frames=int(min_reflection_run_frames),
+            )
+            frame_mask_cache[cache_key] = frame_mask
+
+        start = int(start_frames[idx])
+        end = start + frame_count
+        if start < 0 or end > int(frame_mask.shape[0]):
+            raise RuntimeError(
+                "Window frame span is out of range while applying Camera1 background filtering: "
+                f"path={src_path}, start={start}, frame_count={frame_count}, num_frames={int(frame_mask.shape[0])}"
+            )
+
+        flagged_count = int(np.count_nonzero(frame_mask[start:end]))
+        if flagged_count > (float(frame_count) * float(majority_fraction)):
+            skip_mask[idx] = True
+
+    return skip_mask
 
 
 def analyze_npz(

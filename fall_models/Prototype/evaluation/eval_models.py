@@ -93,6 +93,9 @@ from dataset_helpers.dataset import (
     remap_label as _remap_label,
     get_fall_merge_set as _get_fall_merge_set,
 )
+from dataset_helpers.check_camera1_background_switches import (
+    build_camera1_majority_flagged_window_mask,
+)
 
 # Same model definitions as training
 from models.tcn.simple_tcn import TCNBaseline
@@ -427,6 +430,37 @@ def _drop_activity6_majority_missing_windows(
     )
 
 
+def _drop_camera1_majority_background_windows(
+    *,
+    X_windows: np.ndarray,
+    y_windows: np.ndarray,
+    meta: Dict[str, Any],
+    frame_mask_cache: Dict[str, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], int]:
+    n_windows = _window_count_from_meta(meta)
+    if int(X_windows.shape[0]) != n_windows or int(y_windows.shape[0]) != n_windows:
+        raise RuntimeError(
+            "Window array length mismatch while applying Camera1 background filtering: "
+            f"X={int(X_windows.shape[0])}, y={int(y_windows.shape[0])}, meta={n_windows}"
+        )
+
+    skip_mask = build_camera1_majority_flagged_window_mask(
+        meta=meta,
+        frame_mask_cache=frame_mask_cache,
+    )
+    skipped = int(np.count_nonzero(skip_mask))
+    if skipped <= 0:
+        return X_windows, y_windows, meta, 0
+
+    keep_mask = ~skip_mask
+    return (
+        X_windows[keep_mask],
+        y_windows[keep_mask],
+        _filter_window_aligned_meta(meta, keep_mask),
+        skipped,
+    )
+
+
 def parse_weights_path_overrides(
     items: Optional[List[str]],
     model_list: List[str],
@@ -599,6 +633,7 @@ def _write_frame_step_npz(src_npz: Path, dst_npz: Path, frame_step: int) -> None
                 out[key] = arr[::frame_step]
             else:
                 out[key] = arr
+        out["source_npz_path"] = np.array(src_npz.as_posix())
 
     for req in ("kpts_xy", "kpts_conf", "frame_labels"):
         if req not in out:
@@ -1629,6 +1664,8 @@ def _append_eval_variant_results(
     fall_class_ids_0based: List[int],
     skipped_test_windows: int,
     skipped_tune_windows: int,
+    skipped_test_camera1_windows: int,
+    skipped_tune_camera1_windows: int,
     tune_variant_info: Optional[Dict[str, Any]],
     p_fall_tune: Optional[np.ndarray],
 ) -> None:
@@ -1703,6 +1740,7 @@ def _append_eval_variant_results(
         "camera": ",".join(str(c) for c in split_camera_ids),
         "n_samples": int(len(y_true_eval)),
         "activity6_majority_missing_skipped_windows": int(skipped_test_windows),
+        "camera1_background_majority_skipped_windows": int(skipped_test_camera1_windows),
         "accuracy": float(acc) * 100.0,
         "recall": float(macro_recall) * 100.0,
         "specificity": float(macro_specificity) * 100.0,
@@ -1801,6 +1839,8 @@ def _append_eval_variant_results(
         "n_samples": int(len(y_true_eval)),
         "activity6_majority_missing_skipped_windows": int(skipped_test_windows),
         "activity6_majority_missing_skipped_tune_windows": int(skipped_tune_windows),
+        "camera1_background_majority_skipped_windows": int(skipped_test_camera1_windows),
+        "camera1_background_majority_skipped_tune_windows": int(skipped_tune_camera1_windows),
         "params_m": float(model_params_m),
         "macro_f1": float(macro_f1),
         "binary_mode": str(binary_mode).lower(),
@@ -2646,6 +2686,7 @@ def main():
 
     frame_has_pose_cache: Dict[Tuple[str, float], np.ndarray] = {}
     frame_label_cache: Dict[Tuple[str, str], np.ndarray] = {}
+    camera1_frame_mask_cache: Dict[str, np.ndarray] = {}
 
     ckpt_root = Path(args.ckpt_root)
     ckpt_overrides = parse_ckpt_overrides(args.ckpt)
@@ -3055,10 +3096,21 @@ def main():
                     f"[{m}][{split_name}] skipped {skipped_test_windows} Activity6 windows "
                     "with no detected keypoints in the majority of sampled frames"
                 )
+            X_test, y_test, test_meta, skipped_test_camera1_windows = _drop_camera1_majority_background_windows(
+                X_windows=X_test,
+                y_windows=y_test,
+                meta=test_meta,
+                frame_mask_cache=camera1_frame_mask_cache,
+            )
+            if skipped_test_camera1_windows > 0:
+                print(
+                    f"[{m}][{split_name}] skipped {skipped_test_camera1_windows} Camera1 windows "
+                    "where background/reflection frames were the majority"
+                )
             if int(y_test.shape[0]) == 0:
                 print(
                     f"[{m}][{split_name}][WARN] no evaluation windows remain after "
-                    "Activity6 majority-missing-keypoint filtering; skipping split."
+                    "post-load window filtering; skipping split."
                 )
                 continue
 
@@ -3162,6 +3214,7 @@ def main():
                 p_fall_source = "rf_predict_proba" if is_rf else "activity_softmax"
 
             skipped_tune_windows = 0
+            skipped_tune_camera1_windows = 0
             tune_variant_infos: Optional[Dict[str, Dict[str, Any]]] = None
             p_fall_tune: Optional[np.ndarray] = None
             if str(args.binary_mode).lower() == "threshold" and args.threshold is None and args.tune_subjects is not None:
@@ -3232,10 +3285,20 @@ def main():
                         f"[{m}][{split_name}] skipped {skipped_tune_windows} Activity6 tuning windows "
                         "with no detected keypoints in the majority of sampled frames"
                     )
+                X_tune, y_tune, tune_meta, skipped_tune_camera1_windows = _drop_camera1_majority_background_windows(
+                    X_windows=X_tune,
+                    y_windows=y_tune,
+                    meta=tune_meta,
+                    frame_mask_cache=camera1_frame_mask_cache,
+                )
+                if skipped_tune_camera1_windows > 0:
+                    print(
+                        f"[{m}][{split_name}] skipped {skipped_tune_camera1_windows} Camera1 tuning windows "
+                        "where background/reflection frames were the majority"
+                    )
                 if int(y_tune.shape[0]) == 0:
                     raise RuntimeError(
-                        f"[{m}][{split_name}] No tuning windows remain after "
-                        "Activity6 majority-missing-keypoint filtering."
+                        f"[{m}][{split_name}] No tuning windows remain after post-load window filtering."
                     )
 
                 tune_transition_eval_info = _build_transition_eval_info(
@@ -3331,6 +3394,8 @@ def main():
                     fall_class_ids_0based=fall_class_ids_0based,
                     skipped_test_windows=int(skipped_test_windows),
                     skipped_tune_windows=int(skipped_tune_windows),
+                    skipped_test_camera1_windows=int(skipped_test_camera1_windows),
+                    skipped_tune_camera1_windows=int(skipped_tune_camera1_windows),
                     tune_variant_info=tune_variant_infos.get(variant_key) if tune_variant_infos is not None else None,
                     p_fall_tune=p_fall_tune,
                 )
