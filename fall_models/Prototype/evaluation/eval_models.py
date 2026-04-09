@@ -7,7 +7,7 @@ same NPZ -> window loading pipeline as training (dataset.py).
 Outputs (in --out-dir):
 - metrics_summary.csv   : per-model/per-split summary including
     * binary sensitivity (recall) and precision macro-averaged over fall/no-fall
-    * per-class (fall, no-fall) precision/recall
+    * per-class multi-class precision/recall/F1/specificity/support columns keyed by class name
     * multi-class macro F1
 - f1_per_class.csv      : per-model/per-split, per-class F1 (multi-class)
 - misclassification_report.xlsx : per-video + per-window activity misclassifications
@@ -1795,7 +1795,7 @@ def _append_eval_variant_results(
         y_pred_bin=y_pred_bin,
     )
 
-    variant_cfg["summary_rows"].append({
+    summary_row = {
         "model": model_name,
         "eval_split": split_name,
         "n_samples": int(len(y_true_eval)),
@@ -1838,7 +1838,21 @@ def _append_eval_variant_results(
         "rp_img_h": rp_img_h_ckpt,
         "feature_mode": str(feature_mode_ckpt),
         "motion_xy_scale": float(motion_xy_scale_ckpt),
-    })
+    }
+
+    used_metric_suffixes: set[str] = set()
+    for lab in labels_all:
+        suffix = _metric_label_suffix(cm_names, int(lab))
+        if suffix in used_metric_suffixes:
+            suffix = f"{suffix}_{int(lab)}"
+        used_metric_suffixes.add(suffix)
+        summary_row[f"precision_{suffix}"] = float(precision[lab])
+        summary_row[f"recall_{suffix}"] = float(recall[lab])
+        summary_row[f"specificity_{suffix}"] = float(specificity[lab])
+        summary_row[f"f1_{suffix}"] = float(f1[lab])
+        summary_row[f"support_{suffix}"] = int(support[lab])
+
+    variant_cfg["summary_rows"].append(summary_row)
 
 
 def pick_threshold_fbeta(
@@ -2028,6 +2042,14 @@ def _label_name(class_names: List[str], label_id: int) -> str:
     if 0 <= int(label_id) < len(class_names):
         return str(class_names[int(label_id)])
     return str(int(label_id))
+
+
+def _metric_label_suffix(class_names: List[str], label_id: int) -> str:
+    raw_name = _label_name(class_names, label_id).strip().lower()
+    token = re.sub(r"[^a-z0-9]+", "_", raw_name).strip("_")
+    if not token or token.isdigit():
+        return f"label_{int(label_id)}"
+    return token
 
 
 def build_misclassification_video_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
