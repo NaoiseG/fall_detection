@@ -23,6 +23,7 @@ Environment overrides:
   SCRATCH_ROOT        Scratch root. Defaults to $HOME/scratch.
   PYTHON_BIN          Python executable. Defaults to python, then python3.
   MODEL_PATH          Defaults to $PROTOTYPE_DIR/pose_models/ultralytics/<pose-model>-pose.pt
+  CAMERA1_REPORT_PATH Defaults to $SCRATCH_ROOT/keypoints/camera1_background_report.csv
   BAD_REPORT_PATH     Defaults to $SCRATCH_ROOT/keypoints/bad_keypoints_report.csv
   EMPTY_REPORT_PATH   Defaults to $SCRATCH_ROOT/keypoints/empty_windows_report.csv
 EOF
@@ -122,10 +123,12 @@ SCRATCH_ROOT="${SCRATCH_ROOT:-$HOME/scratch}"
 KEYPOINTS_ROOT="${SCRATCH_ROOT}/keypoints/UPFall_keypoints/${POSE_MODEL}/base"
 UPFALL_ROOT="${SCRATCH_ROOT}/UPFall"
 MODEL_PATH="${MODEL_PATH:-${PROTOTYPE_DIR}/pose_models/ultralytics/${POSE_MODEL}-pose.pt}"
+CAMERA1_REPORT_PATH="${CAMERA1_REPORT_PATH:-${SCRATCH_ROOT}/keypoints/camera1_background_report.csv}"
 BAD_REPORT_PATH="${BAD_REPORT_PATH:-${SCRATCH_ROOT}/keypoints/bad_keypoints_report.csv}"
 EMPTY_REPORT_PATH="${EMPTY_REPORT_PATH:-${SCRATCH_ROOT}/keypoints/empty_windows_report.csv}"
 PYTHON_BIN="$(resolve_python_bin)"
 
+mkdir -p -- "$(dirname -- "$CAMERA1_REPORT_PATH")"
 mkdir -p -- "$(dirname -- "$BAD_REPORT_PATH")"
 mkdir -p -- "$(dirname -- "$EMPTY_REPORT_PATH")"
 
@@ -147,14 +150,39 @@ log "Keypoints root: ${KEYPOINTS_ROOT}"
 log "UP-Fall root:   ${UPFALL_ROOT}"
 log "Model path:     ${MODEL_PATH}"
 
-log "Step 1/7: Scan for bad keypoint tracks."
+log "Step 1/10: Scan Camera1 for background/reflection switches."
+remove_stale_report "$CAMERA1_REPORT_PATH"
+run_cmd \
+  "$PYTHON_BIN" "$PROTOTYPE_DIR/dataset_helpers/check_camera1_background_switches.py" \
+  --root "$KEYPOINTS_ROOT" \
+  --output "$CAMERA1_REPORT_PATH"
+
+log "Step 2/10: Delete reported Camera1 entries."
+delete_if_report_exists \
+  "$CAMERA1_REPORT_PATH" \
+  "$PYTHON_BIN" "$PROTOTYPE_DIR/dataset_helpers/delete_reported_entries.py" \
+  "$CAMERA1_REPORT_PATH" \
+  --root "$KEYPOINTS_ROOT" \
+  --execute
+
+log "Step 3/10: Regenerate Camera1 keypoints."
+run_cmd \
+  "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
+  --subjects 1-17 \
+  --camera 1 \
+  --lock-settings strict_lock \
+  --upfall-root "$UPFALL_ROOT" \
+  --output-root "$KEYPOINTS_ROOT" \
+  --model-path "$MODEL_PATH"
+
+log "Step 4/10: Scan Camera2 for bad keypoint tracks."
 remove_stale_report "$BAD_REPORT_PATH"
 run_cmd \
   "$PYTHON_BIN" "$PROTOTYPE_DIR/dataset_helpers/check_keypoints_tracking.py" \
   --root "$KEYPOINTS_ROOT" \
   --output "$BAD_REPORT_PATH"
 
-log "Step 2/7: Delete reported bad keypoint entries."
+log "Step 5/10: Delete reported Camera2 bad keypoint entries."
 delete_if_report_exists \
   "$BAD_REPORT_PATH" \
   "$PYTHON_BIN" "$PROTOTYPE_DIR/dataset_helpers/delete_reported_entries.py" \
@@ -162,7 +190,7 @@ delete_if_report_exists \
   --root "$KEYPOINTS_ROOT" \
   --execute
 
-log "Step 3/7: Regenerate keypoints."
+log "Step 6/10: Regenerate Camera2 keypoints."
 run_cmd \
   "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
   --subjects 1-17 \
@@ -173,7 +201,7 @@ run_cmd \
   --model-path "$MODEL_PATH" \
   --no-suspicious
 
-log "Step 4/7: Scan for empty windows."
+log "Step 7/10: Scan Camera2 for empty windows."
 remove_stale_report "$EMPTY_REPORT_PATH"
 run_cmd \
   "$PYTHON_BIN" "$PROTOTYPE_DIR/dataset_helpers/check_keypoints_empty_windows.py" \
@@ -181,7 +209,7 @@ run_cmd \
   --camera-dirs Camera2 \
   --output "$EMPTY_REPORT_PATH"
 
-log "Step 5/7: Delete reported empty-window entries."
+log "Step 8/10: Delete reported Camera2 empty-window entries."
 delete_if_report_exists \
   "$EMPTY_REPORT_PATH" \
   "$PYTHON_BIN" "$PROTOTYPE_DIR/dataset_helpers/delete_reported_entries.py" \
@@ -189,7 +217,7 @@ delete_if_report_exists \
   --root "$KEYPOINTS_ROOT" \
   --execute
 
-log "Step 6/7: Regenerate keypoints again with --allow-region2-start."
+log "Step 9/10: Regenerate Camera2 keypoints again with --allow-region2-start."
 run_cmd \
   "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
   --subjects 1-17 \
@@ -201,7 +229,7 @@ run_cmd \
   --no-suspicious \
   --allow-region2-start
 
-log "Step 7/7: Re-scan empty windows, delete any remaining empties, then fix bad labels."
+log "Step 10/10: Re-scan Camera2 empty windows, delete remaining empties, then fix bad labels."
 remove_stale_report "$EMPTY_REPORT_PATH"
 run_cmd \
   "$PYTHON_BIN" "$PROTOTYPE_DIR/dataset_helpers/check_keypoints_empty_windows.py" \
