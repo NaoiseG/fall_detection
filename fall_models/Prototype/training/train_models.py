@@ -1147,8 +1147,8 @@ if __name__ == "__main__":
         "--normalize-mode",
         type=str,
         default="center_scale",
-        choices=["center_scale", "root_scale", "paper_rp"],
-        help="Normalisation mode when --normalize 1. center_scale=legacy; root_scale=hip-root relative + robust scale; paper_rp=paper Relative Position (translation only).",
+        choices=["center_scale", "root_scale", "paper_rp", "paper_rp_scale"],
+        help="Normalisation mode when --normalize 1. center_scale=legacy; root_scale=hip-root relative + robust scale; paper_rp=paper Relative Position (translation only); paper_rp_scale=paper_rp translation + per-frame scale normalisation.",
     )
     parser.add_argument("--add-vel", type=int, default=1, help="Add velocity channels vx, vy (0/1).")
     parser.add_argument("--add-acc", type=int, default=1, help="Add acceleration channels ax, ay (0/1).")

@@ -723,6 +723,27 @@ def _normalize_xy_paper_rp(xy: np.ndarray, conf: np.ndarray, center: np.ndarray)
     return out
 
 
+def _normalize_xy_paper_rp_scale(xy: np.ndarray, conf: np.ndarray, center: np.ndarray) -> np.ndarray:
+    """
+    Paper-style RP with additional per-frame scale normalisation:
+      - translation: hip shifted to image center (same as paper_rp)
+      - scale: divide by shoulder/hip/torso width after translation
+    Preserves pose orientation (standing vs. lying) while removing
+    subject-distance variance.
+    """
+    N, K, _ = xy.shape
+    out = xy.astype(np.float32, copy=True)
+    c = np.asarray(center, dtype=np.float32).reshape(2)
+
+    for t in range(N):
+        hip = _reference_hip(out[t], conf[t])
+        out[t] = out[t] + (c - hip)[None, :]
+        _, scale = _frame_center_scale(out[t], conf[t])
+        out[t] = out[t] / float(scale)
+
+    return out
+
+
 def _add_velocity_channels(xy_norm: np.ndarray) -> np.ndarray:
     """
     xy_norm: (N,K,2)
@@ -1545,6 +1566,14 @@ def make_window_tensors(
                 rp_img_h=rp_img_h,
             )
             xy_used = _normalize_xy_paper_rp(xy_filled, conf_filled, center=center)
+        elif nm == "paper_rp_scale":
+            center = _compute_image_center(
+                xy=xy_filled,
+                rp_center_mode=str(rp_center_mode),
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
+            )
+            xy_used = _normalize_xy_paper_rp_scale(xy_filled, conf_filled, center=center)
         else:
             raise ValueError(f"Unknown normalize_mode: {normalize_mode}")
 
