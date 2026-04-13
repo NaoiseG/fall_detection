@@ -6,26 +6,38 @@ IFS=$'\n\t'
 usage() {
   cat <<'EOF'
 Usage:
-  ./fix_bad_keypoints.sh <pose-model>
+  ./fix_bad_keypoints.sh --keypoints-root <path> --upfall-root <path> --model-path <path> [options]
 
 Example:
-  ./fix_bad_keypoints.sh yolo11l
+  ./fix_bad_keypoints.sh \
+    --keypoints-root "$HOME/scratch/keypoints/UPFall_keypoints/yolo11l/base" \
+    --upfall-root "$HOME/scratch/UPFall" \
+    --model-path "$HOME/models/yolo11l-pose.pt"
 
-Supported pose models:
-  yolo11n
-  yolo11s
-  yolo11m
-  yolo11l
-  yolo11x
+Required arguments:
+  --keypoints-root PATH  Root directory containing the keypoint tree to clean.
+  --upfall-root PATH     Root directory of the UP-Fall frames tree used for regeneration.
+  --model-path PATH      Pose model weights passed through to get_keypoints_files.py.
+
+Optional arguments:
+  --subjects SPEC        Subject list/range to regenerate, e.g. 1-17 or 1,3,7.
+                         Defaults to subjects auto-detected from --keypoints-root,
+                         then --upfall-root.
+  --lock-settings NAME   Lock preset for regeneration. Defaults to strict_lock.
+  --report-dir PATH      Directory for intermediate CSV reports.
+  -h, --help             Show this help text.
 
 Environment overrides:
   PROTOTYPE_DIR       Prototype root. Defaults to the parent of this script.
-  SCRATCH_ROOT        Scratch root. Defaults to $HOME/scratch.
   PYTHON_BIN          Python executable. Defaults to python, then python3.
-  MODEL_PATH          Defaults to $PROTOTYPE_DIR/pose_models/ultralytics/<pose-model>-pose.pt
-  CAMERA1_REPORT_PATH Defaults to $SCRATCH_ROOT/keypoints/camera1_background_report.csv
-  BAD_REPORT_PATH     Defaults to $SCRATCH_ROOT/keypoints/bad_keypoints_report.csv
-  EMPTY_REPORT_PATH   Defaults to $SCRATCH_ROOT/keypoints/empty_windows_report.csv
+  REPORT_DIR          Default report directory when --report-dir is omitted.
+  CAMERA1_REPORT_PATH Override the Camera1 report path.
+  BAD_REPORT_PATH     Override the Camera2 tracking report path.
+  EMPTY_REPORT_PATH   Override the Camera2 empty-window report path.
+
+Notes:
+  - --keypoints-root should be the directory that directly contains Subject* folders.
+  - The cleanup pipeline still targets the UP-Fall Camera1 and Camera2 layout.
 EOF
 }
 
@@ -91,46 +103,121 @@ resolve_python_bin() {
   exit 1
 }
 
-if [[ $# -ne 1 ]]; then
+require_value() {
+  local flag_name="$1"
+  local flag_value="${2:-}"
+  if [[ -z "$flag_value" ]]; then
+    echo "ERROR: Missing value for ${flag_name}" >&2
+    usage >&2
+    exit 1
+  fi
+}
+
+validate_lock_settings() {
+  case "$1" in
+    strict_lock|default)
+      ;;
+    *)
+      echo "ERROR: Unsupported lock setting: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+discover_subjects() {
+  local root="$1"
+  local -a subject_ids=()
+  local subject_dir=""
+  local base_name=""
+  local subject_id=""
+  local joined=""
+
+  [[ -d "$root" ]] || return 1
+
+  while IFS= read -r -d '' subject_dir; do
+    base_name="$(basename -- "$subject_dir")"
+    if [[ "$base_name" =~ ^Subject([0-9]+)$ ]]; then
+      subject_ids+=("${BASH_REMATCH[1]}")
+    fi
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -name 'Subject*' -print0 2>/dev/null)
+
+  [[ ${#subject_ids[@]} -gt 0 ]] || return 1
+
+  while IFS= read -r subject_id; do
+    [[ -n "$subject_id" ]] || continue
+    if [[ -n "$joined" ]]; then
+      joined+=","
+    fi
+    joined+="$subject_id"
+  done < <(printf '%s\n' "${subject_ids[@]}" | sort -n -u)
+
+  [[ -n "$joined" ]] || return 1
+  printf '%s' "$joined"
+}
+
+KEYPOINTS_ROOT=""
+UPFALL_ROOT=""
+MODEL_PATH=""
+SUBJECTS="${SUBJECTS:-}"
+LOCK_SETTINGS="${LOCK_SETTINGS:-strict_lock}"
+REPORT_DIR="${REPORT_DIR:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --keypoints-root)
+      require_value "$1" "${2:-}"
+      KEYPOINTS_ROOT="$2"
+      shift 2
+      ;;
+    --upfall-root)
+      require_value "$1" "${2:-}"
+      UPFALL_ROOT="$2"
+      shift 2
+      ;;
+    --model-path)
+      require_value "$1" "${2:-}"
+      MODEL_PATH="$2"
+      shift 2
+      ;;
+    --subjects)
+      require_value "$1" "${2:-}"
+      SUBJECTS="$2"
+      shift 2
+      ;;
+    --lock-settings)
+      require_value "$1" "${2:-}"
+      LOCK_SETTINGS="$2"
+      shift 2
+      ;;
+    --report-dir)
+      require_value "$1" "${2:-}"
+      REPORT_DIR="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unrecognized argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$KEYPOINTS_ROOT" || -z "$UPFALL_ROOT" || -z "$MODEL_PATH" ]]; then
+  echo "ERROR: --keypoints-root, --upfall-root, and --model-path are required." >&2
   usage >&2
   exit 1
 fi
 
-case "$1" in
-  -h|--help)
-    usage
-    exit 0
-    ;;
-esac
-
-POSE_MODEL="${1%-pose}"
-
-case "$POSE_MODEL" in
-  yolo11n|yolo11s|yolo11m|yolo11l|yolo11x)
-    ;;
-  *)
-    echo "ERROR: Unsupported pose model: $1" >&2
-    usage >&2
-    exit 1
-    ;;
-esac
+validate_lock_settings "$LOCK_SETTINGS"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROTOTYPE_DIR="${PROTOTYPE_DIR:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 export PROTOTYPE_DIR
-
-SCRATCH_ROOT="${SCRATCH_ROOT:-$HOME/scratch}"
-KEYPOINTS_ROOT="${SCRATCH_ROOT}/keypoints/UPFall_keypoints/${POSE_MODEL}/base"
-UPFALL_ROOT="${SCRATCH_ROOT}/UPFall"
-MODEL_PATH="${MODEL_PATH:-${PROTOTYPE_DIR}/pose_models/ultralytics/${POSE_MODEL}-pose.pt}"
-CAMERA1_REPORT_PATH="${CAMERA1_REPORT_PATH:-${SCRATCH_ROOT}/keypoints/camera1_background_report.csv}"
-BAD_REPORT_PATH="${BAD_REPORT_PATH:-${SCRATCH_ROOT}/keypoints/bad_keypoints_report.csv}"
-EMPTY_REPORT_PATH="${EMPTY_REPORT_PATH:-${SCRATCH_ROOT}/keypoints/empty_windows_report.csv}"
-PYTHON_BIN="$(resolve_python_bin)"
-
-mkdir -p -- "$(dirname -- "$CAMERA1_REPORT_PATH")"
-mkdir -p -- "$(dirname -- "$BAD_REPORT_PATH")"
-mkdir -p -- "$(dirname -- "$EMPTY_REPORT_PATH")"
 
 if [[ ! -d "$PROTOTYPE_DIR" ]]; then
   echo "ERROR: Prototype directory not found: $PROTOTYPE_DIR" >&2
@@ -142,13 +229,51 @@ if [[ ! -f "$MODEL_PATH" ]]; then
   exit 1
 fi
 
+if [[ ! -d "$KEYPOINTS_ROOT" ]]; then
+  echo "ERROR: Keypoints root not found: $KEYPOINTS_ROOT" >&2
+  exit 1
+fi
+
+if [[ ! -d "$UPFALL_ROOT" ]]; then
+  echo "ERROR: UP-Fall root not found: $UPFALL_ROOT" >&2
+  exit 1
+fi
+
+if [[ -z "$REPORT_DIR" ]]; then
+  REPORT_DIR="${KEYPOINTS_ROOT}/_fix_bad_keypoints_reports"
+fi
+
+CAMERA1_REPORT_PATH="${CAMERA1_REPORT_PATH:-${REPORT_DIR}/camera1_background_report.csv}"
+BAD_REPORT_PATH="${BAD_REPORT_PATH:-${REPORT_DIR}/bad_keypoints_report.csv}"
+EMPTY_REPORT_PATH="${EMPTY_REPORT_PATH:-${REPORT_DIR}/empty_windows_report.csv}"
+PYTHON_BIN="$(resolve_python_bin)"
+
+mkdir -p -- "$(dirname -- "$CAMERA1_REPORT_PATH")"
+mkdir -p -- "$(dirname -- "$BAD_REPORT_PATH")"
+mkdir -p -- "$(dirname -- "$EMPTY_REPORT_PATH")"
+
+SUBJECT_SOURCE="cli"
+if [[ -z "$SUBJECTS" ]]; then
+  if SUBJECTS="$(discover_subjects "$KEYPOINTS_ROOT")"; then
+    SUBJECT_SOURCE="keypoints-root"
+  elif SUBJECTS="$(discover_subjects "$UPFALL_ROOT")"; then
+    SUBJECT_SOURCE="upfall-root"
+  else
+    echo "ERROR: Could not infer subjects from $KEYPOINTS_ROOT or $UPFALL_ROOT. Pass --subjects explicitly." >&2
+    exit 1
+  fi
+fi
+
 cd "$PROTOTYPE_DIR"
 
-log "Starting bad keypoint cleanup pipeline for ${POSE_MODEL}"
+log "Starting bad keypoint cleanup pipeline"
 log "Prototype root: ${PROTOTYPE_DIR}"
 log "Keypoints root: ${KEYPOINTS_ROOT}"
 log "UP-Fall root:   ${UPFALL_ROOT}"
 log "Model path:     ${MODEL_PATH}"
+log "Subjects:       ${SUBJECTS} (${SUBJECT_SOURCE})"
+log "Lock settings:  ${LOCK_SETTINGS}"
+log "Report dir:     ${REPORT_DIR}"
 
 log "Step 1/10: Scan Camera1 for background/reflection switches."
 remove_stale_report "$CAMERA1_REPORT_PATH"
@@ -168,9 +293,9 @@ delete_if_report_exists \
 log "Step 3/10: Regenerate Camera1 keypoints."
 run_cmd \
   "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
-  --subjects 1-17 \
+  --subjects "$SUBJECTS" \
   --camera 1 \
-  --lock-settings strict_lock \
+  --lock-settings "$LOCK_SETTINGS" \
   --upfall-root "$UPFALL_ROOT" \
   --output-root "$KEYPOINTS_ROOT" \
   --model-path "$MODEL_PATH"
@@ -193,9 +318,9 @@ delete_if_report_exists \
 log "Step 6/10: Regenerate Camera2 keypoints."
 run_cmd \
   "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
-  --subjects 1-17 \
+  --subjects "$SUBJECTS" \
   --camera 2 \
-  --lock-settings strict_lock \
+  --lock-settings "$LOCK_SETTINGS" \
   --upfall-root "$UPFALL_ROOT" \
   --output-root "$KEYPOINTS_ROOT" \
   --model-path "$MODEL_PATH" \
@@ -220,9 +345,9 @@ delete_if_report_exists \
 log "Step 9/10: Regenerate Camera2 keypoints again with --allow-region2-start."
 run_cmd \
   "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
-  --subjects 1-17 \
+  --subjects "$SUBJECTS" \
   --camera 2 \
-  --lock-settings strict_lock \
+  --lock-settings "$LOCK_SETTINGS" \
   --upfall-root "$UPFALL_ROOT" \
   --output-root "$KEYPOINTS_ROOT" \
   --model-path "$MODEL_PATH" \
@@ -248,4 +373,4 @@ run_cmd \
   "$PYTHON_BIN" "$PROTOTYPE_DIR/dataset_helpers/fix_label_20_to_2.py" \
   --root "$KEYPOINTS_ROOT"
 
-log "Pipeline complete for ${POSE_MODEL}."
+log "Pipeline complete."
