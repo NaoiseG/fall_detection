@@ -17,7 +17,7 @@ set -o pipefail
 PROJECT_DIR="/home/jetson/NaoiseG/fall_detection/fall_models/Prototype"
 BENCH_DIR="benchmarks"
 FULL_PRUNED_MODEL_ROOT="/home/jetson/NaoiseG/fall_detection/pruning/pruned_models/full_pruned"
-VIDEO_PATH="../../Datasets/test_vids/sitting.mp4"
+VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 CLASSIFIER="cnnlstm"
 CNNLSTM_WEIGHT="../../web_app/models/classification/cnnlstm/yolo11l-pose/cnnlstm_best.pt"
 
@@ -250,7 +250,7 @@ build_command() {
     --half "${half_flag}" \
     --max-people 10 \
     --max-det 10 \
-    --warmup-frames 0 \
+    --warmup-frames 5 \
     --warmup-windows 0 \
     --benchmark 1 \
     --profile-out "${BENCH_DIR}" \

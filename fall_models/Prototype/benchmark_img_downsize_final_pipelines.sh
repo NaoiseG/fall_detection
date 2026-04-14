@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}"
 
 BENCH_DIR="${BENCH_DIR:-benchmarks/img_downsize/final_pipelines}"
-VIDEO_PATH="${VIDEO_PATH:-../../Datasets/test_vids/sitting.mp4}"
+VIDEO_PATH="${VIDEO_PATH:-../../Datasets/test_vids/activity_all.mp4}"
 MODEL_ROOT="${MODEL_ROOT:-../../quantisation/models/img_downsize}"
 CLASSIFICATION_ROOT="${CLASSIFICATION_ROOT:-../../web_app/models/classification}"
 
@@ -249,7 +249,7 @@ build_command() {
     --half "${half_flag}" \
     --max-people 10 \
     --max-det 10 \
-    --warmup-frames 0 \
+    --warmup-frames 5 \
     --warmup-windows 0 \
     --benchmark 1 \
     --profile-out "${profile_out_dir}" \
