@@ -126,6 +126,82 @@ def main():
         default=Path("detector/yolo/data/yolov3-spp.weights"),
         help="YOLOv3-SPP detector weights path (.weights or TensorRT .engine), absolute or relative to --alphapose-root.",
     )
+    ap.add_argument(
+        "--lock-settings",
+        choices=("strict_lock", "default"),
+        default="strict_lock",
+        help="Tracking/lock preset. 'strict_lock' matches the settings used by get_keypoints_files.py. Default: strict_lock.",
+    )
+    ap.add_argument(
+        "--no-suspicious",
+        action="store_true",
+        help=(
+            "Treat known Camera2 background regions as a switch barrier. "
+            "Tracking prefers candidates outside those regions, and will leave frames empty "
+            "instead of switching into them unless continuity is very strong."
+        ),
+    )
+    ap.add_argument(
+        "--allow-region1-start",
+        action="store_true",
+        help=(
+            "When --no-suspicious is enabled, allow initial target acquisition to start "
+            "inside suspicious Region 1 (the right-side box) instead of waiting for a "
+            "non-suspicious target."
+        ),
+    )
+    ap.add_argument(
+        "--allow-region2-start",
+        action="store_true",
+        help=(
+            "When --no-suspicious is enabled, allow initial target acquisition to start "
+            "inside suspicious Region 2 (the middle/early-clip box) instead of waiting for a "
+            "non-suspicious target."
+        ),
+    )
+    ap.add_argument(
+        "--camera1-foreground-guard",
+        dest="camera1_foreground_guard",
+        action="store_true",
+        help=(
+            "For Camera1, prefer larger/lower foreground candidates before the track is "
+            "permanently locked, which helps avoid sticking to reflections."
+        ),
+    )
+    ap.add_argument(
+        "--no-camera1-foreground-guard",
+        dest="camera1_foreground_guard",
+        action="store_false",
+        help="Disable the Camera1 foreground-acquisition guard.",
+    )
+    ap.add_argument(
+        "--lock-after-foreground-frames",
+        type=int,
+        default=None,
+        help=(
+            "Override the number of consecutive prelock foreground selections required "
+            "before making the first lock permanent."
+        ),
+    )
+    ap.add_argument(
+        "--lock-delay-frames",
+        type=int,
+        default=None,
+        help="Override an additional minimum frame index before making the first lock permanent.",
+    )
+    ap.add_argument(
+        "--acquire-min-box-area-ratio",
+        type=float,
+        default=None,
+        help="Override the minimum prelock candidate box-area ratio used by the Camera1 foreground guard.",
+    )
+    ap.add_argument(
+        "--acquire-bottom-margin-px",
+        type=float,
+        default=None,
+        help="Override the bottom-edge margin used by the Camera1 foreground guard.",
+    )
+    ap.set_defaults(camera1_foreground_guard=None)
     args = ap.parse_args()
 
     upfall_root = args.upfall_root.expanduser().resolve()
@@ -145,23 +221,54 @@ def main():
         checkpoint=str(args.fastpose_weights),
         detector_cfg=str(args.detector_cfg),
         detector_weights=str(args.detector_weights),
-        conf_thres=0.01,
-        conf_min=0.01,
-        nms_thres=0.6,
         fps=30,
         max_people=1,
-        max_jump_px=None,  # None => use max_jump_diag_frac * image_diagonal
-        max_jump_diag_frac=0.12,
-        max_lost=60,
-        switch_margin_px=9999.0,
-        reset_on_max_lost=False,
-        lock_first_target=True,
-        strict_reacquire=True,
-        min_iou_same_track=0.05,
-        max_box_area_ratio=2.5,
         save_csv=False,
         render_video=True,
     )
+
+    # Apply lock-settings preset first, then per-field overrides.
+    _ALPHAPOSE_LOCK_PRESETS = {
+        "default": {},
+        "strict_lock": {
+            "conf_thres": 0.01,
+            "conf_min": 0.01,
+            "max_jump_px": None,
+            "max_jump_diag_frac": 0.12,
+            "max_lost": 60,
+            "switch_margin_px": 9999.0,
+            "reset_on_max_lost": False,
+            "lock_first_target": True,
+            "strict_reacquire": True,
+            "min_iou_same_track": 0.05,
+            "max_box_area_ratio": 2.5,
+        },
+    }
+    for field_name, value in _ALPHAPOSE_LOCK_PRESETS[args.lock_settings].items():
+        setattr(cfg, field_name, value)
+
+    cfg.no_suspicious = bool(args.no_suspicious and int(args.camera) == 2)
+    cfg.allow_region1_start = bool(args.allow_region1_start and int(args.camera) == 2)
+    cfg.allow_region2_start = bool(args.allow_region2_start and int(args.camera) == 2)
+
+    if int(args.camera) == 1:
+        if args.camera1_foreground_guard is None:
+            cfg.prefer_foreground_on_acquire = True
+            if args.lock_after_foreground_frames is None:
+                cfg.lock_after_foreground_frames = 10
+        else:
+            cfg.prefer_foreground_on_acquire = bool(args.camera1_foreground_guard)
+
+    overrides = {
+        "lock_after_foreground_frames": args.lock_after_foreground_frames,
+        "lock_delay_frames": args.lock_delay_frames,
+        "acquire_min_box_area_ratio": args.acquire_min_box_area_ratio,
+        "acquire_bottom_margin_px": args.acquire_bottom_margin_px,
+    }
+    for field_name, value in overrides.items():
+        if value is not None:
+            setattr(cfg, field_name, value)
+
     runner = AlphaPoseRunner(cfg)
 
     camera_folders = find_camera_folders_subjects(
@@ -175,6 +282,12 @@ def main():
     print(f"AlphaPose root: {args.alphapose_root}")
     print(f"FastPose weights: {args.fastpose_weights}")
     print(f"Detector weights: {args.detector_weights}")
+    print(f"Lock settings preset: {args.lock_settings}")
+    print(f"No suspicious switching: {cfg.no_suspicious}")
+    print(f"Allow Region1 start: {cfg.allow_region1_start}")
+    print(f"Allow Region2 start: {cfg.allow_region2_start}")
+    print(f"Prefer foreground on acquire: {cfg.prefer_foreground_on_acquire}")
+    print(f"Lock after foreground frames: {cfg.lock_after_foreground_frames}")
     print(f"Subjects: {args.subjects}")
     print("Camera folders found:", len(camera_folders))
     total = len(camera_folders)

@@ -6,18 +6,51 @@ IFS=$'\n\t'
 usage() {
   cat <<'EOF'
 Usage:
-  ./fix_bad_keypoints.sh --keypoints-root <path> --upfall-root <path> --model-path <path> [options]
+  ./fix_bad_keypoints.sh --keypoints-root <path> --upfall-root <path> [--pose-backend yolo|alphapose|vitpose] [backend-args] [options]
 
-Example:
+Examples (YOLO, default):
   ./fix_bad_keypoints.sh \
     --keypoints-root "$HOME/scratch/keypoints/UPFall_keypoints/yolo11l/base" \
     --upfall-root "$HOME/scratch/UPFall" \
     --model-path "$HOME/models/yolo11l-pose.pt"
 
+Example (AlphaPose):
+  ./fix_bad_keypoints.sh \
+    --keypoints-root "$HOME/scratch/keypoints/UPFall_keypoints_alpha" \
+    --upfall-root "$HOME/scratch/UPFall" \
+    --pose-backend alphapose \
+    --alphapose-root "$HOME/models/AlphaPose" \
+    --fastpose-weights "$HOME/models/fast_res50_256x192.pth" \
+    --detector-weights "$HOME/models/yolov3-spp.weights"
+
+Example (ViTPose):
+  ./fix_bad_keypoints.sh \
+    --keypoints-root "$HOME/scratch/keypoints/UPFall_keypoints_vit" \
+    --upfall-root "$HOME/scratch/UPFall" \
+    --pose-backend vitpose \
+    --detector-model "PekingU/rtdetr_r50vd_coco_o365" \
+    --pose-model "usyd-community/vitpose-base"
+
 Required arguments:
   --keypoints-root PATH  Root directory containing the keypoint tree to clean.
   --upfall-root PATH     Root directory of the UP-Fall frames tree used for regeneration.
-  --model-path PATH      Pose model weights passed through to get_keypoints_files.py.
+
+Backend selection (default: yolo):
+  --pose-backend NAME    Pose backend to use: yolo, alphapose, or vitpose.
+
+YOLO backend arguments (required when --pose-backend yolo):
+  --model-path PATH      YOLO pose model weights (.pt or .engine).
+
+AlphaPose backend arguments (required when --pose-backend alphapose):
+  --alphapose-root PATH      AlphaPose repo root directory.
+  --fastpose-weights PATH    FastPose weights (.pth or .engine).
+  --detector-weights PATH    YOLOv3-SPP detector weights (.weights or .engine).
+  --cfg-path PATH            AlphaPose config YAML (default: configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml).
+  --detector-cfg PATH        Detector cfg file (default: detector/yolo/cfg/yolov3-spp.cfg).
+
+ViTPose backend arguments (required when --pose-backend vitpose):
+  --detector-model NAME  RT-DETR model ID/path (default: PekingU/rtdetr_r50vd_coco_o365).
+  --pose-model NAME      ViTPose model ID/path (default: usyd-community/vitpose-base).
 
 Optional arguments:
   --subjects SPEC        Subject list/range to regenerate, e.g. 1-17 or 1,3,7.
@@ -158,7 +191,18 @@ discover_subjects() {
 
 KEYPOINTS_ROOT=""
 UPFALL_ROOT=""
+POSE_BACKEND="${POSE_BACKEND:-yolo}"
+# yolo
 MODEL_PATH=""
+# alphapose
+ALPHAPOSE_ROOT=""
+FASTPOSE_WEIGHTS=""
+DETECTOR_WEIGHTS_AP=""
+CFG_PATH=""
+DETECTOR_CFG=""
+# vitpose
+DETECTOR_MODEL=""
+POSE_MODEL=""
 SUBJECTS="${SUBJECTS:-}"
 LOCK_SETTINGS="${LOCK_SETTINGS:-strict_lock}"
 REPORT_DIR="${REPORT_DIR:-}"
@@ -175,9 +219,49 @@ while [[ $# -gt 0 ]]; do
       UPFALL_ROOT="$2"
       shift 2
       ;;
+    --pose-backend)
+      require_value "$1" "${2:-}"
+      POSE_BACKEND="$2"
+      shift 2
+      ;;
     --model-path)
       require_value "$1" "${2:-}"
       MODEL_PATH="$2"
+      shift 2
+      ;;
+    --alphapose-root)
+      require_value "$1" "${2:-}"
+      ALPHAPOSE_ROOT="$2"
+      shift 2
+      ;;
+    --fastpose-weights)
+      require_value "$1" "${2:-}"
+      FASTPOSE_WEIGHTS="$2"
+      shift 2
+      ;;
+    --detector-weights)
+      require_value "$1" "${2:-}"
+      DETECTOR_WEIGHTS_AP="$2"
+      shift 2
+      ;;
+    --cfg-path)
+      require_value "$1" "${2:-}"
+      CFG_PATH="$2"
+      shift 2
+      ;;
+    --detector-cfg)
+      require_value "$1" "${2:-}"
+      DETECTOR_CFG="$2"
+      shift 2
+      ;;
+    --detector-model)
+      require_value "$1" "${2:-}"
+      DETECTOR_MODEL="$2"
+      shift 2
+      ;;
+    --pose-model)
+      require_value "$1" "${2:-}"
+      POSE_MODEL="$2"
       shift 2
       ;;
     --subjects)
@@ -207,11 +291,36 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$KEYPOINTS_ROOT" || -z "$UPFALL_ROOT" || -z "$MODEL_PATH" ]]; then
-  echo "ERROR: --keypoints-root, --upfall-root, and --model-path are required." >&2
+if [[ -z "$KEYPOINTS_ROOT" || -z "$UPFALL_ROOT" ]]; then
+  echo "ERROR: --keypoints-root and --upfall-root are required." >&2
   usage >&2
   exit 1
 fi
+
+case "$POSE_BACKEND" in
+  yolo)
+    if [[ -z "$MODEL_PATH" ]]; then
+      echo "ERROR: --model-path is required when --pose-backend is yolo." >&2
+      usage >&2
+      exit 1
+    fi
+    ;;
+  alphapose)
+    if [[ -z "$ALPHAPOSE_ROOT" || -z "$FASTPOSE_WEIGHTS" || -z "$DETECTOR_WEIGHTS_AP" ]]; then
+      echo "ERROR: --alphapose-root, --fastpose-weights, and --detector-weights are required when --pose-backend is alphapose." >&2
+      usage >&2
+      exit 1
+    fi
+    ;;
+  vitpose)
+    # detector-model and pose-model have defaults inside the Python script; no hard requirement here.
+    ;;
+  *)
+    echo "ERROR: Unsupported --pose-backend: $POSE_BACKEND. Choose from: yolo, alphapose, vitpose." >&2
+    usage >&2
+    exit 1
+    ;;
+esac
 
 validate_lock_settings "$LOCK_SETTINGS"
 
@@ -224,8 +333,13 @@ if [[ ! -d "$PROTOTYPE_DIR" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$MODEL_PATH" ]]; then
+if [[ "$POSE_BACKEND" == "yolo" && ! -f "$MODEL_PATH" ]]; then
   echo "ERROR: Pose model weights not found: $MODEL_PATH" >&2
+  exit 1
+fi
+
+if [[ "$POSE_BACKEND" == "alphapose" && ! -d "$ALPHAPOSE_ROOT" ]]; then
+  echo "ERROR: AlphaPose root not found: $ALPHAPOSE_ROOT" >&2
   exit 1
 fi
 
@@ -270,10 +384,72 @@ log "Starting bad keypoint cleanup pipeline"
 log "Prototype root: ${PROTOTYPE_DIR}"
 log "Keypoints root: ${KEYPOINTS_ROOT}"
 log "UP-Fall root:   ${UPFALL_ROOT}"
-log "Model path:     ${MODEL_PATH}"
+log "Pose backend:   ${POSE_BACKEND}"
+case "$POSE_BACKEND" in
+  yolo)      log "Model path:     ${MODEL_PATH}" ;;
+  alphapose) log "AlphaPose root: ${ALPHAPOSE_ROOT}" ; log "FastPose:       ${FASTPOSE_WEIGHTS}" ;;
+  vitpose)   log "Detector model: ${DETECTOR_MODEL:-<default>}" ; log "Pose model:     ${POSE_MODEL:-<default>}" ;;
+esac
 log "Subjects:       ${SUBJECTS} (${SUBJECT_SOURCE})"
 log "Lock settings:  ${LOCK_SETTINGS}"
 log "Report dir:     ${REPORT_DIR}"
+
+# Build the base regeneration command for the selected backend.
+# Usage: regen_cmd <camera> [extra-flags...]
+regen_cmd() {
+  local camera="$1"
+  shift
+  local -a cmd
+  case "$POSE_BACKEND" in
+    yolo)
+      cmd=(
+        "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files
+        --subjects "$SUBJECTS"
+        --camera "$camera"
+        --lock-settings "$LOCK_SETTINGS"
+        --upfall-root "$UPFALL_ROOT"
+        --output-root "$KEYPOINTS_ROOT"
+        --model-path "$MODEL_PATH"
+      )
+      ;;
+    alphapose)
+      cmd=(
+        "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files_alphapose
+        --subjects "$SUBJECTS"
+        --camera "$camera"
+        --lock-settings "$LOCK_SETTINGS"
+        --upfall-root "$UPFALL_ROOT"
+        --output-root "$KEYPOINTS_ROOT"
+        --alphapose-root "$ALPHAPOSE_ROOT"
+        --fastpose-weights "$FASTPOSE_WEIGHTS"
+        --detector-weights "$DETECTOR_WEIGHTS_AP"
+      )
+      if [[ -n "$CFG_PATH" ]]; then
+        cmd+=(--cfg-path "$CFG_PATH")
+      fi
+      if [[ -n "$DETECTOR_CFG" ]]; then
+        cmd+=(--detector-cfg "$DETECTOR_CFG")
+      fi
+      ;;
+    vitpose)
+      cmd=(
+        "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files_ViTpose
+        --subjects "$SUBJECTS"
+        --camera "$camera"
+        --lock-settings "$LOCK_SETTINGS"
+        --upfall-root "$UPFALL_ROOT"
+        --output-root "$KEYPOINTS_ROOT"
+      )
+      if [[ -n "$DETECTOR_MODEL" ]]; then
+        cmd+=(--detector-model "$DETECTOR_MODEL")
+      fi
+      if [[ -n "$POSE_MODEL" ]]; then
+        cmd+=(--pose-model "$POSE_MODEL")
+      fi
+      ;;
+  esac
+  run_cmd "${cmd[@]}" "$@"
+}
 
 log "Step 1/10: Scan Camera1 for background/reflection switches."
 remove_stale_report "$CAMERA1_REPORT_PATH"
@@ -291,14 +467,7 @@ delete_if_report_exists \
   --execute
 
 log "Step 3/10: Regenerate Camera1 keypoints."
-run_cmd \
-  "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
-  --subjects "$SUBJECTS" \
-  --camera 1 \
-  --lock-settings "$LOCK_SETTINGS" \
-  --upfall-root "$UPFALL_ROOT" \
-  --output-root "$KEYPOINTS_ROOT" \
-  --model-path "$MODEL_PATH"
+regen_cmd 1
 
 log "Step 4/10: Scan Camera2 for bad keypoint tracks."
 remove_stale_report "$BAD_REPORT_PATH"
@@ -316,15 +485,7 @@ delete_if_report_exists \
   --execute
 
 log "Step 6/10: Regenerate Camera2 keypoints."
-run_cmd \
-  "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
-  --subjects "$SUBJECTS" \
-  --camera 2 \
-  --lock-settings "$LOCK_SETTINGS" \
-  --upfall-root "$UPFALL_ROOT" \
-  --output-root "$KEYPOINTS_ROOT" \
-  --model-path "$MODEL_PATH" \
-  --no-suspicious
+regen_cmd 2 --no-suspicious
 
 log "Step 7/10: Scan Camera2 for empty windows."
 remove_stale_report "$EMPTY_REPORT_PATH"
@@ -343,16 +504,7 @@ delete_if_report_exists \
   --execute
 
 log "Step 9/10: Regenerate Camera2 keypoints again with --allow-region2-start."
-run_cmd \
-  "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files \
-  --subjects "$SUBJECTS" \
-  --camera 2 \
-  --lock-settings "$LOCK_SETTINGS" \
-  --upfall-root "$UPFALL_ROOT" \
-  --output-root "$KEYPOINTS_ROOT" \
-  --model-path "$MODEL_PATH" \
-  --no-suspicious \
-  --allow-region2-start
+regen_cmd 2 --no-suspicious --allow-region2-start
 
 log "Step 10/10: Re-scan Camera2 empty windows, delete remaining empties, then fix bad labels."
 remove_stale_report "$EMPTY_REPORT_PATH"
