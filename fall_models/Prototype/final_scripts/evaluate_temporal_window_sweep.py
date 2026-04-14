@@ -251,6 +251,7 @@ def build_train_command(
 ) -> List[str]:
     return [
         sys.executable,
+        "-u",
         "-m",
         "training.train_models",
         "--model",
@@ -316,6 +317,7 @@ def build_eval_command(
 ) -> List[str]:
     return [
         sys.executable,
+        "-u",
         "-m",
         "evaluation.eval_models",
         "--models",

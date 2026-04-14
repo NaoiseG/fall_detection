@@ -28,10 +28,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import math
 import re
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -120,9 +123,11 @@ class LE2ISequence:
 @dataclass(frozen=True)
 class LE2IFallTimingAnnotation:
     annotation_path: Path
-    event_start_frame: int
-    event_end_frame: int
+    event_start_frame: Optional[int]
+    event_end_frame: Optional[int]
     num_lines: int
+    source_kind: str
+    strict_reliable: bool
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -158,6 +163,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
         help="Directory where window_predictions.csv, video_summary.csv, metrics.json, and run_config.json are written.",
+    )
+    parser.add_argument(
+        "--ffmpeg-video-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional cache directory for FFmpeg-made video-only copies of LE2I AVIs. "
+            "When omitted, the cache defaults to <output-dir>/video_only_cache."
+        ),
+    )
+    parser.add_argument(
+        "--disable-ffmpeg-video-only-remux",
+        action="store_true",
+        help=(
+            "Disable the LE2I-specific FFmpeg video-only remux fallback. "
+            "By default the evaluator prefers a video-only cached copy when FFmpeg is available."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -386,7 +408,26 @@ def _read_nonempty_text_lines(path: Path) -> List[str]:
         return [str(line).strip() for line in handle if str(line).strip()]
 
 
-def parse_le2i_annotation(annotation_path: Path) -> Tuple[str, Optional[LE2IFallTimingAnnotation]]:
+def _parse_le2i_phase_rows(lines: Sequence[str]) -> List[Tuple[int, int]]:
+    rows: List[Tuple[int, int]] = []
+    for line in lines:
+        parts = [part.strip() for part in str(line).split(",")]
+        if len(parts) < 2:
+            continue
+        frame_idx = _safe_int_from_text(parts[0])
+        phase_label = _safe_int_from_text(parts[1])
+        if frame_idx is None or phase_label is None:
+            continue
+        rows.append((int(frame_idx), int(phase_label)))
+    rows.sort(key=lambda item: item[0])
+    return rows
+
+
+def parse_le2i_annotation(
+    annotation_path: Path,
+    *,
+    warn_on_malformed_timing: bool = True,
+) -> Tuple[str, Optional[LE2IFallTimingAnnotation]]:
     lines = _read_nonempty_text_lines(annotation_path)
     if len(lines) >= 2:
         event_start_frame = _safe_int_from_text(lines[0])
@@ -400,12 +441,147 @@ def parse_le2i_annotation(annotation_path: Path) -> Tuple[str, Optional[LE2IFall
                         event_start_frame=int(event_start_frame),
                         event_end_frame=int(event_end_frame),
                         num_lines=int(len(lines)),
+                        source_kind="header",
+                        strict_reliable=True,
                     ),
                 )
             return "non_fall", None
 
-    LOGGER.warning("Could not parse fall start/end from annotation header: %s", annotation_path)
+    phase_rows = _parse_le2i_phase_rows(lines)
+    non_normal_rows = [(frame_idx, phase_label) for frame_idx, phase_label in phase_rows if int(phase_label) != 1]
+    if non_normal_rows:
+        if warn_on_malformed_timing:
+            LOGGER.warning(
+                "Missing or malformed LE2I timing header; using loose fall-only labeling and skipping strict timing for %s",
+                annotation_path,
+            )
+        return (
+            "fall",
+            LE2IFallTimingAnnotation(
+                annotation_path=annotation_path,
+                event_start_frame=None,
+                event_end_frame=None,
+                num_lines=int(len(lines)),
+                source_kind="phase_only_no_header",
+                strict_reliable=False,
+            ),
+        )
+
+    if phase_rows:
+        return "non_fall", None
+
+    if warn_on_malformed_timing:
+        LOGGER.warning("Could not parse LE2I annotation file: %s", annotation_path)
     return "non_fall", None
+
+
+def resolve_le2i_annotation_dir(subset_root: Path) -> Optional[Path]:
+    for dirname in ("Annotation_files", "Annotations_files"):
+        candidate = subset_root / dirname
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def find_ffmpeg_executable() -> Optional[str]:
+    return shutil.which("ffmpeg")
+
+
+def _iter_video_frames(video_path: Path):
+    """Yield (total_frames_hint, frame_generator) for a video file.
+
+    Tries PyAV first (avoids OpenCV's native AVI codec which can corrupt the
+    heap on some LE2I files).  Falls back to cv2.CAP_FFMPEG and then the
+    default OpenCV backend.  The generator yields BGR uint8 numpy arrays.
+    """
+    # --- PyAV path -----------------------------------------------------------
+    try:
+        import av as _av  # type: ignore[import]
+        container = _av.open(str(video_path))
+        stream = container.streams.video[0]
+        hint = int(stream.frames) if stream.frames else 0
+
+        def _av_gen():
+            try:
+                for f in container.decode(stream):
+                    yield f.to_ndarray(format="bgr24")
+            finally:
+                container.close()
+
+        return hint, _av_gen()
+    except ImportError:
+        pass
+    except Exception as exc:
+        LOGGER.debug("PyAV failed for %s (%s); falling back to cv2", video_path, exc)
+
+    # --- OpenCV path ---------------------------------------------------------
+    cap = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    hint = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    def _cv2_gen():
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                yield frame
+        finally:
+            cap.release()
+
+    return hint, _cv2_gen()
+
+
+def remux_video_to_video_only(
+    video_path: Path,
+    *,
+    cache_dir: Path,
+    ffmpeg_exe: str,
+) -> Path:
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", video_path.stem).strip("._") or "video"
+    suffix = video_path.suffix if video_path.suffix else ".avi"
+    path_hash = hashlib.sha1(str(video_path.resolve()).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    cache_name = f"{safe_stem}__{path_hash}{suffix}"
+    remuxed_path = cache_dir / cache_name
+    if remuxed_path.is_file():
+        try:
+            if remuxed_path.stat().st_mtime >= video_path.stat().st_mtime and remuxed_path.stat().st_size > 0:
+                return remuxed_path
+        except OSError:
+            pass
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(ffmpeg_exe),
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-an",
+        str(remuxed_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0 or (not remuxed_path.is_file()) or remuxed_path.stat().st_size <= 0:
+        stderr_text = str(result.stderr or "").strip()
+        if remuxed_path.exists():
+            try:
+                remuxed_path.unlink()
+            except OSError:
+                pass
+        raise RuntimeError(
+            f"FFmpeg video-only remux failed for {video_path}. "
+            f"stderr: {stderr_text or 'n/a'}"
+        )
+    return remuxed_path
 
 
 def discover_le2i_sequences(le2i_root: Path) -> List[LE2ISequence]:
@@ -415,9 +591,9 @@ def discover_le2i_sequences(le2i_root: Path) -> List[LE2ISequence]:
     subset_roots.sort(key=lambda path: natural_sort_key(path.name))
 
     for subset_root in subset_roots:
-        annotation_dir = subset_root / "Annotation_files"
+        annotation_dir = resolve_le2i_annotation_dir(subset_root)
         video_dir = subset_root / "Videos"
-        if not annotation_dir.is_dir():
+        if annotation_dir is None:
             LOGGER.info("Skipping unannotated LE2I subset: %s", subset_root)
             continue
         if not video_dir.is_dir():
@@ -433,7 +609,7 @@ def discover_le2i_sequences(le2i_root: Path) -> List[LE2ISequence]:
                 LOGGER.warning("Missing LE2I video for annotation %s: expected %s", annotation_path, video_path)
                 continue
 
-            video_label, _ = parse_le2i_annotation(annotation_path)
+            video_label, _ = parse_le2i_annotation(annotation_path, warn_on_malformed_timing=True)
             sequences.append(
                 LE2ISequence(
                     dataset=DATASET_NAME,
@@ -474,8 +650,8 @@ def select_test_sequences(
 def load_le2i_fall_timing_annotations(sequences: Sequence[LE2ISequence]) -> Dict[str, LE2IFallTimingAnnotation]:
     annotations: Dict[str, LE2IFallTimingAnnotation] = {}
     for sequence in sequences:
-        video_label, annotation = parse_le2i_annotation(sequence.annotation_path)
-        if video_label == "fall" and annotation is not None:
+        video_label, annotation = parse_le2i_annotation(sequence.annotation_path, warn_on_malformed_timing=False)
+        if video_label == "fall" and annotation is not None and bool(annotation.strict_reliable):
             annotations[sequence.video_id] = annotation
     return annotations
 
@@ -776,7 +952,12 @@ def _append_window_row(
     start_frame_1based = to_human_frame(int(window_data.raw_start_idx))
     end_frame_1based = to_human_frame(int(window_data.raw_end_idx))
 
-    has_timing_annotation = bool(sequence.video_label == "fall" and timing_annotation is not None)
+    has_timing_annotation = bool(
+        sequence.video_label == "fall"
+        and timing_annotation is not None
+        and timing_annotation.event_start_frame is not None
+        and timing_annotation.event_end_frame is not None
+    )
     annotated_event_start_frame = None
     annotated_event_end_frame = None
     overlaps_annotated_fall_event = False
@@ -1173,6 +1354,9 @@ def evaluate_sequence(
     min_consecutive_positive: int,
     strict_early_tolerance_frames: int,
     strict_late_tolerance_frames: int,
+    ffmpeg_exe: Optional[str],
+    video_only_cache_dir: Optional[Path],
+    remux_video_only: bool,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     pose_pipeline.reset_tracking_state()
 
@@ -1192,12 +1376,25 @@ def evaluate_sequence(
     conf_thres = float(getattr(classifier, "conf_thres", 0.0))
     raw_frame_idx = 0
 
-    cap = cv2.VideoCapture(str(sequence.video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {sequence.video_path}")
+    # Determine target frame size from checkpoint training dimensions (paper_rp uses pixel coords).
+    target_hw: Optional[Tuple[int, int]] = None
+    _ckpt_w = getattr(classifier, "rp_img_w", None)
+    _ckpt_h = getattr(classifier, "rp_img_h", None)
+    if _ckpt_w is not None and _ckpt_h is not None:
+        target_hw = (int(_ckpt_h), int(_ckpt_w))
+
+    input_video_path = sequence.video_path
+    effective_video_path = sequence.video_path
+    if bool(remux_video_only) and ffmpeg_exe is not None and video_only_cache_dir is not None:
+        effective_video_path = remux_video_to_video_only(
+            sequence.video_path,
+            cache_dir=video_only_cache_dir,
+            ffmpeg_exe=ffmpeg_exe,
+        )
+
+    total_frames_hint, frame_iter = _iter_video_frames(effective_video_path)
 
     progress = None
-    total_frames_hint = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if tqdm is not None:
         progress = tqdm(
             total=total_frames_hint if total_frames_hint > 0 else None,
@@ -1207,12 +1404,10 @@ def evaluate_sequence(
         )
 
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-
+        for frame in frame_iter:
             readable_frames += 1
+            if target_hw is not None and (int(frame.shape[0]), int(frame.shape[1])) != target_hw:
+                frame = cv2.resize(frame, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_LINEAR)
             image_shape_hw = (int(frame.shape[0]), int(frame.shape[1]))
 
             pose_out = pose_pipeline.process_frame(frame_bgr=frame, raw_frame_idx=int(raw_frame_idx), sync_cuda_timing=False)
@@ -1270,7 +1465,6 @@ def evaluate_sequence(
     finally:
         if progress is not None:
             progress.close()
-        cap.release()
 
     if image_shape_hw is not None:
         while True:
@@ -1317,7 +1511,12 @@ def evaluate_sequence(
     annotated_event_start_time_s: Optional[float] = None
     annotated_event_end_time_s: Optional[float] = None
 
-    if timing_annotation is not None and sequence.video_label == "fall":
+    if (
+        timing_annotation is not None
+        and sequence.video_label == "fall"
+        and timing_annotation.event_start_frame is not None
+        and timing_annotation.event_end_frame is not None
+    ):
         annotated_event_start_frame = int(timing_annotation.event_start_frame)
         annotated_event_end_frame = int(timing_annotation.event_end_frame)
         annotated_event_start_time_s = frame_time_seconds(int(annotated_event_start_frame) - 1, fps)
@@ -1326,14 +1525,20 @@ def evaluate_sequence(
     base_video_summary = {
         "dataset": sequence.dataset,
         "video_id": sequence.video_id,
-        "video_path": str(sequence.video_path),
+        "video_path": str(input_video_path),
         "video_label": sequence.video_label,
         "subset_name": sequence.subset_name,
         "annotation_path": str(sequence.annotation_path),
+        "opened_video_path": str(effective_video_path),
         "fps": float(fps),
         "num_frames": int(raw_frame_idx),
         "num_windows": int(len(window_rows)),
-        "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
+        "timing_annotation_available": bool(
+            sequence.video_label == "fall"
+            and timing_annotation is not None
+            and timing_annotation.event_start_frame is not None
+            and timing_annotation.event_end_frame is not None
+        ),
         "annotated_event_start_frame": annotated_event_start_frame,
         "annotated_event_end_frame": annotated_event_end_frame,
         "annotated_event_start_time_s": annotated_event_start_time_s,
@@ -1343,7 +1548,7 @@ def evaluate_sequence(
         "pose_found_frames": int(pose_found_frames),
         "sampled_pose_found_frames": int(sampled_pose_found_frames),
         "sequence_root": str(sequence.subset_root),
-        "video_file": str(sequence.video_path),
+        "video_file": str(input_video_path),
     }
     video_summary = build_video_summary_for_decision(
         base_video_summary,
@@ -1612,6 +1817,12 @@ def main() -> int:
         f"{matched_timing_annotations_selected}/{num_fall} selected fall videos "
         f"({matched_timing_annotations_all}/{num_fall_all} across the full discovery set)."
     )
+    malformed_header_falls_all = int(num_fall_all - matched_timing_annotations_all)
+    if malformed_header_falls_all > 0:
+        print(
+            "Loose-only fall videos with malformed or headerless timing annotations: "
+            f"{malformed_header_falls_all}. These remain in clip-level metrics but are excluded from strict timing metrics."
+        )
 
     device = pick_device(args.device)
     resolved_imgsz = float(args.imgsz) if args.imgsz is not None else float(infer_imgsz_from_path(keypoint_weights) or 640.0)
@@ -1623,6 +1834,15 @@ def main() -> int:
         args.strict_late_tolerance_frames,
         classifier.window_policy.raw_window_len,
     )
+    ffmpeg_exe = None if bool(args.disable_ffmpeg_video_only_remux) else find_ffmpeg_executable()
+    video_only_cache_dir = None
+    remux_video_only = bool(ffmpeg_exe is not None)
+    if remux_video_only:
+        video_only_cache_dir = (
+            args.ffmpeg_video_cache_dir.expanduser().resolve()
+            if args.ffmpeg_video_cache_dir is not None
+            else (output_dir / "video_only_cache").resolve()
+        )
     pose_pipeline = build_pose_pipeline(args, device=device, keypoint_weights=keypoint_weights, imgsz=resolved_imgsz)
 
     LOGGER.info(
@@ -1635,6 +1855,10 @@ def main() -> int:
         classifier.window_policy.frame_step,
     )
     LOGGER.info("Using pose imgsz=%s on device=%s", f"{resolved_imgsz:g}", device)
+    if remux_video_only and video_only_cache_dir is not None:
+        LOGGER.info("Using FFmpeg video-only cache at %s", video_only_cache_dir)
+    else:
+        LOGGER.info("FFmpeg video-only remux is disabled or FFmpeg is unavailable; opening source AVIs directly.")
     LOGGER.info(
         "Strict timing metric: alert uses first confirmed window end frame with allowed interval [fall_start - %d, fall_end + %d].",
         strict_early_tolerance_frames,
@@ -1651,7 +1875,12 @@ def main() -> int:
         annotated_event_end_frame: Optional[int] = None
         annotated_event_start_time_s: Optional[float] = None
         annotated_event_end_time_s: Optional[float] = None
-        if timing_annotation is not None and sequence.video_label == "fall":
+        if (
+            timing_annotation is not None
+            and sequence.video_label == "fall"
+            and timing_annotation.event_start_frame is not None
+            and timing_annotation.event_end_frame is not None
+        ):
             annotated_event_start_frame = int(timing_annotation.event_start_frame)
             annotated_event_end_frame = int(timing_annotation.event_end_frame)
             annotated_event_start_time_s = frame_time_seconds(int(annotated_event_start_frame) - 1, float(args.fps))
@@ -1668,6 +1897,9 @@ def main() -> int:
                 min_consecutive_positive=int(args.min_consecutive_positive),
                 strict_early_tolerance_frames=int(strict_early_tolerance_frames),
                 strict_late_tolerance_frames=int(strict_late_tolerance_frames),
+                ffmpeg_exe=ffmpeg_exe,
+                video_only_cache_dir=video_only_cache_dir,
+                remux_video_only=bool(remux_video_only),
             )
         except Exception as exc:
             LOGGER.warning("Failed to evaluate %s: %s", sequence.video_id, exc)
@@ -1685,7 +1917,12 @@ def main() -> int:
                             "fps": float(args.fps),
                             "num_frames": 0,
                             "num_windows": 0,
-                            "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
+                            "timing_annotation_available": bool(
+                                sequence.video_label == "fall"
+                                and timing_annotation is not None
+                                and timing_annotation.event_start_frame is not None
+                                and timing_annotation.event_end_frame is not None
+                            ),
                             "annotated_event_start_frame": annotated_event_start_frame,
                             "annotated_event_end_frame": annotated_event_end_frame,
                             "annotated_event_start_time_s": annotated_event_start_time_s,
@@ -1696,6 +1933,7 @@ def main() -> int:
                             "sampled_pose_found_frames": 0,
                             "sequence_root": str(sequence.subset_root),
                             "video_file": str(sequence.video_path),
+                            "opened_video_path": str(sequence.video_path),
                             "warning": str(exc),
                         },
                         window_rows=[],
@@ -1921,6 +2159,7 @@ def main() -> int:
         "sampled_pose_found_frames",
         "sequence_root",
         "video_file",
+        "opened_video_path",
         "warning",
     ]
 
@@ -1998,6 +2237,9 @@ def main() -> int:
         "strict_metric_alert_anchor": "first_confirmed_positive_window_end_frame",
         "strict_early_tolerance_frames": int(strict_early_tolerance_frames),
         "strict_late_tolerance_frames": int(strict_late_tolerance_frames),
+        "ffmpeg_video_only_remux_enabled": bool(remux_video_only),
+        "ffmpeg_executable": ffmpeg_exe,
+        "ffmpeg_video_cache_dir": None if video_only_cache_dir is None else str(video_only_cache_dir),
         "selected_threshold": float(selected_threshold),
         "selected_min_consecutive_positive": int(selected_min_consecutive_positive),
         "optimize_video_decision": bool(args.optimize_video_decision),
@@ -2040,6 +2282,9 @@ def main() -> int:
                 for seq in sequences_all
                 if seq.video_label == "fall" and seq.video_id in timing_annotations
             )
+        ),
+        "num_fall_sequences_without_strict_timing_annotation": int(
+            sum(1 for seq in sequences_all if seq.video_label == "fall") - len(timing_annotations)
         ),
         "timing_ground_truth_positive_rule": "window overlaps the LE2I annotated fall interval from the annotation header",
         "test_mode": bool(args.test),

@@ -398,6 +398,8 @@ def make_window_features(
         nm = str(normalize_mode).lower().strip()
         if nm == "center_scale":
             xy_used = ds._normalize_xy(xy_filled, conf_filled)
+        elif nm == "root_scale":
+            xy_used = ds._normalize_xy_root_scale(xy_filled, conf_filled)
         elif nm == "paper_rp":
             center = ds._compute_image_center(
                 xy=xy_filled,
@@ -406,6 +408,14 @@ def make_window_features(
                 rp_img_h=rp_img_h,
             )
             xy_used = ds._normalize_xy_paper_rp(xy_filled, conf_filled, center=center)
+        elif nm == "paper_rp_scale":
+            center = ds._compute_image_center(
+                xy=xy_filled,
+                rp_center_mode=str(rp_center_mode),
+                rp_img_w=rp_img_w,
+                rp_img_h=rp_img_h,
+            )
+            xy_used = ds._normalize_xy_paper_rp_scale(xy_filled, conf_filled, center=center)
         else:
             raise ValueError(f"Unknown normalize_mode: {normalize_mode}")
 

@@ -1308,6 +1308,13 @@ def evaluate_sequence(
     policy = classifier.window_policy
     conf_thres = float(getattr(classifier, "conf_thres", 0.0))
 
+    # Determine target frame size from checkpoint training dimensions (paper_rp uses pixel coords).
+    target_hw: Optional[Tuple[int, int]] = None
+    _ckpt_w = getattr(classifier, "rp_img_w", None)
+    _ckpt_h = getattr(classifier, "rp_img_h", None)
+    if _ckpt_w is not None and _ckpt_h is not None:
+        target_hw = (int(_ckpt_h), int(_ckpt_w))
+
     frame_iter: Iterable[Tuple[int, Path]] = enumerate(sequence.frame_paths)
     frame_iter = iter_progress(frame_iter, desc=f"{sequence.video_id}", total=len(sequence.frame_paths), leave=False)
 
@@ -1323,6 +1330,8 @@ def evaluate_sequence(
             LOGGER.warning("Unreadable frame; substituting a blank frame for %s", frame_path)
         else:
             readable_frames += 1
+            if target_hw is not None and (int(frame.shape[0]), int(frame.shape[1])) != target_hw:
+                frame = cv2.resize(frame, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_LINEAR)
             last_frame_shape = tuple(int(v) for v in frame.shape)
             image_shape_hw = (int(frame.shape[0]), int(frame.shape[1]))
 
