@@ -172,7 +172,7 @@ add_yolo_jobs() {
   for model in "${models[@]}"; do
     for precision in "${precisions[@]}"; do
       case "$precision" in
-        fp32) keypoints_folder="fp32_fp32" ;;
+        fp32) keypoints_folder="fp32" ;;
         fp16) keypoints_folder="fp16" ;;
         int8) keypoints_folder="int8" ;;
         *)
