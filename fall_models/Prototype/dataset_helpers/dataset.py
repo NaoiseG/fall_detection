@@ -725,22 +725,24 @@ def _normalize_xy_paper_rp(xy: np.ndarray, conf: np.ndarray, center: np.ndarray)
 
 def _normalize_xy_paper_rp_scale(xy: np.ndarray, conf: np.ndarray, center: np.ndarray) -> np.ndarray:
     """
-    Paper-style RP with additional per-frame scale normalisation:
+    Paper-style RP with image-size scale normalisation:
       - translation: hip shifted to image center (same as paper_rp)
-      - scale: divide by shoulder/hip/torso width after translation
-    Preserves pose orientation (standing vs. lying) while removing
-    subject-distance variance.
+      - scale: x divided by image width, y divided by image height
+    center = (W/2, H/2) from _compute_image_center, so image dims = center * 2.
+    For normalized_01 mode center = (0.5, 0.5), giving W=H=1.0 (no-op scale).
     """
     N, K, _ = xy.shape
     out = xy.astype(np.float32, copy=True)
     c = np.asarray(center, dtype=np.float32).reshape(2)
+    # Derive (W, H) from center; guard against degenerate zero center.
+    img_wh = c * 2.0
+    img_wh = np.where(img_wh > 1e-6, img_wh, np.ones(2, dtype=np.float32))
 
     for t in range(N):
         hip = _reference_hip(out[t], conf[t])
         out[t] = out[t] + (c - hip)[None, :]
-        _, scale = _frame_center_scale(out[t], conf[t])
-        out[t] = out[t] / float(scale)
 
+    out = out / img_wh[None, None, :]
     return out
 
 

@@ -125,6 +125,119 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def infer_epochs_from_train_command(train_command: Any) -> int | None:
+    if not isinstance(train_command, list):
+        return None
+    for idx, token in enumerate(train_command):
+        if str(token) != "--epochs":
+            continue
+        if idx + 1 >= len(train_command):
+            return None
+        try:
+            return int(train_command[idx + 1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def normalize_setup_summary(summary: Dict[str, Any], fallback_epochs: int) -> Dict[str, Any]:
+    normalized = dict(summary)
+    if normalized.get("epochs") is None:
+        inferred_epochs = infer_epochs_from_train_command(normalized.get("train_command"))
+        normalized["epochs"] = int(inferred_epochs) if inferred_epochs is not None else int(fallback_epochs)
+    else:
+        normalized["epochs"] = int(normalized["epochs"])
+    return normalized
+
+
+def is_complete_setup_summary(summary: Any, expected_setup_name: str | None = None) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if expected_setup_name is not None and str(summary.get("setup_name")) != expected_setup_name:
+        return False
+
+    training_results = summary.get("training_results")
+    if not isinstance(training_results, list):
+        return False
+    training_models = {
+        str(row.get("model"))
+        for row in training_results
+        if isinstance(row, dict) and row.get("model") is not None
+    }
+    if training_models != set(MODELS):
+        return False
+
+    weights = summary.get("weights")
+    if not isinstance(weights, dict):
+        return False
+    if {str(k) for k in weights.keys()} != set(MODELS):
+        return False
+
+    evaluation_metrics = summary.get("evaluation_metrics")
+    if not isinstance(evaluation_metrics, dict):
+        return False
+    if set(EVAL_VARIANTS) - set(str(k) for k in evaluation_metrics.keys()):
+        return False
+    for variant in EVAL_VARIANTS:
+        rows = evaluation_metrics.get(variant)
+        if not isinstance(rows, list) or len(rows) == 0:
+            return False
+
+    return True
+
+
+def load_completed_setup_summaries(combined_results_path: Path, fallback_epochs: int) -> Dict[str, Dict[str, Any]]:
+    if not combined_results_path.exists():
+        return {}
+
+    payload = load_json(combined_results_path)
+    payload_epochs = payload.get("epochs", fallback_epochs)
+    raw_setups = payload.get("setups", [])
+    if not isinstance(raw_setups, list):
+        raise RuntimeError(
+            f"Expected 'setups' to be a list in combined results JSON: {combined_results_path}"
+        )
+
+    completed: Dict[str, Dict[str, Any]] = {}
+    for raw_summary in raw_setups:
+        if not isinstance(raw_summary, dict):
+            continue
+        setup_name = str(raw_summary.get("setup_name", "")).strip()
+        if not setup_name:
+            continue
+        if setup_name in completed:
+            print(f"[resume] Ignoring duplicate setup entry in combined results: {setup_name}")
+            continue
+
+        summary = normalize_setup_summary(raw_summary, fallback_epochs=int(payload_epochs))
+        if not is_complete_setup_summary(summary, expected_setup_name=setup_name):
+            print(f"[resume] Ignoring incomplete setup entry in combined results: {setup_name}")
+            continue
+        completed[setup_name] = summary
+
+    print(f"[resume] Loaded {len(completed)} completed setup(s) from: {combined_results_path}")
+    return completed
+
+
+def remove_setup_dir(setup_dir: Path, out_root: Path) -> None:
+    if not setup_dir.exists():
+        return
+
+    resolved_out_root = out_root.resolve()
+    resolved_setup_dir = setup_dir.resolve()
+    try:
+        resolved_setup_dir.relative_to(resolved_out_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Refusing to delete setup directory outside output root: {resolved_setup_dir}"
+        ) from exc
+
+    if resolved_setup_dir == resolved_out_root:
+        raise RuntimeError(f"Refusing to delete output root directly: {resolved_out_root}")
+
+    shutil.rmtree(resolved_setup_dir)
+
+
 def coerce_scalar(value: str) -> Any:
     text = value.strip()
     if text == "":
@@ -203,6 +316,7 @@ def build_combined_payload(
     setup_summaries: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     flat_rows = flatten_summary_rows(setup_summaries)
+    setup_epochs = sorted({int(summary.get("epochs", epochs)) for summary in setup_summaries})
     return {
         "generated_at": utc_now_iso(),
         "project_root": str(repo_root.resolve()),
@@ -212,6 +326,7 @@ def build_combined_payload(
         "window_sizes": list(WINDOW_SIZES),
         "overlaps_pct": list(OVERLAPS_PCT),
         "epochs": int(epochs),
+        "setup_epochs": setup_epochs,
         "fixed_config": {
             "train_subjects": "1-12",
             "val_subjects": "13-15",
@@ -426,12 +541,16 @@ def run_setup(
 
     if summary_path.exists():
         print(f"[resume] Reusing existing setup summary: {summary_path}")
-        return load_json(summary_path)
+        summary = normalize_setup_summary(load_json(summary_path), fallback_epochs=int(epochs))
+        if not is_complete_setup_summary(summary, expected_setup_name=setup.name):
+            print(f"[resume] Existing setup summary is incomplete; restarting: {summary_path}")
+            remove_setup_dir(setup_dir, out_root)
+        else:
+            return summary
 
     if setup_dir.exists():
-        raise RuntimeError(
-            f"Setup directory already exists but has no setup summary, so I will not overwrite it: {setup_dir}"
-        )
+        print(f"[resume] Partial setup detected; deleting and restarting: {setup_dir}")
+        remove_setup_dir(setup_dir, out_root)
 
     training_dir = setup_dir / "training"
     training_dir.mkdir(parents=True, exist_ok=False)
@@ -468,6 +587,7 @@ def run_setup(
         "generated_at": utc_now_iso(),
         "setup_name": setup.name,
         "setup_dir": str(setup_dir.resolve()),
+        "epochs": int(epochs),
         "window_size": int(setup.window_size),
         "overlap_pct": int(setup.overlap_pct),
         "overlap_fraction": float(setup.overlap_pct) / 100.0,
@@ -508,8 +628,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=300,
-        help="Epochs per model for each setup (default: 300).",
+        default=100,
+        help="Epochs per model for each setup (default: 100).",
     )
     return parser.parse_args()
 
@@ -523,20 +643,25 @@ def main() -> None:
     out_root = Path(expand_user_path(str(args.out))).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    setup_summaries: List[Dict[str, Any]] = []
     combined_results_path = out_root / "combined_results.json"
+    completed_by_name = load_completed_setup_summaries(combined_results_path, fallback_epochs=int(args.epochs))
+    setup_summaries: List[Dict[str, Any]] = []
 
     for setup in build_setups():
         print(
             f"\n[setup] {setup.name} | T={setup.window_size} | overlap={setup.overlap_pct}% | stride={setup.stride}"
         )
-        summary = run_setup(
-            repo_root=repo_root,
-            out_root=out_root,
-            npz_root=npz_root,
-            epochs=int(args.epochs),
-            setup=setup,
-        )
+        if setup.name in completed_by_name:
+            print(f"[resume] Reusing completed setup from combined results: {setup.name}")
+            summary = completed_by_name[setup.name]
+        else:
+            summary = run_setup(
+                repo_root=repo_root,
+                out_root=out_root,
+                npz_root=npz_root,
+                epochs=int(args.epochs),
+                setup=setup,
+            )
         setup_summaries.append(summary)
 
         combined_payload = build_combined_payload(
