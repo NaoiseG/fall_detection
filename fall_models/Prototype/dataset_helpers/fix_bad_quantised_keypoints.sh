@@ -468,7 +468,7 @@ CONTINUE_ON_ERROR=1
 DATASETS_ROOT="${DEFAULT_REPO_ROOT}/Datasets"
 MODELS_ROOT="${DEFAULT_REPO_ROOT}/pose_models/quantised"
 UPFALL_ROOT=""
-ALPHAPOSE_ROOT="${DEFAULT_REPO_ROOT}/pose_models/AlphaPose"
+ALPHAPOSE_ROOT="${DEFAULT_REPO_ROOT}/fall_models/pose_models/AlphaPose"
 STATE_DIR="${DEFAULT_REPO_ROOT}/dataset_helpers/.fix_bad_keypoints_state"
 
 declare -a JOB_ORDER=()
