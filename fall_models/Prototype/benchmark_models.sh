@@ -20,6 +20,7 @@ BENCH_DIR="benchmarks"
 VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
 MODELS_ROOT="../../pose_models/quantised"
+BENCHMARK_STARTUP_TIMEOUT_S=300
 
 POSE_MODELS=(
   "yolo11n-pose"
@@ -58,7 +59,6 @@ VITPOSE_VERSIONS=(
 
 CLASSIFIERS=(
   "cnnlstm"
-  "stgcn"
   "motionbert"
 )
 
@@ -104,6 +104,63 @@ join_cmd() {
     printf -v out '%s%q ' "$out" "$arg"
   done
   printf '%s' "${out% }"
+}
+
+run_with_startup_watchdog() {
+  # Usage: run_with_startup_watchdog <marker> <timeout_s> -- <cmd> [args...]
+  # Runs <cmd> in the background. If <marker> does not appear in stdout within
+  # <timeout_s> seconds the process is killed and 124 is returned.
+  # Once the marker is seen the process runs to completion uninterrupted.
+  local marker="$1"
+  local timeout_s="$2"
+  shift 2
+  # consume the '--' separator
+  if [[ "${1:-}" == "--" ]]; then shift; fi
+
+  local marker_file
+  marker_file="$(mktemp)"
+
+  # Run command, scanning stdout for the marker, passing all output through.
+  (
+    "${@}" 2>&1 | while IFS= read -r line; do
+      printf '%s\n' "$line"
+      if [[ "$line" == *"${marker}"* ]]; then
+        touch "${marker_file}"
+      fi
+    done
+  ) &
+  local cmd_pid=$!
+
+  local deadline=$(( SECONDS + timeout_s ))
+  local marker_seen=0
+
+  while kill -0 "${cmd_pid}" 2>/dev/null; do
+    if [[ -f "${marker_file}" && "$(cat "${marker_file}" 2>/dev/null; echo x)" != "x" ]] || \
+       { [[ -f "${marker_file}" ]] && touch "${marker_file}" 2>/dev/null; }; then
+      marker_seen=1
+      break
+    fi
+    if [[ -f "${marker_file}" ]]; then
+      marker_seen=1
+      break
+    fi
+    if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+      break
+    fi
+    sleep 2
+  done
+
+  if [[ "${marker_seen}" -eq 0 ]] && kill -0 "${cmd_pid}" 2>/dev/null; then
+    kill "${cmd_pid}" 2>/dev/null
+    wait "${cmd_pid}" 2>/dev/null
+    rm -f "${marker_file}"
+    return 124
+  fi
+
+  wait "${cmd_pid}"
+  local rc=$?
+  rm -f "${marker_file}"
+  return "${rc}"
 }
 
 pose_weight_for_version() {
@@ -504,14 +561,19 @@ run_one_benchmark() {
 
   snapshot_top_level_dirs > "${before_file}"
 
-  "${cmd[@]}"
+  run_with_startup_watchdog "[benchmark] loop_start" "${BENCHMARK_STARTUP_TIMEOUT_S}" -- "${cmd[@]}"
   rc=$?
 
   snapshot_top_level_dirs > "${after_file}"
 
   if [[ "${rc}" -ne 0 ]]; then
-    log_failure \
-      "pose_model=${pose_model} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    if [[ "${rc}" -eq 124 ]]; then
+      log_failure \
+        "pose_model=${pose_model} version=${version} classifier=${classifier} status=startup_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+    else
+      log_failure \
+        "pose_model=${pose_model} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    fi
     rm -f "${before_file}" "${after_file}"
     return 1
   fi
@@ -624,14 +686,19 @@ run_one_alphapose_benchmark() {
 
   snapshot_top_level_dirs > "${before_file}"
 
-  "${cmd[@]}"
+  run_with_startup_watchdog "[benchmark] loop_start" "${BENCHMARK_STARTUP_TIMEOUT_S}" -- "${cmd[@]}"
   rc=$?
 
   snapshot_top_level_dirs > "${after_file}"
 
   if [[ "${rc}" -ne 0 ]]; then
-    log_failure \
-      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    if [[ "${rc}" -eq 124 ]]; then
+      log_failure \
+        "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+    else
+      log_failure \
+        "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    fi
     rm -f "${before_file}" "${after_file}"
     return 1
   fi
@@ -736,14 +803,19 @@ run_one_vitpose_benchmark() {
 
   snapshot_top_level_dirs > "${before_file}"
 
-  "${cmd[@]}"
+  run_with_startup_watchdog "[benchmark] loop_start" "${BENCHMARK_STARTUP_TIMEOUT_S}" -- "${cmd[@]}"
   rc=$?
 
   snapshot_top_level_dirs > "${after_file}"
 
   if [[ "${rc}" -ne 0 ]]; then
-    log_failure \
-      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    if [[ "${rc}" -eq 124 ]]; then
+      log_failure \
+        "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+    else
+      log_failure \
+        "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    fi
     rm -f "${before_file}" "${after_file}"
     return 1
   fi

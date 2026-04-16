@@ -1036,6 +1036,7 @@ def run_shared_benchmark(
         if not bool(config.no_display):
             cv2.namedWindow(str(config.benchmark_name), cv2.WINDOW_NORMAL)
 
+        print("[benchmark] loop_start", flush=True)
         while True:
             if stop_due_profile_duration():
                 break
