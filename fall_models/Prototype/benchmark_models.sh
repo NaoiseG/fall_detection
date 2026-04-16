@@ -19,6 +19,7 @@ PROJECT_DIR="/home/jetson/NaoiseG/fall_detection/fall_models/Prototype"
 BENCH_DIR="benchmarks"
 VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
+MODELS_ROOT="../../pose_models/quantised"
 
 POSE_MODELS=(
   "yolo11n-pose"
@@ -108,7 +109,7 @@ join_cmd() {
 pose_weight_for_version() {
   local pose_model="$1"
   local version="$2"
-  local base_dir="../../quantisation/models/ultralytics/${pose_model}"
+  local base_dir="${MODELS_ROOT}/ultralytics/${pose_model}"
 
   case "$version" in
     base) printf '%s/%s.pt' "${base_dir}" "${pose_model}" ;;
@@ -151,10 +152,10 @@ alphapose_detector_weights_for_version() {
 
   case "$version" in
     original)          printf '%s' "detector/yolo/data/yolov3-spp.weights" ;;
-    fp32_fp32)         printf '%s' "../../quantisation/models/alphapose/yolov3_spp_fp32.engine" ;;
-    fp16det_fp32pose)  printf '%s' "../../quantisation/models/alphapose/yolov3_spp_fp16.engine" ;;
-    fp16_fp16)         printf '%s' "../../quantisation/models/alphapose/yolov3_spp_fp16.engine" ;;
-    int8det_fp16pose)  printf '%s' "../../quantisation/models/alphapose/yolov3_spp_int8.engine" ;;
+    fp32_fp32)         printf '%s' "${MODELS_ROOT}/alphapose/yolov3_spp_fp32.engine" ;;
+    fp16det_fp32pose)  printf '%s' "${MODELS_ROOT}/alphapose/yolov3_spp_fp16.engine" ;;
+    fp16_fp16)         printf '%s' "${MODELS_ROOT}/alphapose/yolov3_spp_fp16.engine" ;;
+    int8det_fp16pose)  printf '%s' "${MODELS_ROOT}/alphapose/yolov3_spp_int8.engine" ;;
     *)
       return 1
       ;;
@@ -166,10 +167,10 @@ alphapose_checkpoint_for_version() {
 
   case "$version" in
     original)          printf '%s' "pretrained_models/fast_res50_256x192.pth" ;;
-    fp32_fp32)         printf '%s' "../../quantisation/models/alphapose/fastpose_fp32.engine" ;;
-    fp16det_fp32pose)  printf '%s' "../../quantisation/models/alphapose/fastpose_fp32.engine" ;;
-    fp16_fp16)         printf '%s' "../../quantisation/models/alphapose/fastpose_fp16.engine" ;;
-    int8det_fp16pose)  printf '%s' "../../quantisation/models/alphapose/fastpose_fp16.engine" ;;
+    fp32_fp32)         printf '%s' "${MODELS_ROOT}/alphapose/fastpose_fp32.engine" ;;
+    fp16det_fp32pose)  printf '%s' "${MODELS_ROOT}/alphapose/fastpose_fp32.engine" ;;
+    fp16_fp16)         printf '%s' "${MODELS_ROOT}/alphapose/fastpose_fp16.engine" ;;
+    int8det_fp16pose)  printf '%s' "${MODELS_ROOT}/alphapose/fastpose_fp16.engine" ;;
     *)
       return 1
       ;;
@@ -181,8 +182,8 @@ vitpose_detector_model_for_version() {
 
   case "$version" in
     base) printf '%s' "PekingU/rtdetr_r50vd_coco_o365" ;;
-    fp32) printf '%s' "../../quantisation/models/vitpose_trt/engines/detector_pekingu_rtdetr_r50vd_coco_o365_fp32.engine" ;;
-    fp16) printf '%s' "../../quantisation/models/vitpose_trt/engines/detector_pekingu_rtdetr_r50vd_coco_o365_fp16.engine" ;;
+    fp32) printf '%s' "${MODELS_ROOT}/vitpose_trt/engines/detector_pekingu_rtdetr_r50vd_coco_o365_fp32.engine" ;;
+    fp16) printf '%s' "${MODELS_ROOT}/vitpose_trt/engines/detector_pekingu_rtdetr_r50vd_coco_o365_fp16.engine" ;;
     *)
       return 1
       ;;
@@ -194,8 +195,8 @@ vitpose_pose_model_for_version() {
 
   case "$version" in
     base) printf '%s' "usyd-community/vitpose-base" ;;
-    fp32) printf '%s' "../../quantisation/models/vitpose_trt/engines/pose_usyd_community_vitpose_base_fp32.engine" ;;
-    fp16) printf '%s' "../../quantisation/models/vitpose_trt/engines/pose_usyd_community_vitpose_base_fp16.engine" ;;
+    fp32) printf '%s' "${MODELS_ROOT}/vitpose_trt/engines/pose_usyd_community_vitpose_base_fp32.engine" ;;
+    fp16) printf '%s' "${MODELS_ROOT}/vitpose_trt/engines/pose_usyd_community_vitpose_base_fp16.engine" ;;
     *)
       return 1
       ;;
