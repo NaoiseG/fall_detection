@@ -311,11 +311,19 @@ class HardwareSampler:
             self._tegrastats_proc = None
 
         if self._jtop_obj is not None:
+            jtop_obj = self._jtop_obj
+            self._jtop_obj = None
             try:
-                self._jtop_obj.close()
+                # jtop.close() can block indefinitely if the jtop service is
+                # unresponsive (e.g. after a previous long-running connection).
+                # Run it in a daemon thread so it cannot hang the process.
+                close_thread = threading.Thread(
+                    target=jtop_obj.close, daemon=True
+                )
+                close_thread.start()
+                close_thread.join(timeout=5.0)
             except Exception:
                 pass
-            self._jtop_obj = None
 
     def get_samples(self) -> List[Dict[str, Any]]:
         with self._lock:
