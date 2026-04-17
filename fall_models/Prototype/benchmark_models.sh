@@ -21,6 +21,7 @@ VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
 MODELS_ROOT="../../pose_models/quantised"
 BENCHMARK_STARTUP_TIMEOUT_S=300
+BENCHMARK_TOTAL_TIMEOUT_S=3600   # 1 hour max per run after startup marker
 
 POSE_MODELS=(
   "yolo11n-pose"
@@ -106,11 +107,35 @@ join_cmd() {
   printf '%s' "${out% }"
 }
 
+terminate_pid_with_grace() {
+  local pid="$1"
+  local grace_s="${2:-5}"
+
+  if [[ -z "${pid}" ]]; then
+    return 0
+  fi
+
+  kill "${pid}" 2>/dev/null || return 0
+
+  local deadline=$(( SECONDS + grace_s ))
+  while kill -0 "${pid}" 2>/dev/null; do
+    if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -9 "${pid}" 2>/dev/null || true
+  fi
+}
+
 run_with_startup_watchdog() {
   # Usage: run_with_startup_watchdog <marker> <timeout_s> -- <cmd> [args...]
   # Runs <cmd> in the background. If <marker> does not appear in stdout within
   # <timeout_s> seconds the process is killed and 124 is returned.
-  # Once the marker is seen the process runs to completion uninterrupted.
+  # Once the marker is seen the process is allowed up to BENCHMARK_TOTAL_TIMEOUT_S
+  # seconds to finish; if it exceeds that it is killed and 124 is returned.
   local marker="$1"
   local timeout_s="$2"
   shift 2
@@ -120,14 +145,17 @@ run_with_startup_watchdog() {
   local marker_file
   marker_file="$(mktemp)"
 
-  # Run command, scanning stdout for the marker, passing all output through.
+  # Run the command directly as the background PID so the watchdog can kill the
+  # Python process itself instead of only terminating a wrapper shell.
   (
-    "${@}" 2>&1 | while IFS= read -r line; do
-      printf '%s\n' "$line"
-      if [[ "$line" == *"${marker}"* ]]; then
-        touch "${marker_file}"
-      fi
-    done
+    exec "${@}" > >(
+      while IFS= read -r line; do
+        printf '%s\n' "$line"
+        if [[ "$line" == *"${marker}"* ]]; then
+          touch "${marker_file}"
+        fi
+      done
+    ) 2>&1
   ) &
   local cmd_pid=$!
 
@@ -151,11 +179,25 @@ run_with_startup_watchdog() {
   done
 
   if [[ "${marker_seen}" -eq 0 ]] && kill -0 "${cmd_pid}" 2>/dev/null; then
-    kill "${cmd_pid}" 2>/dev/null
+    terminate_pid_with_grace "${cmd_pid}" 5
     wait "${cmd_pid}" 2>/dev/null
     rm -f "${marker_file}"
     return 124
   fi
+
+  # Marker seen — wait for completion but enforce a total-run timeout.
+  local total_deadline=$(( SECONDS + ${BENCHMARK_TOTAL_TIMEOUT_S:-3600} ))
+  while kill -0 "${cmd_pid}" 2>/dev/null; do
+    if [[ "${SECONDS}" -ge "${total_deadline}" ]]; then
+      printf '[watchdog] total timeout (%ds) exceeded, killing run\n' \
+        "${BENCHMARK_TOTAL_TIMEOUT_S:-3600}" >&2
+      terminate_pid_with_grace "${cmd_pid}" 5
+      wait "${cmd_pid}" 2>/dev/null
+      rm -f "${marker_file}"
+      return 124
+    fi
+    sleep 5
+  done
 
   wait "${cmd_pid}"
   local rc=$?

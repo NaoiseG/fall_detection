@@ -932,8 +932,10 @@ def run_shared_benchmark(
     loop_count = 0
     fps_ema: Optional[float] = None
     ema_alpha = 0.1
-
     run_t0 = time.perf_counter()
+    heartbeat_interval_s = 30.0 if bool(config.benchmark_mode) else 0.0
+    last_heartbeat_t = run_t0
+
     user_exit = False
     cap_ended = False
     hw_rows: List[Dict[str, Any]] = []
@@ -1070,6 +1072,8 @@ def run_shared_benchmark(
                 h0, w0 = frame.shape[:2]
                 image_shape = (int(h0), int(w0))
 
+            if int(raw_frame_idx) == 0:
+                print("[benchmark] first_frame_start", flush=True)
             pose_out = pose_pipeline.process_frame(frame_bgr=frame, raw_frame_idx=int(raw_frame_idx), sync_cuda_timing=sync_cuda_timing)
             if pose_out.sampled:
                 sampled_xy.append(pose_out.keypoints_xy.copy())
@@ -1157,6 +1161,23 @@ def run_shared_benchmark(
             total_loop_ms = (time.perf_counter() - t_loop0) * 1000.0
             inst_fps = 1000.0 / max(1e-6, total_loop_ms)
             fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+
+            if int(raw_frame_idx) == 0:
+                print(
+                    f"[benchmark] first_frame_done pose_ms={float(pose_out.pose_infer_ms):.1f} "
+                    f"loop_ms={float(total_loop_ms):.1f}",
+                    flush=True,
+                )
+
+            now = time.perf_counter()
+            if heartbeat_interval_s > 0.0 and (now - last_heartbeat_t) >= heartbeat_interval_s:
+                fps_text = f"{float(fps_ema):.2f}" if fps_ema is not None else "nan"
+                print(
+                    f"[benchmark] heartbeat elapsed_s={float(now - run_t0):.1f} "
+                    f"frames={int(raw_frame_idx) + 1} windows={len(window_rows)} fps_ema={fps_text}",
+                    flush=True,
+                )
+                last_heartbeat_t = now
 
             frame_rows.append(
                 {
