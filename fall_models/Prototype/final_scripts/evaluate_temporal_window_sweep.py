@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List
 
 
 MODELS = ("cnnlstm", "stgcn")
-WINDOW_SIZES = (4, 8, 16, 32, 64)
+WINDOW_SIZES = (4, 8, 16, 32, 64, 128)
 OVERLAPS_PCT = (25, 50, 75)
 EVAL_VARIANTS = ("strict_label_mode", "two_label_transition_relaxed")
 
