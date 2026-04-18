@@ -19,6 +19,10 @@ MODELS = ("cnnlstm", "stgcn")
 WINDOW_SIZES = (4, 8, 16, 32, 64, 128)
 OVERLAPS_PCT = (25, 50, 75)
 EVAL_VARIANTS = ("strict_label_mode", "two_label_transition_relaxed")
+DEFAULT_LABEL_MODE = "center"
+WINDOW_LABEL_MODE_OVERRIDES = {
+    128: "majority",
+}
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,7 @@ class SweepSetup:
     window_size: int
     overlap_pct: int
     stride: int
+    label_mode: str
     name: str
 
 
@@ -57,6 +62,10 @@ def validate_yolo11l_npz_root(npz_root: str) -> None:
             )
 
 
+def label_mode_for_window_size(window_size: int) -> str:
+    return str(WINDOW_LABEL_MODE_OVERRIDES.get(int(window_size), DEFAULT_LABEL_MODE))
+
+
 def build_setups() -> List[SweepSetup]:
     setups: List[SweepSetup] = []
     for window_size in WINDOW_SIZES:
@@ -76,6 +85,7 @@ def build_setups() -> List[SweepSetup]:
                     window_size=window_size,
                     overlap_pct=overlap_pct,
                     stride=stride_rounded,
+                    label_mode=label_mode_for_window_size(window_size),
                     name=f"T{window_size:02d}_overlap{overlap_pct:02d}_stride{stride_rounded:02d}",
                 )
             )
@@ -125,19 +135,34 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def infer_epochs_from_train_command(train_command: Any) -> int | None:
-    if not isinstance(train_command, list):
+def infer_flag_value_from_command(command: Any, flag: str) -> str | None:
+    if not isinstance(command, list):
         return None
-    for idx, token in enumerate(train_command):
-        if str(token) != "--epochs":
+    for idx, token in enumerate(command):
+        if str(token) != str(flag):
             continue
-        if idx + 1 >= len(train_command):
+        if idx + 1 >= len(command):
             return None
-        try:
-            return int(train_command[idx + 1])
-        except (TypeError, ValueError):
+        value = command[idx + 1]
+        if value is None:
             return None
+        text = str(value).strip()
+        return text or None
     return None
+
+
+def infer_epochs_from_train_command(train_command: Any) -> int | None:
+    value = infer_flag_value_from_command(train_command, "--epochs")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def infer_label_mode_from_command(command: Any) -> str | None:
+    return infer_flag_value_from_command(command, "--label-mode")
 
 
 def normalize_setup_summary(summary: Dict[str, Any], fallback_epochs: int) -> Dict[str, Any]:
@@ -147,13 +172,23 @@ def normalize_setup_summary(summary: Dict[str, Any], fallback_epochs: int) -> Di
         normalized["epochs"] = int(inferred_epochs) if inferred_epochs is not None else int(fallback_epochs)
     else:
         normalized["epochs"] = int(normalized["epochs"])
+    label_mode = normalized.get("label_mode")
+    if label_mode is None:
+        label_mode = infer_label_mode_from_command(normalized.get("train_command"))
+    normalized["label_mode"] = str(label_mode or DEFAULT_LABEL_MODE)
     return normalized
 
 
-def is_complete_setup_summary(summary: Any, expected_setup_name: str | None = None) -> bool:
+def is_complete_setup_summary(
+    summary: Any,
+    expected_setup_name: str | None = None,
+    expected_label_mode: str | None = None,
+) -> bool:
     if not isinstance(summary, dict):
         return False
     if expected_setup_name is not None and str(summary.get("setup_name")) != expected_setup_name:
+        return False
+    if expected_label_mode is not None and str(summary.get("label_mode") or DEFAULT_LABEL_MODE) != str(expected_label_mode):
         return False
 
     training_results = summary.get("training_results")
@@ -186,7 +221,11 @@ def is_complete_setup_summary(summary: Any, expected_setup_name: str | None = No
     return True
 
 
-def load_completed_setup_summaries(combined_results_path: Path, fallback_epochs: int) -> Dict[str, Dict[str, Any]]:
+def load_completed_setup_summaries(
+    combined_results_path: Path,
+    fallback_epochs: int,
+    expected_setups_by_name: Dict[str, SweepSetup],
+) -> Dict[str, Dict[str, Any]]:
     if not combined_results_path.exists():
         return {}
 
@@ -210,7 +249,15 @@ def load_completed_setup_summaries(combined_results_path: Path, fallback_epochs:
             continue
 
         summary = normalize_setup_summary(raw_summary, fallback_epochs=int(payload_epochs))
-        if not is_complete_setup_summary(summary, expected_setup_name=setup_name):
+        expected_setup = expected_setups_by_name.get(setup_name)
+        if expected_setup is None:
+            print(f"[resume] Ignoring unknown setup entry in combined results: {setup_name}")
+            continue
+        if not is_complete_setup_summary(
+            summary,
+            expected_setup_name=setup_name,
+            expected_label_mode=expected_setup.label_mode,
+        ):
             print(f"[resume] Ignoring incomplete setup entry in combined results: {setup_name}")
             continue
         completed[setup_name] = summary
@@ -286,6 +333,7 @@ def flatten_summary_rows(setup_summaries: List[Dict[str, Any]]) -> List[Dict[str
                     "window_size": setup_summary["window_size"],
                     "overlap_pct": setup_summary["overlap_pct"],
                     "stride": setup_summary["stride"],
+                    "label_mode": setup_summary["label_mode"],
                     "variant": variant,
                 }
                 merged.update(row)
@@ -332,7 +380,11 @@ def build_combined_payload(
             "val_subjects": "13-15",
             "test_subjects": "16-17",
             "camera": [1, 2],
-            "label_mode": "center",
+            "label_mode_default": DEFAULT_LABEL_MODE,
+            "label_mode_overrides": {
+                str(window_size): str(label_mode)
+                for window_size, label_mode in sorted(WINDOW_LABEL_MODE_OVERRIDES.items())
+            },
             "drop_ambig_share": 0,
             "normalize": 1,
             "normalize_mode": "paper_rp",
@@ -381,7 +433,7 @@ def build_train_command(
         "1",
         "2",
         "--label-mode",
-        "center",
+        setup.label_mode,
         "--drop-ambig-share",
         "0",
         "--T",
@@ -445,7 +497,7 @@ def build_eval_command(
         "1",
         "2",
         "--label-mode",
-        "center",
+        setup.label_mode,
         "--drop-ambig-share",
         "0",
         "--T",
@@ -535,14 +587,23 @@ def run_setup(
     npz_root: str,
     epochs: int,
     setup: SweepSetup,
+    force_restart: bool = False,
 ) -> Dict[str, Any]:
     setup_dir = out_root / setup.name
     summary_path = setup_dir / "setup_summary.json"
 
+    if force_restart and setup_dir.exists():
+        print(f"[overwrite] Removing existing setup directory before rerun: {setup_dir}")
+        remove_setup_dir(setup_dir, out_root)
+
     if summary_path.exists():
         print(f"[resume] Reusing existing setup summary: {summary_path}")
         summary = normalize_setup_summary(load_json(summary_path), fallback_epochs=int(epochs))
-        if not is_complete_setup_summary(summary, expected_setup_name=setup.name):
+        if not is_complete_setup_summary(
+            summary,
+            expected_setup_name=setup.name,
+            expected_label_mode=setup.label_mode,
+        ):
             print(f"[resume] Existing setup summary is incomplete; restarting: {summary_path}")
             remove_setup_dir(setup_dir, out_root)
         else:
@@ -592,6 +653,7 @@ def run_setup(
         "overlap_pct": int(setup.overlap_pct),
         "overlap_fraction": float(setup.overlap_pct) / 100.0,
         "stride": int(setup.stride),
+        "label_mode": str(setup.label_mode),
         "train_run_id": run_id,
         "training_results_csv": str(train_results_csv.resolve()),
         "evaluation_dir": str(final_eval_dir.resolve()),
@@ -605,12 +667,42 @@ def run_setup(
     return setup_summary
 
 
+def parse_window_sizes_arg(raw_window_sizes: List[int] | None) -> set[int] | None:
+    if raw_window_sizes is None:
+        return None
+
+    selected = {int(window_size) for window_size in raw_window_sizes}
+    invalid = sorted(selected - set(WINDOW_SIZES))
+    if invalid:
+        raise SystemExit(
+            f"Unsupported --window-sizes value(s): {invalid}. Supported values: {list(WINDOW_SIZES)}"
+        )
+    return selected
+
+
+def filter_setups_by_window_size(
+    setups: List[SweepSetup],
+    selected_window_sizes: set[int] | None,
+) -> List[SweepSetup]:
+    if selected_window_sizes is None:
+        return list(setups)
+    return [setup for setup in setups if int(setup.window_size) in selected_window_sizes]
+
+
+def ordered_setup_summaries(
+    ordered_setups: List[SweepSetup],
+    summaries_by_name: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [summaries_by_name[setup.name] for setup in ordered_setups if setup.name in summaries_by_name]
+
+
 def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
         description=(
             "Train and evaluate cnnlstm and stgcn over temporal window sizes "
-            "T={4,8,16,32,64} and overlaps {25,50,75}% for yolo11l keypoints."
+            "T={4,8,16,32,64,128} and overlaps {25,50,75}% for yolo11l keypoints. "
+            "T=128 uses majority window labels; smaller windows use center labels."
         )
     )
     parser.add_argument(
@@ -631,6 +723,24 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Epochs per model for each setup (default: 100).",
     )
+    parser.add_argument(
+        "--window-sizes",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Optional subset of window sizes to run, e.g. --window-sizes 128 or "
+            "--window-sizes 32 64 128."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-selected",
+        action="store_true",
+        help=(
+            "Delete and rerun the selected setups even if completed results already exist. "
+            "Use with --window-sizes 128 to refresh only the T=128 runs."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -639,19 +749,37 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     npz_root = expand_user_path(str(args.npz_root))
     validate_yolo11l_npz_root(npz_root)
+    all_setups = build_setups()
+    setup_by_name = {setup.name: setup for setup in all_setups}
+    selected_window_sizes = parse_window_sizes_arg(args.window_sizes)
+    selected_setups = filter_setups_by_window_size(all_setups, selected_window_sizes)
+
+    if not selected_setups:
+        raise SystemExit("No setups matched the requested --window-sizes filter.")
 
     out_root = Path(expand_user_path(str(args.out))).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
     combined_results_path = out_root / "combined_results.json"
-    completed_by_name = load_completed_setup_summaries(combined_results_path, fallback_epochs=int(args.epochs))
-    setup_summaries: List[Dict[str, Any]] = []
+    completed_by_name = load_completed_setup_summaries(
+        combined_results_path,
+        fallback_epochs=int(args.epochs),
+        expected_setups_by_name=setup_by_name,
+    )
+    setup_summaries_by_name: Dict[str, Dict[str, Any]] = dict(completed_by_name)
 
-    for setup in build_setups():
+    if args.overwrite_selected:
+        for setup in selected_setups:
+            if setup.name in setup_summaries_by_name:
+                print(f"[overwrite] Dropping cached combined-results entry: {setup.name}")
+                setup_summaries_by_name.pop(setup.name, None)
+
+    for setup in selected_setups:
         print(
-            f"\n[setup] {setup.name} | T={setup.window_size} | overlap={setup.overlap_pct}% | stride={setup.stride}"
+            f"\n[setup] {setup.name} | T={setup.window_size} | overlap={setup.overlap_pct}% "
+            f"| stride={setup.stride} | label_mode={setup.label_mode}"
         )
-        if setup.name in completed_by_name:
+        if setup.name in completed_by_name and not args.overwrite_selected:
             print(f"[resume] Reusing completed setup from combined results: {setup.name}")
             summary = completed_by_name[setup.name]
         else:
@@ -661,15 +789,17 @@ def main() -> None:
                 npz_root=npz_root,
                 epochs=int(args.epochs),
                 setup=setup,
+                force_restart=bool(args.overwrite_selected),
             )
-        setup_summaries.append(summary)
+        setup_summaries_by_name[setup.name] = summary
+        ordered_summaries = ordered_setup_summaries(all_setups, setup_summaries_by_name)
 
         combined_payload = build_combined_payload(
             repo_root=repo_root,
             out_root=out_root,
             npz_root=npz_root,
             epochs=int(args.epochs),
-            setup_summaries=setup_summaries,
+            setup_summaries=ordered_summaries,
         )
         write_json(combined_results_path, combined_payload)
         print(f"[write] Updated combined results: {combined_results_path}")
