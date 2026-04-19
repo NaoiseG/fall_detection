@@ -20,9 +20,7 @@ WINDOW_SIZES = (4, 8, 16, 32, 64, 128)
 OVERLAPS_PCT = (25, 50, 75)
 EVAL_VARIANTS = ("strict_label_mode", "two_label_transition_relaxed")
 DEFAULT_LABEL_MODE = "center"
-WINDOW_LABEL_MODE_OVERRIDES = {
-    128: "majority",
-}
+LABEL_MODE_CHOICES = ("center", "majority")
 
 
 @dataclass(frozen=True)
@@ -62,11 +60,7 @@ def validate_yolo11l_npz_root(npz_root: str) -> None:
             )
 
 
-def label_mode_for_window_size(window_size: int) -> str:
-    return str(WINDOW_LABEL_MODE_OVERRIDES.get(int(window_size), DEFAULT_LABEL_MODE))
-
-
-def build_setups() -> List[SweepSetup]:
+def build_setups(label_mode: str) -> List[SweepSetup]:
     setups: List[SweepSetup] = []
     for window_size in WINDOW_SIZES:
         for overlap_pct in OVERLAPS_PCT:
@@ -85,7 +79,7 @@ def build_setups() -> List[SweepSetup]:
                     window_size=window_size,
                     overlap_pct=overlap_pct,
                     stride=stride_rounded,
-                    label_mode=label_mode_for_window_size(window_size),
+                    label_mode=str(label_mode),
                     name=f"T{window_size:02d}_overlap{overlap_pct:02d}_stride{stride_rounded:02d}",
                 )
             )
@@ -361,6 +355,7 @@ def build_combined_payload(
     out_root: Path,
     npz_root: str,
     epochs: int,
+    label_mode: str,
     setup_summaries: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     flat_rows = flatten_summary_rows(setup_summaries)
@@ -380,11 +375,9 @@ def build_combined_payload(
             "val_subjects": "13-15",
             "test_subjects": "16-17",
             "camera": [1, 2],
-            "label_mode_default": DEFAULT_LABEL_MODE,
-            "label_mode_overrides": {
-                str(window_size): str(label_mode)
-                for window_size, label_mode in sorted(WINDOW_LABEL_MODE_OVERRIDES.items())
-            },
+            "label_mode": str(label_mode),
+            "label_mode_default": str(label_mode),
+            "label_mode_overrides": {},
             "drop_ambig_share": 0,
             "normalize": 1,
             "normalize_mode": "paper_rp",
@@ -702,7 +695,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Train and evaluate cnnlstm and stgcn over temporal window sizes "
             "T={4,8,16,32,64,128} and overlaps {25,50,75}% for yolo11l keypoints. "
-            "T=128 uses majority window labels; smaller windows use center labels."
+            "The selected --label-mode is applied uniformly to every window size."
         )
     )
     parser.add_argument(
@@ -722,6 +715,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Epochs per model for each setup (default: 100).",
+    )
+    parser.add_argument(
+        "--label-mode",
+        type=str,
+        default=DEFAULT_LABEL_MODE,
+        choices=list(LABEL_MODE_CHOICES),
+        help=(
+            "Window labeling strategy to use for every setup. "
+            "Use --label-mode majority to apply majority labels across all window sizes."
+        ),
     )
     parser.add_argument(
         "--window-sizes",
@@ -749,7 +752,7 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     npz_root = expand_user_path(str(args.npz_root))
     validate_yolo11l_npz_root(npz_root)
-    all_setups = build_setups()
+    all_setups = build_setups(label_mode=str(args.label_mode))
     setup_by_name = {setup.name: setup for setup in all_setups}
     selected_window_sizes = parse_window_sizes_arg(args.window_sizes)
     selected_setups = filter_setups_by_window_size(all_setups, selected_window_sizes)
@@ -799,6 +802,7 @@ def main() -> None:
             out_root=out_root,
             npz_root=npz_root,
             epochs=int(args.epochs),
+            label_mode=str(args.label_mode),
             setup_summaries=ordered_summaries,
         )
         write_json(combined_results_path, combined_payload)
