@@ -424,9 +424,11 @@ def _temporary_torch_from_numpy_fallback(enabled: bool):
             return original_from_numpy(arr)
         except TypeError as exc:
             if isinstance(arr, np.ndarray) and "expected np.ndarray" in str(exc):
-                # TensorRT binding setup in some Jetson stacks trips over
-                # torch.from_numpy(np.empty(...)). Falling back to a pure-Python
-                # conversion keeps engine initialization working.
+                # Some Jetson PyTorch builds intermittently reject perfectly
+                # valid NumPy arrays inside Ultralytics preprocess/TensorRT
+                # setup with "expected np.ndarray (got numpy.ndarray)".
+                # Falling back to a pure-Python conversion keeps YOLO predict
+                # working for both .pt and .engine weights.
                 return _tensor_from_numpy_without_bridge(arr)
             raise
 
@@ -1122,7 +1124,7 @@ def run_pose_on_frames(
             predict_kwargs["imgsz"] = list(predict_imgsz_info["applied_hw"])
         if yolo_is_engine:
             predict_kwargs["half"] = use_half_yolo
-        with _temporary_torch_from_numpy_fallback(enabled=bool(yolo_is_engine)):
+        with _temporary_torch_from_numpy_fallback(enabled=True):
             results = model.predict(**predict_kwargs)
         r = results[0]
         selected_xy: Optional[np.ndarray] = None

@@ -9,42 +9,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-
-# =============================================================================
-# Label scheme: merge fall subclasses into a single "Fall" class (7 classes total)
-#
-# This repo supports two raw label conventions in the underlying NPZs:
-#   Case A: 1–11  (falls are 1..5, ADLs are 6..11)
-#   Case B: 0–10  (falls are 0..4, ADLs are 5..10)
-#
-# We remap to a unified 0-index scheme:
-#   new_id 0: Fall  (merged)
-#   new_id 1..6: remaining 6 ADL classes, kept distinct
-#
-# Why remap *before* majority vote?
-#   If the raw fall frames are split across multiple fall subclasses, computing
-#   a majority vote on raw IDs can incorrectly prefer an ADL label even when
-#   falls dominate in aggregate. We therefore compute window labels on the
-#   merged label space.
-# =============================================================================
-
-# Raw fall IDs (in NPZ frame_labels space) for each convention
-FALL_MERGE_SET_1_11 = {1, 2, 3, 4, 5}
+FALL_MERGE_SET_1_11 = {1, 2, 3, 4, 5} #=======================
 FALL_MERGE_SET_0_10 = {0, 1, 2, 3, 4}
 
-# New label names (index = new class id)
-# NOTE: These names reflect the UP-Fall merged 7-class mapping used by MotionBERT:
-#   0: Fall
-#   1: Walking
-#   2: Standing
-#   3: Sitting
-#   4: Picking up an object
-#   5: Jumping
-#   6: Laying
-#
-# The raw conventions (1-11 vs 0-10) only affect how frame labels are remapped; the
-# merged 0..6 names are the same for both.
-NEW_LABEL_NAMES_1_11 = ["Fall", "Walking", "Standing", "Sitting", "Picking up an object", "Jumping", "Laying"]
+NEW_LABEL_NAMES_1_11 = ["Fall", "Walking", "Standing", "Sitting", "Picking up an object", "Jumping", "Laying"] #================================
 NEW_LABEL_NAMES_0_10 = ["Fall", "Walking", "Standing", "Sitting", "Picking up an object", "Jumping", "Laying"]
 
 # Filled at runtime after convention detection (for easy introspection/debugging)

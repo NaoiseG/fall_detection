@@ -132,6 +132,8 @@ terminate_pid_with_grace() {
   fi
 }
 
+WATCHDOG_TIMEOUT_KIND=""
+
 run_with_startup_watchdog() {
   # Usage: run_with_startup_watchdog <marker> <timeout_s> -- <cmd> [args...]
   # Runs <cmd> in the background. If <marker> does not appear in stdout within
@@ -140,6 +142,7 @@ run_with_startup_watchdog() {
   # seconds to finish; if it exceeds that it is killed and 124 is returned.
   local marker="$1"
   local timeout_s="$2"
+  WATCHDOG_TIMEOUT_KIND=""
   shift 2
   # consume the '--' separator
   if [[ "${1:-}" == "--" ]]; then shift; fi
@@ -184,6 +187,7 @@ run_with_startup_watchdog() {
     terminate_pid_with_grace "${cmd_pid}" 5
     wait "${cmd_pid}" 2>/dev/null
     rm -f "${marker_file}"
+    WATCHDOG_TIMEOUT_KIND="startup_marker_timeout"
     return 124
   fi
 
@@ -196,6 +200,7 @@ run_with_startup_watchdog() {
       terminate_pid_with_grace "${cmd_pid}" 5
       wait "${cmd_pid}" 2>/dev/null
       rm -f "${marker_file}"
+      WATCHDOG_TIMEOUT_KIND="total_runtime_timeout"
       return 124
     fi
     sleep 5
@@ -624,8 +629,20 @@ run_one_benchmark() {
 
   if [[ "${rc}" -ne 0 ]]; then
     if [[ "${rc}" -eq 124 ]]; then
-      log_failure \
-        "pose_model=${pose_model} version=${version} classifier=${classifier} status=startup_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+      case "${WATCHDOG_TIMEOUT_KIND:-}" in
+        startup_marker_timeout)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+          ;;
+        total_runtime_timeout)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} cmd=\"${cmd_str}\""
+          ;;
+        *)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+          ;;
+      esac
     else
       log_failure \
         "pose_model=${pose_model} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
@@ -749,8 +766,20 @@ run_one_alphapose_benchmark() {
 
   if [[ "${rc}" -ne 0 ]]; then
     if [[ "${rc}" -eq 124 ]]; then
-      log_failure \
-        "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+      case "${WATCHDOG_TIMEOUT_KIND:-}" in
+        startup_marker_timeout)
+          log_failure \
+            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+          ;;
+        total_runtime_timeout)
+          log_failure \
+            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} cmd=\"${cmd_str}\""
+          ;;
+        *)
+          log_failure \
+            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+          ;;
+      esac
     else
       log_failure \
         "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
@@ -866,8 +895,20 @@ run_one_vitpose_benchmark() {
 
   if [[ "${rc}" -ne 0 ]]; then
     if [[ "${rc}" -eq 124 ]]; then
-      log_failure \
-        "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+      case "${WATCHDOG_TIMEOUT_KIND:-}" in
+        startup_marker_timeout)
+          log_failure \
+            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+          ;;
+        total_runtime_timeout)
+          log_failure \
+            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} cmd=\"${cmd_str}\""
+          ;;
+        *)
+          log_failure \
+            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+          ;;
+      esac
     else
       log_failure \
         "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""

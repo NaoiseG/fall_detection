@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from contextlib import contextmanager
@@ -306,6 +307,12 @@ def _temporary_torch_from_numpy_fallback(enabled: bool):
             return original_from_numpy(arr)
         except TypeError as exc:
             if isinstance(arr, np.ndarray) and "expected np.ndarray" in str(exc):
+                if os.environ.get("POSE_DEBUG_NUMPY_FALLBACK", "0") == "1":
+                    print(
+                        "[pose_debug] torch.from_numpy fallback "
+                        f"shape={tuple(arr.shape)} dtype={arr.dtype}",
+                        flush=True,
+                    )
                 # TensorRT binding setup in some Jetson stacks trips over
                 # torch.from_numpy(np.empty(...)). Falling back to a pure-Python
                 # conversion keeps engine initialization working.
