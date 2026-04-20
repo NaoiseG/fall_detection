@@ -20,6 +20,8 @@ FULL_PRUNED_MODEL_ROOT="/home/jetson/NaoiseG/fall_detection/pruning/pruned_model
 VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 CLASSIFIER="cnnlstm"
 CNNLSTM_WEIGHT="../../web_app/models/classification/cnnlstm/yolo11l-pose/cnnlstm_best.pt"
+TEMPORAL_WINDOW_SIZE=64
+TEMPORAL_WINDOW_STRIDE=48
 
 FULL_PRUNED_MODELS=(
   "yolo11l_pruned_80"
@@ -248,6 +250,8 @@ build_command() {
     --arch "${CLASSIFIER}" \
     --device cuda \
     --half "${half_flag}" \
+    --T "${TEMPORAL_WINDOW_SIZE}" \
+    --stride "${TEMPORAL_WINDOW_STRIDE}" \
     --max-people 10 \
     --max-det 10 \
     --warmup-frames 5 \

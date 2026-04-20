@@ -23,6 +23,8 @@ FULL_PRUNED_MODEL_ROOT="/home/jetson/NaoiseG/fall_detection/pruning/pruned_model
 FULL_PRUNED_BASE_CHECKPOINT="best_export_ready.pt"
 VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
+TEMPORAL_WINDOW_SIZE=64
+TEMPORAL_WINDOW_STRIDE=48
 
 POSE_MODELS=(
   "yolo11n"
@@ -352,6 +354,8 @@ build_command() {
       --yolo-weights "${pose_weight}" \
       --device cuda \
       --half "${half_flag}" \
+      --win-len "${TEMPORAL_WINDOW_SIZE}" \
+      --win-step "${TEMPORAL_WINDOW_STRIDE}" \
       --max-people 10 \
       --max-det 10 \
       --warmup-frames 5 \
@@ -370,6 +374,8 @@ build_command() {
       --arch "${classifier}" \
       --device cuda \
       --half "${half_flag}" \
+      --T "${TEMPORAL_WINDOW_SIZE}" \
+      --stride "${TEMPORAL_WINDOW_STRIDE}" \
       --max-people 10 \
       --max-det 10 \
       --warmup-frames 5 \

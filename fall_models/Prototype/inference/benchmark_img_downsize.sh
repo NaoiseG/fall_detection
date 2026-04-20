@@ -24,6 +24,8 @@ PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 BENCH_DIR="benchmarks/img_downsize"
 VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
+TEMPORAL_WINDOW_SIZE=64
+TEMPORAL_WINDOW_STRIDE=48
 
 COMBINATIONS=(
   "yolo11m-pose:576"
@@ -177,6 +179,8 @@ build_command() {
     --arch "${classifier}" \
     --device cuda \
     --half 0 \
+    --T "${TEMPORAL_WINDOW_SIZE}" \
+    --stride "${TEMPORAL_WINDOW_STRIDE}" \
     --max-people 10 \
     --max-det 10 \
     --warmup-frames 5 \

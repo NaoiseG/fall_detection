@@ -32,6 +32,8 @@ BENCH_DIR="${BENCH_DIR:-benchmarks/img_downsize/final_pipelines}"
 VIDEO_PATH="${VIDEO_PATH:-../../Datasets/test_vids/activity_all.mp4}"
 MODEL_ROOT="${MODEL_ROOT:-../../quantisation/models/img_downsize}"
 CLASSIFICATION_ROOT="${CLASSIFICATION_ROOT:-../../web_app/models/classification}"
+TEMPORAL_WINDOW_SIZE="${TEMPORAL_WINDOW_SIZE:-64}"
+TEMPORAL_WINDOW_STRIDE="${TEMPORAL_WINDOW_STRIDE:-48}"
 
 RUN_SPECS=(
   "mfp16|yolo11m-pose|fp16|576|stgcn|yolo11m-pose|yolo11m-pose_imgsz576_fp16.engine"
@@ -247,6 +249,8 @@ build_command() {
     --arch "${classifier}" \
     --device cuda \
     --half "${half_flag}" \
+    --T "${TEMPORAL_WINDOW_SIZE}" \
+    --stride "${TEMPORAL_WINDOW_STRIDE}" \
     --max-people 10 \
     --max-det 10 \
     --warmup-frames 5 \

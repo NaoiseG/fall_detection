@@ -22,6 +22,8 @@ MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action
 MODELS_ROOT="../../pose_models/quantised"
 BENCHMARK_STARTUP_TIMEOUT_S=300
 BENCHMARK_TOTAL_TIMEOUT_S=3600   # 1 hour max per run after startup marker
+TEMPORAL_WINDOW_SIZE=64
+TEMPORAL_WINDOW_STRIDE=48
 
 POSE_MODELS=(
   "yolo11n-pose"
@@ -427,6 +429,8 @@ build_command() {
       --yolo-weights "${pose_weight}" \
       --device cuda \
       --half "${half_flag}" \
+      --win-len "${TEMPORAL_WINDOW_SIZE}" \
+      --win-step "${TEMPORAL_WINDOW_STRIDE}" \
       --max-people 10 \
       --max-det 10 \
       --warmup-frames 5 \
@@ -445,6 +449,8 @@ build_command() {
       --arch "${classifier}" \
       --device cuda \
       --half "${half_flag}" \
+      --T "${TEMPORAL_WINDOW_SIZE}" \
+      --stride "${TEMPORAL_WINDOW_STRIDE}" \
       --max-people 10 \
       --max-det 10 \
       --warmup-frames 5 \
@@ -473,6 +479,8 @@ build_alphapose_command() {
       --alphapose-checkpoint "${alphapose_checkpoint}" \
       --alphapose-detector-weights "${alphapose_detector_weights}" \
       --device cuda \
+      --win-len "${TEMPORAL_WINDOW_SIZE}" \
+      --win-step "${TEMPORAL_WINDOW_STRIDE}" \
       --max-det 10 \
       --warmup-frames 5 \
       --warmup-windows 0 \
@@ -493,6 +501,8 @@ build_alphapose_command() {
       --alphapose-checkpoint "${alphapose_checkpoint}" \
       --alphapose-detector-weights "${alphapose_detector_weights}" \
       --device cuda \
+      --T "${TEMPORAL_WINDOW_SIZE}" \
+      --stride "${TEMPORAL_WINDOW_STRIDE}" \
       --max-det 10 \
       --warmup-frames 5 \
       --warmup-windows 0 \
@@ -517,6 +527,8 @@ build_vitpose_command() {
       --vitpose-detector-model "${vitpose_detector_model}" \
       --vitpose-pose-model "${vitpose_pose_model}" \
       --device cuda \
+      --win-len "${TEMPORAL_WINDOW_SIZE}" \
+      --win-step "${TEMPORAL_WINDOW_STRIDE}" \
       --max-det 10 \
       --warmup-frames 5 \
       --warmup-windows 0 \
@@ -534,6 +546,8 @@ build_vitpose_command() {
       --vitpose-detector-model "${vitpose_detector_model}" \
       --vitpose-pose-model "${vitpose_pose_model}" \
       --device cuda \
+      --T "${TEMPORAL_WINDOW_SIZE}" \
+      --stride "${TEMPORAL_WINDOW_STRIDE}" \
       --max-det 10 \
       --warmup-frames 5 \
       --warmup-windows 0 \
