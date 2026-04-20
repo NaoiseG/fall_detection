@@ -2,10 +2,13 @@ const classificationSelect = document.getElementById("classification-model");
 const keypointSelect = document.getElementById("keypoint-model");
 const keypointPrecisionSelect = document.getElementById("keypoint-precision");
 const videoSelect = document.getElementById("video-select");
+const cameraSelectLabel = document.getElementById("camera-select-label");
+const cameraSelect = document.getElementById("camera-select");
 const windowSizeInput = document.getElementById("window-size");
 const strideOverlapInput = document.getElementById("stride-overlap");
 const samplingKInput = document.getElementById("sampling-k");
 const runButton = document.getElementById("run-inference");
+const stopButton = document.getElementById("stop-inference");
 const responseBox = document.getElementById("response");
 const statusLabel = document.getElementById("run-status");
 const liveStatus = document.getElementById("live-status");
@@ -16,6 +19,9 @@ let queueProcessing = false;
 let activeEventSource = null;
 let streamTerminated = false;
 let activeStatusUrl = "";
+let activeJobId = "";
+let activeStopUrl = "";
+let isLiveMode = false;
 
 function setOutputState(ok) {
   if (!responseBox || !statusLabel) {
@@ -42,12 +48,23 @@ function setLiveStatus(text) {
   }
 }
 
+function isLiveSelected() {
+  return videoSelect && videoSelect.value === "live";
+}
+
 function setRunReady() {
   if (!runButton || !videoSelect) {
     return;
   }
-  runButton.disabled = !videoSelect.value;
+  if (isLiveSelected()) {
+    runButton.disabled = !cameraSelect || !cameraSelect.value;
+  } else {
+    runButton.disabled = !videoSelect.value;
+  }
   runButton.textContent = "Run";
+  if (stopButton) {
+    stopButton.style.display = "none";
+  }
 }
 
 function syncPrecisionControl() {
@@ -73,18 +90,25 @@ function closeActiveStream() {
   }
   streamTerminated = false;
   activeStatusUrl = "";
+  activeJobId = "";
+  activeStopUrl = "";
+  isLiveMode = false;
 }
 
 function renderStartInfo(data) {
   if (!responseBox) {
     return;
   }
-  responseBox.textContent = [
+  const lines = [
     "Inference stream started.",
     `job_id: ${data.job_id || "N/A"}`,
     `stream_url: ${data.stream_url || "N/A"}`,
     `status_url: ${data.status_url || "N/A"}`,
-  ].join("\n");
+  ];
+  if (data.stop_url) {
+    lines.push(`stop_url: ${data.stop_url}`);
+  }
+  responseBox.textContent = lines.join("\n");
 }
 
 function renderError(message) {
@@ -261,7 +285,7 @@ async function drawPacket(packet) {
   const frameNumber = Number(packet.frame_number) || 0;
   const frameCount = Number(packet.frame_count) || 0;
   const fps = Number(packet.fps);
-  const fpsText = Number.isFinite(fps) ? fps.toFixed(1) : "NA";
+  const fpsText = Number.isFinite(fps) && fps > 0 ? fps.toFixed(1) : "NA";
   if (frameCount > 0) {
     setLiveStatus(`Running... frame ${frameNumber}/${frameCount} | fps ${fpsText}`);
   } else {
@@ -376,6 +400,61 @@ function attachStreamHandlers(streamUrl, statusUrl) {
   };
 }
 
+async function stopLiveInference() {
+  if (!activeStopUrl) {
+    return;
+  }
+  try {
+    await fetch(activeStopUrl, { method: "POST" });
+  } catch (_err) {
+    // best-effort stop
+  }
+}
+
+async function loadCameras() {
+  if (!cameraSelect) {
+    return;
+  }
+  cameraSelect.innerHTML = '<option value="">Loading cameras...</option>';
+  if (runButton) {
+    runButton.disabled = true;
+  }
+  try {
+    const response = await fetch("/api/list_cameras");
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || "Failed to load cameras.");
+    }
+    const cameras = Array.isArray(data.cameras) ? data.cameras : [];
+    if (cameras.length === 0) {
+      cameraSelect.innerHTML = '<option value="">No cameras found</option>';
+      renderError("No cameras found. Plug in a camera and refresh.");
+      return;
+    }
+    cameraSelect.innerHTML = "";
+    for (const cam of cameras) {
+      const option = document.createElement("option");
+      option.value = String(cam.index);
+      option.textContent = `${cam.label} (${cam.width}x${cam.height})`;
+      cameraSelect.appendChild(option);
+    }
+    setRunReady();
+  } catch (error) {
+    cameraSelect.innerHTML = '<option value="">Error loading cameras</option>';
+    renderError(`Failed to load cameras: ${error.message}`);
+  }
+}
+
+function showCameraSelector() {
+  if (cameraSelectLabel) cameraSelectLabel.style.display = "";
+  if (cameraSelect) cameraSelect.style.display = "";
+}
+
+function hideCameraSelector() {
+  if (cameraSelectLabel) cameraSelectLabel.style.display = "none";
+  if (cameraSelect) cameraSelect.style.display = "none";
+}
+
 async function loadTestVideos() {
   if (!videoSelect || !runButton) {
     return;
@@ -409,6 +488,12 @@ async function loadTestVideos() {
       option.textContent = videoName;
       videoSelect.appendChild(option);
     }
+    // Live mode sentinel at the bottom of the list.
+    const liveOption = document.createElement("option");
+    liveOption.value = "live";
+    liveOption.textContent = "--- Live (webcam) ---";
+    videoSelect.appendChild(liveOption);
+
     setRunReady();
   } catch (error) {
     if (statusLabel) {
@@ -447,6 +532,7 @@ async function runInference() {
     return;
   }
 
+  const live = isLiveSelected();
   const payload = {
     classification_model: classificationSelect.value,
     keypoint_model: keypointSelect.value,
@@ -457,6 +543,9 @@ async function runInference() {
     overlap_percent: knobs.overlapPercent,
     k: knobs.k,
   };
+  if (live && cameraSelect) {
+    payload.camera_index = parseInt(cameraSelect.value, 10) || 0;
+  }
 
   runButton.disabled = true;
   runButton.textContent = "Running...";
@@ -483,6 +572,12 @@ async function runInference() {
     }
 
     renderStartInfo(data);
+    activeJobId = data.job_id || "";
+    activeStopUrl = data.stop_url || "";
+    isLiveMode = live;
+    if (live && stopButton) {
+      stopButton.style.display = "";
+    }
     attachStreamHandlers(data.stream_url, data.status_url);
   } catch (error) {
     renderError(error.message || "Request failed.");
@@ -499,9 +594,44 @@ if (runButton) {
 
 if (videoSelect) {
   videoSelect.addEventListener("change", () => {
+    if (activeEventSource) {
+      return;
+    }
+    if (isLiveSelected()) {
+      showCameraSelector();
+      void loadCameras();
+    } else {
+      hideCameraSelector();
+      setRunReady();
+    }
+  });
+}
+
+if (cameraSelect) {
+  cameraSelect.addEventListener("change", () => {
     if (!activeEventSource) {
       setRunReady();
     }
+  });
+}
+
+if (stopButton) {
+  stopButton.addEventListener("click", () => {
+    stopButton.disabled = true;
+    stopButton.textContent = "Stopping...";
+    void stopLiveInference();
+    // The SSE stream will emit "done" after the job stops; the normal
+    // done/error handlers will reset the UI.  If the stream has already
+    // closed we fall back to a manual reset after a short delay.
+    setTimeout(() => {
+      if (!activeEventSource) {
+        closeActiveStream();
+        setRunReady();
+      }
+      if (stopButton) {
+        stopButton.disabled = false;
+      }
+    }, 3000);
   });
 }
 

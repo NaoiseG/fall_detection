@@ -26,11 +26,15 @@ class InferenceStreamJob:
     packet_queue: "queue.Queue[str]" = field(default_factory=lambda: queue.Queue(maxsize=4))
     last_packet: Optional[str] = None
     done_event: threading.Event = field(default_factory=threading.Event)
+    stop_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def snapshot(self) -> Dict[str, Optional[str]]:
         with self.lock:
             return {"status": self.status, "error": self.error}
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
 
     def set_done(self) -> None:
         with self.lock:
@@ -99,6 +103,42 @@ class InferenceStreamJobManager:
         )
         thread.start()
         return job
+
+    def start_live_job(
+        self,
+        *,
+        camera_index: int,
+        classification_model: str,
+        classification_model_path: Path,
+        keypoint_model_path: Path,
+        inference_options: Optional[Dict[str, Any]] = None,
+    ) -> InferenceStreamJob:
+        job = InferenceStreamJob(job_id=uuid.uuid4().hex)
+        with self._jobs_lock:
+            self._jobs[job.job_id] = job
+
+        thread = threading.Thread(
+            target=self._run_live_job,
+            kwargs={
+                "job": job,
+                "camera_index": int(camera_index),
+                "classification_model": str(classification_model),
+                "classification_model_path": classification_model_path.resolve(),
+                "keypoint_model_path": keypoint_model_path.resolve(),
+                "inference_options": dict(inference_options or {}),
+            },
+            daemon=True,
+            name=f"inference-live-job-{job.job_id}",
+        )
+        thread.start()
+        return job
+
+    def stop_job(self, job_id: str) -> bool:
+        job = self.get_job(job_id)
+        if job is None:
+            return False
+        job.request_stop()
+        return True
 
     def get_job(self, job_id: str) -> Optional[InferenceStreamJob]:
         with self._jobs_lock:
@@ -175,4 +215,36 @@ class InferenceStreamJobManager:
             job.set_done()
         except Exception as error:
             logger.exception("Inference stream job failed: job_id=%s", job.job_id)
+            job.set_error(str(error))
+
+    def _run_live_job(
+        self,
+        *,
+        job: InferenceStreamJob,
+        camera_index: int,
+        classification_model: str,
+        classification_model_path: Path,
+        keypoint_model_path: Path,
+        inference_options: Dict[str, Any],
+    ) -> None:
+        try:
+            model_key = str(classification_model).strip().lower()
+            if model_key == "motionbert":
+                raise NotImplementedError("MotionBERT is not supported in live mode.")
+
+            from inference.inference_on_live import run_inference_live
+
+            return_code = run_inference_live(
+                camera_index=camera_index,
+                stop_event=job.stop_event,
+                classification_model_path=classification_model_path,
+                keypoint_model_path=keypoint_model_path,
+                on_packet=job.push_packet,
+                **dict(inference_options),
+            )
+            if int(return_code) != 0:
+                raise RuntimeError(f"Live inference failed with return code {return_code}.")
+            job.set_done()
+        except Exception as error:
+            logger.exception("Live inference job failed: job_id=%s", job.job_id)
             job.set_error(str(error))

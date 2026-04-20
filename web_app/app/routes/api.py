@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+import threading
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from werkzeug.utils import secure_filename
@@ -29,6 +30,11 @@ api_bp = Blueprint("api", __name__, url_prefix="/api")
 inference_service = InferenceService()
 inference_service.load()
 inference_stream_job_manager = InferenceStreamJobManager()
+
+# Camera list is cached after the first probe so we don't re-open every camera
+# on each request (probing is slow on Windows).
+_cameras_cache: Optional[List[Dict[str, Any]]] = None
+_cameras_cache_lock = threading.Lock()
 
 
 def _json_error(message: str, status_code: int):
@@ -312,21 +318,30 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         raise ValueError("Invalid classification model selection.")
     if keypoint_model not in KEYPOINT_MODELS:
         raise ValueError("Invalid keypoint model selection.")
-    if not _is_safe_video_filename(video_name):
-        raise ValueError("Invalid video value. Expected a filename without path separators.")
 
-    selected_video = str(video_name).strip()
-    test_videos_dir, available_videos = _list_available_test_videos()
-    if selected_video not in available_videos:
-        raise ValueError("Selected video is not available in the test video directory.")
+    # Live mode: video value is the sentinel string "live".
+    is_live = isinstance(video_name, str) and str(video_name).strip().lower() == "live"
 
-    resolved_video_path = (test_videos_dir / selected_video).resolve()
-    try:
-        resolved_video_path.relative_to(test_videos_dir)
-    except ValueError as error:
-        raise ValueError("Invalid video path resolution.") from error
-    if not resolved_video_path.is_file():
-        raise ValueError("Selected video file does not exist.")
+    if is_live:
+        camera_index = _validate_int(
+            payload.get("camera_index", 0), name="camera_index", min_value=0
+        )
+    else:
+        if not _is_safe_video_filename(video_name):
+            raise ValueError("Invalid video value. Expected a filename without path separators.")
+
+        selected_video = str(video_name).strip()
+        test_videos_dir, available_videos = _list_available_test_videos()
+        if selected_video not in available_videos:
+            raise ValueError("Selected video is not available in the test video directory.")
+
+        resolved_video_path = (test_videos_dir / selected_video).resolve()
+        try:
+            resolved_video_path.relative_to(test_videos_dir)
+        except ValueError as error:
+            raise ValueError("Invalid video path resolution.") from error
+        if not resolved_video_path.is_file():
+            raise ValueError("Selected video file does not exist.")
 
     keypoint_weights_path = _ensure_keypoint_asset(
         model_name=keypoint_model,
@@ -372,9 +387,8 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         "interp_group": 100,
     }
 
-    return {
-        "video_name": selected_video,
-        "video_path": resolved_video_path,
+    result: Dict[str, Any] = {
+        "mode": "live" if is_live else "video",
         "classification_model": classification_model,
         "keypoint_model": keypoint_model,
         "keypoint_precision": keypoint_precision,
@@ -382,17 +396,34 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         "keypoint_model_path": keypoint_weights_path,
         "inference_options": inference_options,
     }
+    if is_live:
+        result["camera_index"] = camera_index
+    else:
+        result["video_name"] = selected_video
+        result["video_path"] = resolved_video_path
+    return result
 
 
 def _start_stream_job_from_payload(payload: Any):
     prepared = _prepare_stream_request(payload)
-    job = inference_stream_job_manager.start_job(
-        video_path=prepared["video_path"],
-        classification_model=prepared["classification_model"],
-        classification_model_path=prepared["classification_model_path"],
-        keypoint_model_path=prepared["keypoint_model_path"],
-        inference_options=prepared["inference_options"],
-    )
+
+    if prepared["mode"] == "live":
+        job = inference_stream_job_manager.start_live_job(
+            camera_index=prepared["camera_index"],
+            classification_model=prepared["classification_model"],
+            classification_model_path=prepared["classification_model_path"],
+            keypoint_model_path=prepared["keypoint_model_path"],
+            inference_options=prepared["inference_options"],
+        )
+    else:
+        job = inference_stream_job_manager.start_job(
+            video_path=prepared["video_path"],
+            classification_model=prepared["classification_model"],
+            classification_model_path=prepared["classification_model_path"],
+            keypoint_model_path=prepared["keypoint_model_path"],
+            inference_options=prepared["inference_options"],
+        )
+
     return (
         jsonify(
             {
@@ -400,6 +431,7 @@ def _start_stream_job_from_payload(payload: Any):
                 "job_id": job.job_id,
                 "stream_url": f"/api/stream/{job.job_id}",
                 "status_url": f"/api/job_status/{job.job_id}",
+                "stop_url": f"/api/stop_job/{job.job_id}",
             }
         ),
         202,
@@ -463,6 +495,24 @@ def job_status(job_id: str):
     if status is None:
         return jsonify({"error": "Job not found."}), 404
     return jsonify(status)
+
+
+@api_bp.post("/stop_job/<job_id>")
+def stop_job(job_id: str):
+    stopped = inference_stream_job_manager.stop_job(job_id)
+    if not stopped:
+        return jsonify({"error": "Job not found."}), 404
+    return jsonify({"ok": True})
+
+
+@api_bp.get("/list_cameras")
+def list_cameras():
+    global _cameras_cache
+    with _cameras_cache_lock:
+        if _cameras_cache is None:
+            from inference.inference_on_live import list_available_cameras
+            _cameras_cache = list_available_cameras()
+    return jsonify({"cameras": _cameras_cache})
 
 
 @api_bp.post("/predict")

@@ -35,6 +35,11 @@
     <option value="">Loading videos...</option>
   </select>
 
+  <label for="camera-select" id="camera-select-label" style="display:none">Camera</label>
+  <select id="camera-select" name="camera-select" style="display:none">
+    <option value="">Loading cameras...</option>
+  </select>
+
   <label for="window-size">Window Size (T)</label>
   <input id="window-size" name="window-size" type="number" min="1" step="1" value="64">
 
@@ -45,6 +50,7 @@
   <input id="sampling-k" name="sampling-k" type="number" min="1" step="1" value="1">
 
   <button id="run-inference" type="button">Run</button>
+  <button id="stop-inference" type="button" style="display:none">Stop</button>
 </div>
 
 <section class="live-view">
