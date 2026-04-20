@@ -901,6 +901,12 @@ cd "${PROJECT_DIR}" || {
   exit 1
 }
 
+# Disable Ultralytics network calls (update checks, hub sync, analytics).
+# Without this, runs using .pt base models hang indefinitely waiting for a
+# network response during model loading.
+export YOLO_OFFLINE=True
+python3 -c "from ultralytics import settings; settings.update({'sync': False})" 2>/dev/null || true
+
 # Keep existing benchmark outputs. Only ensure the directory exists.
 mkdir -p "${BENCH_DIR}"
 
