@@ -72,7 +72,8 @@ CLASSIFIERS=(
 # Fixed classification weights for ALL runs
 CNNLSTM_WEIGHT="../../web_app/models/classification/cnnlstm/yolo11l-pose/cnnlstm_best.pt"
 STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/stgcn_best.pt"
-MOTIONBERT_WEIGHT="../../web_app/models/classification/MotionBERT/yolo11l-pose/checkpoint/action/FT_MB_release_MB_ft_UPFall_xsub/best_epoch.bin"
+MOTIONBERT_ROOT="../../web_app/models/classification/MotionBERT"
+MOTIONBERT_RUN_DIR="FT_MB_release_MB_ft_UPFall_xsub"
 
 TOTAL_RUNS=$(( \
   ${#POSE_MODELS[@]} * ${#VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
@@ -423,13 +424,20 @@ pose_weight_for_version() {
   esac
 }
 
+motionbert_weight_for_pose_model() {
+  local pose_model="$1"
+
+  printf '%s/%s/%s/best_epoch.bin' "${MOTIONBERT_ROOT}" "${pose_model}" "${MOTIONBERT_RUN_DIR}"
+}
+
 classifier_weight_for_arch() {
   local classifier="$1"
+  local pose_model="${2:-yolo11l-pose}"
 
   case "$classifier" in
     cnnlstm)    printf '%s' "${CNNLSTM_WEIGHT}" ;;
     stgcn)      printf '%s' "${STGCN_WEIGHT}" ;;
-    motionbert) printf '%s' "${MOTIONBERT_WEIGHT}" ;;
+    motionbert) motionbert_weight_for_pose_model "${pose_model}" ;;
     *)
       return 1
       ;;
@@ -775,7 +783,7 @@ run_one_benchmark() {
     return 1
   }
 
-  cls_weight="$(classifier_weight_for_arch "${classifier}")" || {
+  cls_weight="$(classifier_weight_for_arch "${classifier}" "${pose_model}")" || {
     log_failure \
       "pose_model=${pose_model} version=${version} classifier=${classifier} status=internal_error reason=invalid_classifier_mapping"
     return 1
@@ -912,7 +920,7 @@ run_one_alphapose_benchmark() {
     return 1
   }
 
-  cls_weight="$(classifier_weight_for_arch "${classifier}")" || {
+  cls_weight="$(classifier_weight_for_arch "${classifier}" "${ALPHAPOSE_POSE_MODEL}")" || {
     log_failure \
       "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=internal_error reason=invalid_classifier_mapping"
     return 1
@@ -1054,7 +1062,7 @@ run_one_vitpose_benchmark() {
     return 1
   }
 
-  cls_weight="$(classifier_weight_for_arch "${classifier}")" || {
+  cls_weight="$(classifier_weight_for_arch "${classifier}" "${VITPOSE_POSE_MODEL}")" || {
     log_failure \
       "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=internal_error reason=invalid_classifier_mapping"
     return 1
