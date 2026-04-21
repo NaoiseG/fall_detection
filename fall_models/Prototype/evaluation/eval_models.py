@@ -632,6 +632,8 @@ def _interp_array_linear(arr: np.ndarray, sampled_indices: np.ndarray, n_frames:
 def _interp_array_nearest(arr: np.ndarray, sampled_indices: np.ndarray, n_frames: int) -> np.ndarray:
     """Nearest-neighbour interpolation of a subsampled array back to n_frames along axis 0."""
     n_sampled = arr.shape[0]
+    if n_sampled <= 1:
+        return np.repeat(arr[:1], n_frames, axis=0)
     nn_idx = np.round(
         np.arange(n_frames, dtype=float) / sampled_indices[-1] * (n_sampled - 1)
     ).astype(int).clip(0, n_sampled - 1)
@@ -658,7 +660,7 @@ def _write_frame_step_npz(src_npz: Path, dst_npz: Path, frame_step: int, mode: s
             if isinstance(arr, np.ndarray) and arr.ndim >= 1 and int(arr.shape[0]) == n_frames:
                 sub = arr[::frame_step]
                 if mode == "interpolate":
-                    if key == "frame_labels":
+                    if key == "frame_labels" or not np.issubdtype(arr.dtype, np.number):
                         out[key] = _interp_array_nearest(sub, sampled_indices, n_frames)
                     else:
                         out[key] = _interp_array_linear(sub, sampled_indices, n_frames)

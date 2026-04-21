@@ -25,9 +25,9 @@ except ImportError as e:
 
 PRIMARY_POSE_MAP_KEY = "metrics/mAP50-95(P)"
 EXPECTED_PRECISIONS = ("fp32", "fp16", "int8")
-DEFAULT_MODELS_ROOT = Path("/home/people/21376026/scratch/pose_models/prune_models/full_pruned")
-DEFAULT_DATA_YAML = Path("/home/people/21376026/fall_detection/pruning/coco-pose.yaml")
-DEFAULT_OUTPUT_DIR = Path("/home/people/21376026/scratch/final_results/pose_models_map5095")
+DEFAULT_MODELS_ROOT = Path("/home/jetson/NaoiseG/fall_detection/pose_models/full_pruned")
+DEFAULT_DATA_YAML = Path("/home/jetson/NaoiseG/fall_detection/pruning/coco-pose.yaml")
+DEFAULT_OUTPUT_DIR = Path("/home/jetson/NaoiseG/fall_detection")
 DEFAULT_JSON_OUT = DEFAULT_OUTPUT_DIR / "pruned_quantised_map5095.json"
 DEFAULT_PROJECT = DEFAULT_OUTPUT_DIR / "runs"
 
@@ -36,6 +36,7 @@ PRUNED_ENGINE_RE = re.compile(
     r"(?P<precision>fp32|fp16|int8)\.engine$",
     re.IGNORECASE,
 )
+PRUNED_MODEL_DIR_RE = re.compile(r"^yolo\d+[nslmx]_pruned_\d+$", re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,6 +134,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also validate .engine files that do not match the expected *_fp32/fp16/int8.engine naming pattern.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only discover/report engines and missing expected precision files; do not run validation.",
+    )
     return parser.parse_args()
 
 
@@ -190,18 +196,45 @@ def is_expected_engine(path: Path) -> bool:
     return bool(PRUNED_ENGINE_RE.match(path.name))
 
 
-def discover_engines(models_root: Path, allow_unexpected_engines: bool = False) -> list[Path]:
+def discover_all_engines(models_root: Path) -> list[Path]:
     root = models_root.expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Models root does not exist: {root}")
+    return sorted(path for path in root.rglob("*.engine") if path.is_file())
 
+
+def discover_engines(models_root: Path, allow_unexpected_engines: bool = False) -> list[Path]:
+    all_engines = discover_all_engines(models_root)
     engines = []
-    for path in sorted(root.rglob("*.engine")):
-        if not path.is_file():
-            continue
+    for path in all_engines:
         if allow_unexpected_engines or is_expected_engine(path):
             engines.append(path)
     return engines
+
+
+def discover_ignored_engines(models_root: Path) -> list[Path]:
+    return [path for path in discover_all_engines(models_root) if not is_expected_engine(path)]
+
+
+def discover_pruned_model_dirs(models_root: Path) -> list[Path]:
+    root = models_root.expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Models root does not exist: {root}")
+    return sorted(path for path in root.rglob("*") if path.is_dir() and PRUNED_MODEL_DIR_RE.match(path.name))
+
+
+def expected_engine_path(model_dir: Path, precision: str) -> Path:
+    return model_dir / "weights" / f"{model_dir.name}_{precision}.engine"
+
+
+def find_missing_expected_engines(models_root: Path) -> list[Path]:
+    missing = []
+    for model_dir in discover_pruned_model_dirs(models_root):
+        for precision in EXPECTED_PRECISIONS:
+            expected_path = expected_engine_path(model_dir, precision)
+            if not expected_path.exists():
+                missing.append(expected_path)
+    return missing
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -544,6 +577,26 @@ def print_table(rows: list[dict[str, Any]], title: str) -> None:
         print(" | ".join(row[key].ljust(widths[key]) for _, key in columns))
 
 
+def print_discovery_report(models_root: Path, engines: list[Path], ignored_engines: list[Path], missing_engines: list[Path]) -> None:
+    model_dirs = discover_pruned_model_dirs(models_root)
+    expected_count = len(model_dirs) * len(EXPECTED_PRECISIONS)
+    print(f"Pruned model directories found: {len(model_dirs)}")
+    print(f"Expected precision engines from directories: {expected_count}")
+    print(f"Discovered expected engine files: {len(engines)}")
+    print(f"Ignored unexpected engine files: {len(ignored_engines)}")
+    print(f"Missing expected engine files: {len(missing_engines)}")
+
+    if ignored_engines:
+        print("\nIgnored unexpected engine files")
+        for path in ignored_engines:
+            print(f"- {path}")
+
+    if missing_engines:
+        print("\nMissing expected engine files")
+        for path in missing_engines:
+            print(f"- {path}")
+
+
 def main() -> int:
     args = parse_args()
 
@@ -557,12 +610,22 @@ def main() -> int:
     temp_yaml = None
     dataset_info: dict[str, Any] = {}
     try:
-        temp_yaml, dataset_info = create_val_only_yaml(args.data_yaml, args.split)
         engines = discover_engines(args.models_root, args.allow_unexpected_engines)
+        ignored_engines = discover_ignored_engines(args.models_root)
+        missing_engines = find_missing_expected_engines(args.models_root)
+
+        print_discovery_report(args.models_root, engines, ignored_engines, missing_engines)
+
         if not engines:
             print(f"No expected .engine files found under: {args.models_root}")
             print("Expected filenames like: yolo11l_pruned_90_fp16.engine")
             return 1
+
+        if args.dry_run:
+            print("\nDry run requested; no validation was launched.")
+            return 0
+
+        temp_yaml, dataset_info = create_val_only_yaml(args.data_yaml, args.split)
 
         existing = {} if args.force else read_json_results(args.json_out)
 
@@ -585,7 +648,6 @@ def main() -> int:
             else:
                 to_run.append(engine_path)
 
-        print(f"Discovered {len(engines)} expected .engine files under {args.models_root}")
         print(f"Using temporary validation-only YAML: {temp_yaml}")
         print(f"Resolved dataset root: {dataset_info.get('dataset_root')}")
         print(f"Resolved {args.split} entry: {dataset_info.get('resolved_split_entry')}")
