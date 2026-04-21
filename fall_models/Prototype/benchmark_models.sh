@@ -74,7 +74,7 @@ CLASSIFIERS=(
 # Classification checkpoint locations
 CNNLSTM_WEIGHT="../../web_app/models/classification/cnnlstm/yolo11l-pose/cnnlstm_best.pt"
 STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/stgcn_best.pt"
-PAPER_STGCN_ROOT="/home/people/21376026/scratch/final_classification_models/stgcn"
+PAPER_STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/paper_stgcn_best.pt"
 MOTIONBERT_ROOT="../../web_app/models/classification/MotionBERT"
 MOTIONBERT_RUN_DIR="FT_MB_release_MB_ft_UPFall_xsub"
 
@@ -434,9 +434,7 @@ motionbert_weight_for_pose_model() {
 }
 
 paper_stgcn_weight_for_pose_model() {
-  local pose_model="$1"
-
-  printf '%s/%s/paper_stgcn_best.pt' "${PAPER_STGCN_ROOT}" "${pose_model}"
+  printf '%s' "${PAPER_STGCN_WEIGHT}"
 }
 
 classifier_weight_for_arch() {
