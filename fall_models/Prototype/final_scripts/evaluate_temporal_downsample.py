@@ -539,7 +539,11 @@ def write_summary_jsons(
     results: Dict[str, Dict[str, Any]],
 ) -> None:
     for mode in MODES:
-        mode_entries = [results[r.run_id] for r in runs if r.mode == mode]
+        mode_entries = [
+            results.get(r.run_id, build_result_entry(r, "pending"))
+            for r in runs
+            if r.mode == mode
+        ]
         payload = {
             "mode": mode,
             "generated_at": now_iso(),
