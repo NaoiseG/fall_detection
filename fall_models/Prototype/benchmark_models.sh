@@ -77,6 +77,7 @@ STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/stgcn_best.
 PAPER_STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/paper_stgcn_best.pt"
 MOTIONBERT_ROOT="../../web_app/models/classification/MotionBERT"
 MOTIONBERT_RUN_DIR="FT_MB_release_MB_ft_UPFall_xsub"
+MOTIONBERT_WEIGHT="${MOTIONBERT_ROOT}/yolo11l-pose/${MOTIONBERT_RUN_DIR}/best_epoch.bin"
 
 TOTAL_RUNS=$(( \
   ${#POSE_MODELS[@]} * ${#VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
@@ -428,9 +429,7 @@ pose_weight_for_version() {
 }
 
 motionbert_weight_for_pose_model() {
-  local pose_model="$1"
-
-  printf '%s/%s/%s/best_epoch.bin' "${MOTIONBERT_ROOT}" "${pose_model}" "${MOTIONBERT_RUN_DIR}"
+  printf '%s' "${MOTIONBERT_WEIGHT}"
 }
 
 paper_stgcn_weight_for_pose_model() {
