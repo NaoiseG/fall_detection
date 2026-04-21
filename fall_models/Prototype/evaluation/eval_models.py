@@ -616,7 +616,29 @@ def resolve_preprocess_config(
     }
 
 
-def _write_frame_step_npz(src_npz: Path, dst_npz: Path, frame_step: int) -> None:
+def _interp_array_linear(arr: np.ndarray, sampled_indices: np.ndarray, n_frames: int) -> np.ndarray:
+    """Linearly interpolate a subsampled array back to n_frames along axis 0."""
+    orig_indices = np.arange(n_frames, dtype=float)
+    n_sampled = arr.shape[0]
+    if arr.ndim == 1:
+        return np.interp(orig_indices, sampled_indices, arr.astype(float)).astype(arr.dtype)
+    flat = arr.reshape(n_sampled, -1).astype(float)
+    out_flat = np.empty((n_frames, flat.shape[1]), dtype=float)
+    for col in range(flat.shape[1]):
+        out_flat[:, col] = np.interp(orig_indices, sampled_indices, flat[:, col])
+    return out_flat.reshape((n_frames,) + arr.shape[1:]).astype(arr.dtype)
+
+
+def _interp_array_nearest(arr: np.ndarray, sampled_indices: np.ndarray, n_frames: int) -> np.ndarray:
+    """Nearest-neighbour interpolation of a subsampled array back to n_frames along axis 0."""
+    n_sampled = arr.shape[0]
+    nn_idx = np.round(
+        np.arange(n_frames, dtype=float) / sampled_indices[-1] * (n_sampled - 1)
+    ).astype(int).clip(0, n_sampled - 1)
+    return arr[nn_idx]
+
+
+def _write_frame_step_npz(src_npz: Path, dst_npz: Path, frame_step: int, mode: str = "interpolate") -> None:
     frame_step = int(frame_step)
     if frame_step <= 1:
         raise ValueError("frame_step must be >= 2 for subsampled NPZ export.")
@@ -628,11 +650,20 @@ def _write_frame_step_npz(src_npz: Path, dst_npz: Path, frame_step: int) -> None
         if n_frames <= 0:
             raise ValueError(f"No frames in {src_npz.as_posix()}")
 
+        sampled_indices = np.arange(0, n_frames, frame_step, dtype=float)
+
         out = {}
         for key in data.files:
             arr = data[key]
             if isinstance(arr, np.ndarray) and arr.ndim >= 1 and int(arr.shape[0]) == n_frames:
-                out[key] = arr[::frame_step]
+                sub = arr[::frame_step]
+                if mode == "interpolate":
+                    if key == "frame_labels":
+                        out[key] = _interp_array_nearest(sub, sampled_indices, n_frames)
+                    else:
+                        out[key] = _interp_array_linear(sub, sampled_indices, n_frames)
+                else:
+                    out[key] = sub
             else:
                 out[key] = arr
         out["source_npz_path"] = np.array(src_npz.as_posix())
@@ -650,6 +681,7 @@ def _materialize_frame_step_npzs(
     frame_step: int,
     cache_dir: Path,
     cache: Dict[str, Path],
+    mode: str = "interpolate",
 ) -> List[Path]:
     if int(frame_step) <= 1:
         return [Path(p) for p in npz_paths]
@@ -661,7 +693,7 @@ def _materialize_frame_step_npzs(
         if key not in cache:
             safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", src.stem)
             dst = cache_dir / f"{len(cache):06d}_{safe_stem}.npz"
-            _write_frame_step_npz(src_npz=src, dst_npz=dst, frame_step=int(frame_step))
+            _write_frame_step_npz(src_npz=src, dst_npz=dst, frame_step=int(frame_step), mode=mode)
             cache[key] = dst
         out_paths.append(cache[key])
     return out_paths
@@ -2513,6 +2545,18 @@ def main():
         help="Subsample NPZ frames by k before windowing (k>=1). Window T/stride are interpreted in raw frames and scaled to sampled frames.",
     )
     parser.add_argument(
+        "--temporal-downsample-mode",
+        type=str,
+        default="interpolate",
+        choices=["shrink", "interpolate"],
+        help=(
+            "How to handle temporal downsampling when --frame-step/--k > 1. "
+            "'shrink': take every k-th frame and reduce window T/stride accordingly (original behaviour). "
+            "'interpolate': take every k-th frame then linearly interpolate back to the original length so "
+            "the model still receives T frames at full density (default)."
+        ),
+    )
+    parser.add_argument(
         "--label-mode",
         type=str,
         default="center",
@@ -2536,6 +2580,7 @@ def main():
     frame_step = int(args.frame_step)
     if frame_step <= 0:
         raise SystemExit("--frame-step/--k must be >= 1.")
+    temporal_downsample_mode = str(args.temporal_downsample_mode).lower().strip()
 
     normalize_cli = bool(args.normalize)
     add_vel_cli = bool(args.add_vel)
@@ -2686,11 +2731,12 @@ def main():
                     frame_step=frame_step,
                     cache_dir=npz_cache_dir,
                     cache=npz_subsample_cache,
+                    mode=temporal_downsample_mode,
                 ),
             )
             for split_name, split_camera_ids, split_npzs in eval_splits
         ]
-        print(f"[window] --frame-step={frame_step}: using subsampled NPZ cache at {npz_cache_dir.as_posix()}")
+        print(f"[window] --frame-step={frame_step} --temporal-downsample-mode={temporal_downsample_mode}: using subsampled NPZ cache at {npz_cache_dir.as_posix()}")
 
     frame_has_pose_cache: Dict[Tuple[str, float], np.ndarray] = {}
     frame_label_cache: Dict[Tuple[str, str], np.ndarray] = {}
@@ -3018,7 +3064,7 @@ def main():
         stride_ckpt_raw = max(1, int(stride_ckpt_raw))
         T_ckpt = int(T_ckpt_raw)
         stride_ckpt = int(stride_ckpt_raw)
-        if frame_step > 1:
+        if frame_step > 1 and temporal_downsample_mode == "shrink":
             T_ckpt = _ceil_div_pos(T_ckpt_raw, frame_step)
             stride_ckpt = _ceil_div_pos(stride_ckpt_raw, frame_step)
             if (T_ckpt_raw % frame_step) != 0 or (stride_ckpt_raw % frame_step) != 0:
@@ -3026,10 +3072,14 @@ def main():
                     f"[{m}][window][WARN] raw T/stride ({T_ckpt_raw}/{stride_ckpt_raw}) not divisible by k={frame_step}; "
                     "using ceil division."
                 )
-        print(f"[{m}][window] raw T/stride={T_ckpt_raw}/{stride_ckpt_raw} -> sampled T/stride={T_ckpt}/{stride_ckpt} (k={frame_step})")
+        if frame_step > 1:
+            print(
+                f"[{m}][window] k={frame_step} mode={temporal_downsample_mode}: "
+                f"raw T/stride={T_ckpt_raw}/{stride_ckpt_raw} -> effective T/stride={T_ckpt}/{stride_ckpt}"
+            )
 
-        if str(m).lower().strip() == "mlp" and frame_step > 1:
-            print("[mlp][WARN] --frame-step/--k > 1 changes T and is incompatible with fixed-size MLP input. Skipping model.")
+        if str(m).lower().strip() == "mlp" and frame_step > 1 and temporal_downsample_mode == "shrink":
+            print("[mlp][WARN] --frame-step/--k > 1 with mode=shrink changes T and is incompatible with fixed-size MLP input. Skipping model.")
             continue
 
         if str(feature_mode_ckpt).lower().strip() == "motion_primary" and (not bool(add_vel_ckpt) or not bool(add_acc_ckpt)):
@@ -3249,6 +3299,7 @@ def main():
                         frame_step=frame_step,
                         cache_dir=npz_cache_dir,
                         cache=npz_subsample_cache,
+                        mode=temporal_downsample_mode,
                     )
 
                 X_tune, y_tune_tags, _, tune_meta = load_windows_with_source_meta_from_npzs(

@@ -30,7 +30,7 @@ python eval_motionbert_action.py \
   --checkpoint checkpoint/action/FT_MB_lite_MB_ft_UPFall_xsub/best_epoch.bin \
   --subjects 1-5 \
   --out-dir eval_outputs \
-  --batch-size 64 \
+  --batch-size 32 \
   --num-workers 0 \
   --device cuda
 
@@ -317,6 +317,46 @@ def _write_action_pkl(obj: Dict, out_path: Path) -> None:
     _ensure_dir(out_path.parent)
     with out_path.open("wb") as f:
         pickle.dump(obj, f, protocol=4)
+
+
+def _interp_axis1_linear(arr: np.ndarray, sampled_indices: np.ndarray, orig_len: int) -> np.ndarray:
+    """Linearly interpolate a subsampled array back to orig_len along axis 1.
+    arr shape: (..., n_sampled, ...) — axis 1 is the time axis.
+    """
+    orig_idx = np.arange(orig_len, dtype=float)
+    n_sampled = arr.shape[1]
+    leading = arr.shape[0]
+    trailing = arr.shape[2:]
+    flat = arr.reshape(leading, n_sampled, -1)
+    out_flat = np.empty((leading, orig_len, flat.shape[2]), dtype=float)
+    for i in range(leading):
+        for c in range(flat.shape[2]):
+            out_flat[i, :, c] = np.interp(orig_idx, sampled_indices, flat[i, :, c])
+    return out_flat.reshape((leading, orig_len) + trailing).astype(arr.dtype)
+
+
+def _make_interpolated_pkl(src_pkl: Path, out_pkl: Path, frame_step: int) -> None:
+    """Write a copy of src_pkl where every annotation's keypoints are subsampled
+    at every frame_step-th frame and then linearly interpolated back to the
+    original total_frames length. frame_labels (if present) use nearest-neighbour."""
+    data = _load_action_pkl(src_pkl)
+    new_annotations = []
+    for ann in data["annotations"]:
+        ann = dict(ann)
+        total = int(ann["total_frames"])
+        sampled_indices = np.arange(0, total, frame_step, dtype=float)
+        # keypoint: (M, T, 17, 2)
+        kp = np.asarray(ann["keypoint"])
+        kp_sub = kp[:, ::frame_step, :, :]
+        ann["keypoint"] = _interp_axis1_linear(kp_sub, sampled_indices, total)
+        # keypoint_score: (M, T, 17)
+        ks = np.asarray(ann["keypoint_score"])
+        ks_sub = ks[:, ::frame_step, :]
+        ann["keypoint_score"] = _interp_axis1_linear(
+            ks_sub[..., np.newaxis], sampled_indices, total
+        )[..., 0]
+        new_annotations.append(ann)
+    _write_action_pkl({"split": data["split"], "annotations": new_annotations}, out_pkl)
 
 
 # -----------------------------------------------------------------------------
@@ -842,13 +882,25 @@ def main() -> None:
         help="One or more camera indices to evaluate on; if multiple are given, outputs each camera split and a combined split.",
     )
     parser.add_argument("--out-dir", type=str, default="eval_outputs", help="Base output directory (timestamped subfolder created).")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64).")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size (default: 32).")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader num_workers (default: 0).")
     parser.add_argument(
         "--frame-step", "--k",
         type=int,
         default=1,
         help="Use every k-th temporal sample for evaluation (k>=1). clip_len is interpreted in raw frames and scaled to sampled frames.",
+    )
+    parser.add_argument(
+        "--temporal-downsample-mode",
+        type=str,
+        default="interpolate",
+        choices=["shrink", "interpolate"],
+        help=(
+            "How to handle temporal downsampling when --frame-step/--k > 1. "
+            "'shrink': take every k-th frame and reduce clip_len accordingly (original behaviour). "
+            "'interpolate': take every k-th frame then linearly interpolate back to the original clip_len "
+            "so the model still receives the full number of frames (default)."
+        ),
     )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device string (cuda, cuda:0, cpu).")
     parser.add_argument("--print-freq", type=int, default=100, help="Print progress every N batches (default: 100).")
@@ -926,6 +978,7 @@ def main() -> None:
     frame_step = int(args_cli.frame_step)
     if frame_step <= 0:
         raise SystemExit("--frame-step/--k must be >= 1.")
+    temporal_downsample_mode = str(args_cli.temporal_downsample_mode).lower().strip()
 
     # Make MotionBERT imports work when script is at repo root.
     repo_root = Path(__file__).resolve().parent
@@ -960,17 +1013,19 @@ def main() -> None:
     if clip_len_raw <= 0:
         raise RuntimeError("Config missing/invalid 'clip_len'.")
     clip_len_eval = int(clip_len_raw)
-    if frame_step > 1:
+    if frame_step > 1 and temporal_downsample_mode == "shrink":
         clip_len_eval = _ceil_div_pos(clip_len_raw, frame_step)
         if (clip_len_raw % frame_step) != 0:
             print(
                 f"[window][WARN] raw clip_len={clip_len_raw} is not divisible by k={frame_step}; using ceil division.",
                 flush=True,
             )
-    print(
-        f"[window] raw clip_len={clip_len_raw} -> sampled clip_len={clip_len_eval} (k={frame_step})",
-        flush=True,
-    )
+    if frame_step > 1:
+        print(
+            f"[window] k={frame_step} mode={temporal_downsample_mode}: "
+            f"raw clip_len={clip_len_raw} -> effective clip_len={clip_len_eval}",
+            flush=True,
+        )
 
     action_classes = int(getattr(cfg, "action_classes", 0))
     if action_classes <= 1:
@@ -1113,8 +1168,15 @@ def main() -> None:
             flush=True,
         )
 
+        eval_pkl_path = fr.filtered_pkl_path
+        if frame_step > 1 and temporal_downsample_mode == "interpolate":
+            interp_pkl = out_dir / f"interp_k{frame_step}_{filtered_pkl.name}"
+            print(f"[{split_name}] Building interpolated pkl (k={frame_step}) -> {interp_pkl.as_posix()}", flush=True)
+            _make_interpolated_pkl(fr.filtered_pkl_path, interp_pkl, frame_step)
+            eval_pkl_path = interp_pkl
+
         ds_kwargs = dict(
-            data_path=str(fr.filtered_pkl_path),
+            data_path=str(eval_pkl_path),
             data_split=fr.split_key,
             n_frames=clip_len_eval,
             random_move=False,
@@ -1252,6 +1314,7 @@ def main() -> None:
             "batch_size": int(args_cli.batch_size),
             "num_workers": int(args_cli.num_workers),
             "frame_step": int(frame_step),
+            "temporal_downsample_mode": temporal_downsample_mode,
             "clip_len_raw": int(clip_len_raw),
             "clip_len_sampled": int(clip_len_eval),
         }
