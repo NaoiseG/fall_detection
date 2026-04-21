@@ -9,6 +9,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+os.environ.setdefault("YOLO_OFFLINE", "True")
+os.environ.setdefault("ULTRALYTICS_OFFLINE", "True")
+os.environ.setdefault("ULTRALYTICS_SYNC", "False")
+os.environ.setdefault("WANDB_DISABLED", "true")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+os.environ.setdefault("GIT_PYTHON_REFRESH", "quiet")
+
 import cv2
 import numpy as np
 import torch
@@ -33,8 +42,15 @@ SKELETON = [
 
 
 def _maybe_cuda_sync(sync_cuda: bool) -> None:
-    if bool(sync_cuda):
+    if bool(sync_cuda) and torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def is_engine_weights_path(weights_path: Path) -> bool:
@@ -449,11 +465,25 @@ class PosePipeline:
         self._yolo_runtime_weights = ensure_ultralytics_engine_header(yolo_weights) if self._yolo_is_engine else yolo_weights
         self._yolo_predict_device = resolve_yolo_predict_device(device=config.device, yolo_is_engine=self._yolo_is_engine)
 
+        print(
+            "[pose] yolo_init_start "
+            f"weights={self._yolo_runtime_weights.as_posix()} "
+            f"engine={bool(self._yolo_is_engine)} device={config.device}",
+            flush=True,
+        )
         try:
             self._pose_model = YOLO(str(self._yolo_runtime_weights), task="pose")
         except TypeError:
             self._pose_model = YOLO(str(self._yolo_runtime_weights))
+
+        if not self._yolo_is_engine:
+            print(f"[pose] yolo_to_device_start device={config.device}", flush=True)
+            self._pose_model.to(str(config.device))
+            _maybe_cuda_sync(str(config.device).lower().startswith("cuda"))
+            print(f"[pose] yolo_to_device_done device={config.device}", flush=True)
+
         self._model_stride = extract_model_stride(self._pose_model)
+        print(f"[pose] yolo_init_done stride={int(self._model_stride)}", flush=True)
         self._predict_imgsz_runtime: Optional[Any] = None
         self._predict_imgsz_info: Dict[str, Any] = {
             "mode": "default",
@@ -584,11 +614,34 @@ class PosePipeline:
         if self.config.yolo_iou is not None:
             predict_kwargs["iou"] = float(self.config.yolo_iou)
 
+        trace_predict = int(raw_frame_idx) == 0 or _env_flag("POSE_DEBUG_PREDICT", False)
+        if trace_predict:
+            print(
+                "[pose] predict_pre_sync_start "
+                f"frame={int(raw_frame_idx)} sync_cuda={bool(sync_cuda_timing)}",
+                flush=True,
+            )
         _maybe_cuda_sync(sync_cuda_timing)
+        if trace_predict:
+            print(
+                "[pose] predict_call_start "
+                f"frame={int(raw_frame_idx)} source_shape={tuple(frame_for_model.shape)} "
+                f"device={self._yolo_predict_device} half={bool(self.config.use_half)} "
+                f"imgsz={predict_kwargs.get('imgsz', None)} max_det={predict_kwargs['max_det']}",
+                flush=True,
+            )
         t_pose0 = time.perf_counter()
-        with _temporary_torch_from_numpy_fallback(enabled=bool(self._yolo_is_engine)):
+        with _temporary_torch_from_numpy_fallback(enabled=bool(self._yolo_is_engine)), torch.inference_mode():
             results = self._pose_model.predict(**predict_kwargs)
+        if trace_predict:
+            print(
+                "[pose] predict_call_done "
+                f"frame={int(raw_frame_idx)} elapsed_ms={(time.perf_counter() - t_pose0) * 1000.0:.1f}",
+                flush=True,
+            )
         _maybe_cuda_sync(sync_cuda_timing)
+        if trace_predict:
+            print(f"[pose] predict_post_sync_done frame={int(raw_frame_idx)}", flush=True)
         pose_infer_ms = (time.perf_counter() - t_pose0) * 1000.0
 
         t_track0 = time.perf_counter()

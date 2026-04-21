@@ -20,8 +20,12 @@ BENCH_DIR="benchmarks"
 VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
 MODELS_ROOT="../../pose_models/quantised"
-BENCHMARK_STARTUP_TIMEOUT_S=300
-BENCHMARK_TOTAL_TIMEOUT_S=3600   # 1 hour max per run after startup marker
+BENCHMARK_STARTUP_TIMEOUT_S="${BENCHMARK_STARTUP_TIMEOUT_S:-300}"
+BENCHMARK_FIRST_FRAME_TIMEOUT_S="${BENCHMARK_FIRST_FRAME_TIMEOUT_S:-240}"
+BENCHMARK_PROGRESS_TIMEOUT_S="${BENCHMARK_PROGRESS_TIMEOUT_S:-180}"
+BENCHMARK_TOTAL_TIMEOUT_S="${BENCHMARK_TOTAL_TIMEOUT_S:-3600}"   # 1 hour max per run after startup marker
+BENCHMARK_MAX_ATTEMPTS="${BENCHMARK_MAX_ATTEMPTS:-3}"
+BENCHMARK_RETRY_SLEEP_S="${BENCHMARK_RETRY_SLEEP_S:-10}"
 TEMPORAL_WINDOW_SIZE=64
 TEMPORAL_WINDOW_STRIDE=48
 
@@ -117,7 +121,11 @@ terminate_pid_with_grace() {
     return 0
   fi
 
-  kill "${pid}" 2>/dev/null || return 0
+  if kill -0 -- "-${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+  else
+    kill "${pid}" 2>/dev/null || return 0
+  fi
 
   local deadline=$(( SECONDS + grace_s ))
   while kill -0 "${pid}" 2>/dev/null; do
@@ -128,13 +136,38 @@ terminate_pid_with_grace() {
   done
 
   if kill -0 "${pid}" 2>/dev/null; then
-    kill -9 "${pid}" 2>/dev/null || true
+    if kill -0 -- "-${pid}" 2>/dev/null; then
+      kill -KILL -- "-${pid}" 2>/dev/null || true
+    else
+      kill -9 "${pid}" 2>/dev/null || true
+    fi
   fi
 }
 
 WATCHDOG_TIMEOUT_KIND=""
+WATCHDOG_ATTEMPTS=0
 
-run_with_startup_watchdog() {
+dump_python_stack_if_possible() {
+  local pid="$1"
+  local reason="$2"
+
+  if [[ -z "${pid}" ]] || ! kill -0 "${pid}" 2>/dev/null; then
+    return 0
+  fi
+
+  printf '[watchdog] %s; requesting Python stack dump with SIGUSR1 (pid=%s)\n' \
+    "${reason}" "${pid}" >&2
+
+  if kill -0 -- "-${pid}" 2>/dev/null; then
+    kill -USR1 -- "-${pid}" 2>/dev/null || true
+  else
+    kill -USR1 "${pid}" 2>/dev/null || true
+  fi
+
+  sleep 2
+}
+
+run_with_startup_watchdog_legacy_unused() {
   # Usage: run_with_startup_watchdog <marker> <timeout_s> -- <cmd> [args...]
   # Runs <cmd> in the background. If <marker> does not appear in stdout within
   # <timeout_s> seconds the process is killed and 124 is returned.
@@ -209,6 +242,168 @@ run_with_startup_watchdog() {
   wait "${cmd_pid}"
   local rc=$?
   rm -f "${marker_file}"
+  return "${rc}"
+}
+
+run_with_startup_watchdog() {
+  # Usage: run_with_startup_watchdog <marker> <timeout_s> -- <cmd> [args...]
+  # Timeout return code is 124 and WATCHDOG_TIMEOUT_KIND names the boundary:
+  # startup_marker_timeout, first_frame_timeout, idle_progress_timeout, or
+  # total_runtime_timeout.
+  local startup_marker="$1"
+  local startup_timeout_s="$2"
+  WATCHDOG_TIMEOUT_KIND=""
+  shift 2
+  # consume the '--' separator
+  if [[ "${1:-}" == "--" ]]; then shift; fi
+
+  local tmp_dir startup_file first_frame_file progress_file
+  tmp_dir="$(mktemp -d)"
+  startup_file="${tmp_dir}/startup_seen"
+  first_frame_file="${tmp_dir}/first_frame_seen"
+  progress_file="${tmp_dir}/last_progress_epoch"
+  date +%s > "${progress_file}"
+
+  # Use setsid when available so timeout cleanup kills children too.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${@}" > >(
+      while IFS= read -r line; do
+        printf '%s\n' "$line"
+        date +%s > "${progress_file}"
+        if [[ "$line" == *"${startup_marker}"* ]]; then
+          : > "${startup_file}"
+        fi
+        if [[ "$line" == *"[benchmark] first_frame_done"* ]]; then
+          : > "${first_frame_file}"
+        fi
+      done
+    ) 2>&1 &
+  else
+    "${@}" > >(
+      while IFS= read -r line; do
+        printf '%s\n' "$line"
+        date +%s > "${progress_file}"
+        if [[ "$line" == *"${startup_marker}"* ]]; then
+          : > "${startup_file}"
+        fi
+        if [[ "$line" == *"[benchmark] first_frame_done"* ]]; then
+          : > "${first_frame_file}"
+        fi
+      done
+    ) 2>&1 &
+  fi
+  local cmd_pid=$!
+
+  local now_epoch
+  now_epoch="$(date +%s)"
+  local startup_deadline=$(( now_epoch + startup_timeout_s ))
+  local first_frame_deadline=0
+  local total_deadline=0
+  local startup_seen=0
+  local first_frame_seen=0
+  local last_progress_epoch
+  local idle_s
+
+  while kill -0 "${cmd_pid}" 2>/dev/null; do
+    now_epoch="$(date +%s)"
+
+    if [[ "${startup_seen}" -eq 0 && -f "${startup_file}" ]]; then
+      startup_seen=1
+      first_frame_deadline=$(( now_epoch + ${BENCHMARK_FIRST_FRAME_TIMEOUT_S:-240} ))
+      total_deadline=$(( now_epoch + ${BENCHMARK_TOTAL_TIMEOUT_S:-3600} ))
+    fi
+
+    if [[ "${first_frame_seen}" -eq 0 && -f "${first_frame_file}" ]]; then
+      first_frame_seen=1
+    fi
+
+    if [[ "${startup_seen}" -eq 0 && "${now_epoch}" -ge "${startup_deadline}" ]]; then
+      dump_python_stack_if_possible "${cmd_pid}" "startup marker timeout (${startup_timeout_s}s)"
+      terminate_pid_with_grace "${cmd_pid}" 5
+      wait "${cmd_pid}" 2>/dev/null
+      rm -rf "${tmp_dir}"
+      WATCHDOG_TIMEOUT_KIND="startup_marker_timeout"
+      return 124
+    fi
+
+    if [[ "${startup_seen}" -eq 1 && "${first_frame_seen}" -eq 0 && "${BENCHMARK_FIRST_FRAME_TIMEOUT_S:-240}" -gt 0 && "${now_epoch}" -ge "${first_frame_deadline}" ]]; then
+      dump_python_stack_if_possible "${cmd_pid}" "first-frame timeout (${BENCHMARK_FIRST_FRAME_TIMEOUT_S:-240}s)"
+      terminate_pid_with_grace "${cmd_pid}" 5
+      wait "${cmd_pid}" 2>/dev/null
+      rm -rf "${tmp_dir}"
+      WATCHDOG_TIMEOUT_KIND="first_frame_timeout"
+      return 124
+    fi
+
+    if [[ "${startup_seen}" -eq 1 && "${first_frame_seen}" -eq 1 && "${BENCHMARK_PROGRESS_TIMEOUT_S:-180}" -gt 0 ]]; then
+      last_progress_epoch="$(cat "${progress_file}" 2>/dev/null || printf '%s' "${now_epoch}")"
+      idle_s=$(( now_epoch - last_progress_epoch ))
+      if [[ "${idle_s}" -ge "${BENCHMARK_PROGRESS_TIMEOUT_S:-180}" ]]; then
+        dump_python_stack_if_possible "${cmd_pid}" "progress timeout (${idle_s}s without output)"
+        terminate_pid_with_grace "${cmd_pid}" 5
+        wait "${cmd_pid}" 2>/dev/null
+        rm -rf "${tmp_dir}"
+        WATCHDOG_TIMEOUT_KIND="idle_progress_timeout"
+        return 124
+      fi
+    fi
+
+    if [[ "${startup_seen}" -eq 1 && "${total_deadline}" -gt 0 && "${now_epoch}" -ge "${total_deadline}" ]]; then
+      dump_python_stack_if_possible "${cmd_pid}" "total runtime timeout (${BENCHMARK_TOTAL_TIMEOUT_S:-3600}s)"
+      terminate_pid_with_grace "${cmd_pid}" 5
+      wait "${cmd_pid}" 2>/dev/null
+      rm -rf "${tmp_dir}"
+      WATCHDOG_TIMEOUT_KIND="total_runtime_timeout"
+      return 124
+    fi
+
+    sleep 2
+  done
+
+  wait "${cmd_pid}"
+  local rc=$?
+  rm -rf "${tmp_dir}"
+  return "${rc}"
+}
+
+run_with_benchmark_watchdog_retries() {
+  # Usage: run_with_benchmark_watchdog_retries <label> -- <cmd> [args...]
+  local run_label="$1"
+  shift
+  if [[ "${1:-}" == "--" ]]; then shift; fi
+
+  local max_attempts="${BENCHMARK_MAX_ATTEMPTS:-3}"
+  local retry_sleep_s="${BENCHMARK_RETRY_SLEEP_S:-10}"
+  local attempt=1
+  local rc=0
+
+  WATCHDOG_ATTEMPTS=0
+  while [[ "${attempt}" -le "${max_attempts}" ]]; do
+    WATCHDOG_ATTEMPTS="${attempt}"
+
+    if [[ "${attempt}" -gt 1 ]]; then
+      printf '[watchdog] retrying %s (attempt %d/%d) after %ss\n' \
+        "${run_label}" "${attempt}" "${max_attempts}" "${retry_sleep_s}"
+      sleep "${retry_sleep_s}"
+    fi
+
+    run_with_startup_watchdog "[benchmark] loop_start" "${BENCHMARK_STARTUP_TIMEOUT_S}" -- "${@}"
+    rc=$?
+
+    if [[ "${rc}" -ne 124 ]]; then
+      return "${rc}"
+    fi
+
+    printf '[watchdog] %s attempt %d/%d timed out: %s\n' \
+      "${run_label}" "${attempt}" "${max_attempts}" "${WATCHDOG_TIMEOUT_KIND:-timeout}"
+
+    if [[ "${attempt}" -ge "${max_attempts}" ]]; then
+      return "${rc}"
+    fi
+
+    attempt=$(( attempt + 1 ))
+  done
+
   return "${rc}"
 }
 
@@ -622,7 +817,7 @@ run_one_benchmark() {
 
   snapshot_top_level_dirs > "${before_file}"
 
-  run_with_startup_watchdog "[benchmark] loop_start" "${BENCHMARK_STARTUP_TIMEOUT_S}" -- "${cmd[@]}"
+  run_with_benchmark_watchdog_retries "${pose_model} ${version} + ${classifier}" -- "${cmd[@]}"
   rc=$?
 
   snapshot_top_level_dirs > "${after_file}"
@@ -632,11 +827,19 @@ run_one_benchmark() {
       case "${WATCHDOG_TIMEOUT_KIND:-}" in
         startup_marker_timeout)
           log_failure \
-            "pose_model=${pose_model} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+            "pose_model=${pose_model} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        first_frame_timeout)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} status=first_frame_timeout timeout_s=${BENCHMARK_FIRST_FRAME_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        idle_progress_timeout)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} status=idle_progress_timeout timeout_s=${BENCHMARK_PROGRESS_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
           ;;
         total_runtime_timeout)
           log_failure \
-            "pose_model=${pose_model} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} cmd=\"${cmd_str}\""
+            "pose_model=${pose_model} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
           ;;
         *)
           log_failure \
@@ -759,7 +962,7 @@ run_one_alphapose_benchmark() {
 
   snapshot_top_level_dirs > "${before_file}"
 
-  run_with_startup_watchdog "[benchmark] loop_start" "${BENCHMARK_STARTUP_TIMEOUT_S}" -- "${cmd[@]}"
+  run_with_benchmark_watchdog_retries "${ALPHAPOSE_POSE_MODEL} ${version} + ${classifier}" -- "${cmd[@]}"
   rc=$?
 
   snapshot_top_level_dirs > "${after_file}"
@@ -769,11 +972,19 @@ run_one_alphapose_benchmark() {
       case "${WATCHDOG_TIMEOUT_KIND:-}" in
         startup_marker_timeout)
           log_failure \
-            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        first_frame_timeout)
+          log_failure \
+            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=first_frame_timeout timeout_s=${BENCHMARK_FIRST_FRAME_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        idle_progress_timeout)
+          log_failure \
+            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=idle_progress_timeout timeout_s=${BENCHMARK_PROGRESS_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
           ;;
         total_runtime_timeout)
           log_failure \
-            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} cmd=\"${cmd_str}\""
+            "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
           ;;
         *)
           log_failure \
@@ -888,7 +1099,7 @@ run_one_vitpose_benchmark() {
 
   snapshot_top_level_dirs > "${before_file}"
 
-  run_with_startup_watchdog "[benchmark] loop_start" "${BENCHMARK_STARTUP_TIMEOUT_S}" -- "${cmd[@]}"
+  run_with_benchmark_watchdog_retries "${VITPOSE_POSE_MODEL} ${version} + ${classifier}" -- "${cmd[@]}"
   rc=$?
 
   snapshot_top_level_dirs > "${after_file}"
@@ -898,11 +1109,19 @@ run_one_vitpose_benchmark() {
       case "${WATCHDOG_TIMEOUT_KIND:-}" in
         startup_marker_timeout)
           log_failure \
-            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} cmd=\"${cmd_str}\""
+            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        first_frame_timeout)
+          log_failure \
+            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=first_frame_timeout timeout_s=${BENCHMARK_FIRST_FRAME_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        idle_progress_timeout)
+          log_failure \
+            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=idle_progress_timeout timeout_s=${BENCHMARK_PROGRESS_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
           ;;
         total_runtime_timeout)
           log_failure \
-            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} cmd=\"${cmd_str}\""
+            "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
           ;;
         *)
           log_failure \
@@ -960,7 +1179,18 @@ cd "${PROJECT_DIR}" || {
 # Without this, runs using .pt base models hang indefinitely waiting for a
 # network response during model loading.
 export YOLO_OFFLINE=True
-python3 -c "from ultralytics import settings; settings.update({'sync': False})" 2>/dev/null || true
+export ULTRALYTICS_OFFLINE=True
+export ULTRALYTICS_SYNC=False
+export WANDB_DISABLED=true
+export HF_HUB_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export NO_ALBUMENTATIONS_UPDATE=1
+export GIT_PYTHON_REFRESH=quiet
+if command -v timeout >/dev/null 2>&1; then
+  timeout 30s python3 -c "from ultralytics import settings; settings.update({'sync': False})" 2>/dev/null || true
+else
+  python3 -c "from ultralytics import settings; settings.update({'sync': False})" 2>/dev/null || true
+fi
 
 # Keep existing benchmark outputs. Only ensure the directory exists.
 mkdir -p "${BENCH_DIR}"

@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
 import csv
+import faulthandler
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import threading
@@ -16,6 +18,25 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
+
+def _enable_watchdog_stack_dump() -> None:
+    try:
+        faulthandler.enable(all_threads=True)
+    except Exception:
+        pass
+
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is None:
+        return
+
+    try:
+        faulthandler.register(sigusr1, all_threads=True, chain=False)
+    except Exception:
+        pass
+
+
+_enable_watchdog_stack_dump()
+
 
 from inference.classifier_adapters import Prediction, TemporalClassifierAdapter, WindowData
 from inference.pose_pipeline import K, SKELETON, PosePipeline
