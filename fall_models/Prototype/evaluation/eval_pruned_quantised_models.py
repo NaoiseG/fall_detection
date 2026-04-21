@@ -28,6 +28,7 @@ DEFAULT_KEYPOINTS_ROOT = Path("/home/people/21376026/scratch/keypoints/pruned_ke
 DEFAULT_CLASSIFICATION_ROOT = Path("/home/people/21376026/scratch/classification_models")
 DEFAULT_OUTPUT_ROOT = Path("/home/people/21376026/scratch/evaluations/pruned_quantised")
 DEFAULT_MOTIONBERT_PKL_ROOT = Path("/home/people/21376026/scratch/MotionBERT_pkls")
+DEFAULT_MOTIONBERT_EVAL_BATCH_SIZE = 32
 
 TEST_SUBJECTS = "16-17"
 TRAIN_SUBJECTS = TEST_SUBJECTS
@@ -646,7 +647,7 @@ def build_motionbert_eval_command(run: RunSpec) -> List[str]:
         "--out-dir",
         run.run_dir.as_posix(),
         "--batch-size",
-        "64",
+        str(DEFAULT_MOTIONBERT_EVAL_BATCH_SIZE),
         "--num-workers",
         "0",
         "--device",
