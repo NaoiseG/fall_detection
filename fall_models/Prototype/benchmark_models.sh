@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Benchmark all combinations of:
-#   5 pose models × 4 versions × 3 classifiers = 60 runs
+#   5 YOLO pose models x 4 versions, plus AlphaPose and ViTPose variants,
+#   across cnnlstm, paper_stgcn and motionbert classifiers.
 #
 # Run this script from:
 #   /home/jetson/NaoiseG/fall_detection/fall_models/Prototype
@@ -66,12 +67,14 @@ VITPOSE_VERSIONS=(
 
 CLASSIFIERS=(
   "cnnlstm"
+  "paper_stgcn"
   "motionbert"
 )
 
-# Fixed classification weights for ALL runs
+# Classification checkpoint locations
 CNNLSTM_WEIGHT="../../web_app/models/classification/cnnlstm/yolo11l-pose/cnnlstm_best.pt"
 STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/stgcn_best.pt"
+PAPER_STGCN_ROOT="/home/people/21376026/scratch/final_classification_models/stgcn"
 MOTIONBERT_ROOT="../../web_app/models/classification/MotionBERT"
 MOTIONBERT_RUN_DIR="FT_MB_release_MB_ft_UPFall_xsub"
 
@@ -430,6 +433,12 @@ motionbert_weight_for_pose_model() {
   printf '%s/%s/%s/best_epoch.bin' "${MOTIONBERT_ROOT}" "${pose_model}" "${MOTIONBERT_RUN_DIR}"
 }
 
+paper_stgcn_weight_for_pose_model() {
+  local pose_model="$1"
+
+  printf '%s/%s/paper_stgcn_best.pt' "${PAPER_STGCN_ROOT}" "${pose_model}"
+}
+
 classifier_weight_for_arch() {
   local classifier="$1"
   local pose_model="${2:-yolo11l-pose}"
@@ -437,6 +446,7 @@ classifier_weight_for_arch() {
   case "$classifier" in
     cnnlstm)    printf '%s' "${CNNLSTM_WEIGHT}" ;;
     stgcn)      printf '%s' "${STGCN_WEIGHT}" ;;
+    paper_stgcn) paper_stgcn_weight_for_pose_model "${pose_model}" ;;
     motionbert) motionbert_weight_for_pose_model "${pose_model}" ;;
     *)
       return 1
