@@ -2,6 +2,7 @@
 
 # Benchmark all combinations of:
 #   5 YOLO pose models x 4 versions, plus AlphaPose and ViTPose variants,
+#   plus full-pruned YOLO pose TensorRT engines,
 #   across cnnlstm, paper_stgcn and motionbert classifiers.
 #
 # Run this script from:
@@ -21,6 +22,7 @@ BENCH_DIR="benchmarks"
 VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
 MODELS_ROOT="../../pose_models/quantised"
+FULL_PRUNED_MODELS_ROOT="../../pose_models/full_pruned"
 BENCHMARK_STARTUP_TIMEOUT_S="${BENCHMARK_STARTUP_TIMEOUT_S:-300}"
 BENCHMARK_FIRST_FRAME_TIMEOUT_S="${BENCHMARK_FIRST_FRAME_TIMEOUT_S:-240}"
 BENCHMARK_PROGRESS_TIMEOUT_S="${BENCHMARK_PROGRESS_TIMEOUT_S:-180}"
@@ -40,6 +42,25 @@ POSE_MODELS=(
 
 VERSIONS=(
   "base"
+  "fp32"
+  "fp16"
+  "int8"
+)
+
+FULL_PRUNED_MODELS=(
+  "yolo11l_pruned_80"
+  "yolo11l_pruned_90"
+  "yolo11m_pruned_80"
+  "yolo11m_pruned_90"
+  "yolo11n_pruned_80"
+  "yolo11n_pruned_90"
+  "yolo11s_pruned_80"
+  "yolo11s_pruned_90"
+  "yolo11x_pruned_70"
+  "yolo11x_pruned_80"
+)
+
+FULL_PRUNED_VERSIONS=(
   "fp32"
   "fp16"
   "int8"
@@ -81,6 +102,7 @@ MOTIONBERT_WEIGHT="${MOTIONBERT_ROOT}/yolo11l-pose/${MOTIONBERT_RUN_DIR}/best_ep
 
 TOTAL_RUNS=$(( \
   ${#POSE_MODELS[@]} * ${#VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
+  ${#FULL_PRUNED_MODELS[@]} * ${#FULL_PRUNED_VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
   ${#ALPHAPOSE_VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
   ${#VITPOSE_VERSIONS[@]} * ${#CLASSIFIERS[@]} \
 ))
@@ -416,6 +438,19 @@ pose_weight_for_version() {
   local pose_model="$1"
   local version="$2"
   local base_dir="${MODELS_ROOT}/ultralytics/${pose_model}"
+
+  if [[ "${pose_model}" == *_pruned_* ]]; then
+    case "$version" in
+      fp32|fp16|int8)
+        printf '%s/%s/weights/%s_%s.engine' \
+          "${FULL_PRUNED_MODELS_ROOT}" "${pose_model}" "${pose_model}" "${version}"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    return 0
+  fi
 
   case "$version" in
     base) printf '%s/%s.pt' "${base_dir}" "${pose_model}" ;;
@@ -1277,6 +1312,12 @@ for pose_model in "${POSE_MODELS[@]}"; do
   done
 done
 
+for pose_model in "${FULL_PRUNED_MODELS[@]}"; do
+  for version in "${FULL_PRUNED_VERSIONS[@]}"; do
+    mkdir -p "${BENCH_DIR}/${pose_model}/${version}"
+  done
+done
+
 for version in "${ALPHAPOSE_VERSIONS[@]}"; do
   mkdir -p "${BENCH_DIR}/${ALPHAPOSE_POSE_MODEL}/${version}"
 done
@@ -1292,6 +1333,25 @@ skip_count=0
 
 for pose_model in "${POSE_MODELS[@]}"; do
   for version in "${VERSIONS[@]}"; do
+    for classifier in "${CLASSIFIERS[@]}"; do
+      run_idx=$((run_idx + 1))
+
+      run_one_benchmark "${run_idx}" "${pose_model}" "${version}" "${classifier}"
+      rc=$?
+
+      if [[ "${rc}" -eq 0 ]]; then
+        success_count=$((success_count + 1))
+      elif [[ "${rc}" -eq 2 ]]; then
+        skip_count=$((skip_count + 1))
+      else
+        failure_count=$((failure_count + 1))
+      fi
+    done
+  done
+done
+
+for pose_model in "${FULL_PRUNED_MODELS[@]}"; do
+  for version in "${FULL_PRUNED_VERSIONS[@]}"; do
     for classifier in "${CLASSIFIERS[@]}"; do
       run_idx=$((run_idx + 1))
 
