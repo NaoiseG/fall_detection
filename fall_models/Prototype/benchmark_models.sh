@@ -537,36 +537,65 @@ resolve_alphapose_check_path() {
   esac
 }
 
-snapshot_top_level_dirs() {
-  # Print absolute paths of immediate subdirectories inside benchmarks, sorted.
-  # This includes both structured destination dirs and run dirs.
-  find "${BENCH_DIR}" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort
+make_profile_parent_dir() {
+  local dest_dir="$1"
+  local pending_root="${dest_dir}/.pending"
+
+  mkdir -p "${pending_root}" || return 1
+  mktemp -d "${pending_root}/run_XXXXXX"
 }
 
-find_new_run_dir() {
-  # Usage: find_new_run_dir <before_file> <after_file>
-  # Returns:
-  #   0 + prints directory path if exactly one new top-level dir appeared
-  #   1 otherwise
-  local before_file="$1"
-  local after_file="$2"
+cleanup_empty_profile_parent() {
+  local profile_parent="$1"
+  local pending_root
 
-  local diff_file
-  diff_file="$(mktemp)"
-
-  comm -13 "${before_file}" "${after_file}" > "${diff_file}"
-
-  local count
-  count="$(grep -c . "${diff_file}" || true)"
-
-  if [[ "${count}" -eq 1 ]]; then
-    cat "${diff_file}"
-    rm -f "${diff_file}"
+  if [[ -z "${profile_parent}" ]]; then
     return 0
   fi
 
-  rm -f "${diff_file}"
-  return 1
+  rmdir "${profile_parent}" 2>/dev/null || true
+  pending_root="$(dirname "${profile_parent}")"
+  rmdir "${pending_root}" 2>/dev/null || true
+}
+
+find_profile_run_dir() {
+  # Usage: find_profile_run_dir <profile_parent> <run_model_tag>
+  # Prints the newest matching benchmark run directory inside the isolated
+  # profile parent. A completed run with summary.json is preferred, but we fall
+  # back to a matching directory so failures remain diagnosable.
+  local profile_parent="$1"
+  local run_model_tag="$2"
+  local candidates=()
+  local last_idx
+
+  [[ -d "${profile_parent}" ]] || return 1
+
+  mapfile -t candidates < <(
+    find "${profile_parent}" -mindepth 1 -maxdepth 1 -type d \
+      -name "*__model_${run_model_tag}__*" \
+      -exec test -f "{}/summary.json" \; -print 2>/dev/null | sort
+  )
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    mapfile -t candidates < <(
+      find "${profile_parent}" -mindepth 1 -maxdepth 1 -type d \
+        -name "*__model_${run_model_tag}__*" -print 2>/dev/null | sort
+    )
+  fi
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    mapfile -t candidates < <(
+      find "${profile_parent}" -mindepth 1 -maxdepth 1 -type d \
+        -exec test -f "{}/summary.json" \; -print 2>/dev/null | sort
+    )
+  fi
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  last_idx=$(( ${#candidates[@]} - 1 ))
+  printf '%s\n' "${candidates[${last_idx}]}"
 }
 
 require_file_or_log() {
@@ -631,6 +660,7 @@ build_command() {
   local version="$2"
   local cls_weight="$3"
   local pose_weight="$4"
+  local profile_out_dir="$5"
   local half_flag
 
   half_flag="$(half_flag_for_version "${version}")" || return 1
@@ -651,7 +681,7 @@ build_command() {
       --warmup-frames 5 \
       --warmup-windows 0 \
       --benchmark 1 \
-      --profile-out "${BENCH_DIR}" \
+      --profile-out "${profile_out_dir}" \
       --no-display 1 \
       --out-csv "" \
       --out-pkl ""
@@ -671,7 +701,7 @@ build_command() {
       --warmup-frames 5 \
       --warmup-windows 0 \
       --benchmark 1 \
-      --profile-out "${BENCH_DIR}" \
+      --profile-out "${profile_out_dir}" \
       --no-display 1
   fi
 }
@@ -681,6 +711,7 @@ build_alphapose_command() {
   local cls_weight="$2"
   local alphapose_checkpoint="$3"
   local alphapose_detector_weights="$4"
+  local profile_out_dir="$5"
 
   if [[ "$classifier" == "motionbert" ]]; then
     printf '%s\0' \
@@ -700,7 +731,7 @@ build_alphapose_command() {
       --warmup-frames 5 \
       --warmup-windows 0 \
       --benchmark 1 \
-      --profile-out "${BENCH_DIR}" \
+      --profile-out "${profile_out_dir}" \
       --no-display 1 \
       --out-csv "" \
       --out-pkl ""
@@ -722,7 +753,7 @@ build_alphapose_command() {
       --warmup-frames 5 \
       --warmup-windows 0 \
       --benchmark 1 \
-      --profile-out "${BENCH_DIR}" \
+      --profile-out "${profile_out_dir}" \
       --no-display 1
   fi
 }
@@ -732,6 +763,7 @@ build_vitpose_command() {
   local cls_weight="$2"
   local vitpose_detector_model="$3"
   local vitpose_pose_model="$4"
+  local profile_out_dir="$5"
 
   if [[ "$classifier" == "motionbert" ]]; then
     printf '%s\0' \
@@ -748,7 +780,7 @@ build_vitpose_command() {
       --warmup-frames 5 \
       --warmup-windows 0 \
       --benchmark 1 \
-      --profile-out "${BENCH_DIR}" \
+      --profile-out "${profile_out_dir}" \
       --no-display 1 \
       --out-csv "" \
       --out-pkl ""
@@ -767,7 +799,7 @@ build_vitpose_command() {
       --warmup-frames 5 \
       --warmup-windows 0 \
       --benchmark 1 \
-      --profile-out "${BENCH_DIR}" \
+      --profile-out "${profile_out_dir}" \
       --no-display 1
   fi
 }
@@ -782,6 +814,8 @@ run_one_benchmark() {
   local cls_weight
   local dest_dir
   local cmd_str
+  local profile_parent
+  local run_model_tag
   local rc=0
 
   pose_weight="$(pose_weight_for_version "${pose_model}" "${version}")" || {
@@ -808,34 +842,45 @@ run_one_benchmark() {
     return 2
   fi
 
+  profile_parent="$(make_profile_parent_dir "${dest_dir}")" || {
+    log_failure \
+      "pose_model=${pose_model} version=${version} classifier=${classifier} status=profile_parent_create_failed dest_dir=${dest_dir}"
+    return 1
+  }
+  run_model_tag="${classifier}"
+
   local cmd=()
   while IFS= read -r -d '' token; do
     cmd+=("$token")
-  done < <(build_command "${classifier}" "${version}" "${cls_weight}" "${pose_weight}")
+  done < <(build_command "${classifier}" "${version}" "${cls_weight}" "${pose_weight}" "${profile_parent}")
 
   cmd_str="$(join_cmd "${cmd[@]}")"
 
   printf '[%d/%d] Running %s %s + %s\n' "${run_idx}" "${TOTAL_RUNS}" "${pose_model}" "${version}" "${classifier}"
 
   # Pre-flight checks
-  require_file_or_log "${VIDEO_PATH}" "${pose_model}" "${version}" "${classifier}" "video" "${cmd_str}" || return 1
-  require_file_or_log "${pose_weight}" "${pose_model}" "${version}" "${classifier}" "pose_weight" "${cmd_str}" || return 1
-  require_file_or_log "${cls_weight}" "${pose_model}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" || return 1
+  require_file_or_log "${VIDEO_PATH}" "${pose_model}" "${version}" "${classifier}" "video" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${pose_weight}" "${pose_model}" "${version}" "${classifier}" "pose_weight" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${cls_weight}" "${pose_model}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
 
   if [[ "${classifier}" == "motionbert" ]]; then
-    require_file_or_log "${MOTIONBERT_CONFIG}" "${pose_model}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" || return 1
+    require_file_or_log "${MOTIONBERT_CONFIG}" "${pose_model}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" || {
+      cleanup_empty_profile_parent "${profile_parent}"
+      return 1
+    }
   fi
-
-  local before_file after_file new_run_dir
-  before_file="$(mktemp)"
-  after_file="$(mktemp)"
-
-  snapshot_top_level_dirs > "${before_file}"
 
   run_with_benchmark_watchdog_retries "${pose_model} ${version} + ${classifier}" -- "${cmd[@]}"
   rc=$?
-
-  snapshot_top_level_dirs > "${after_file}"
 
   if [[ "${rc}" -ne 0 ]]; then
     if [[ "${rc}" -eq 124 ]]; then
@@ -865,36 +910,28 @@ run_one_benchmark() {
       log_failure \
         "pose_model=${pose_model} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
     fi
-    rm -f "${before_file}" "${after_file}"
+    cleanup_empty_profile_parent "${profile_parent}"
     return 1
   fi
 
-  if new_run_dir="$(find_new_run_dir "${before_file}" "${after_file}")"; then
-    if [[ -d "${new_run_dir}" ]]; then
-      local run_basename
-      run_basename="$(basename "${new_run_dir}")"
+  local new_run_dir run_basename
+  if new_run_dir="$(find_profile_run_dir "${profile_parent}" "${run_model_tag}")"; then
+    run_basename="$(basename "${new_run_dir}")"
 
-      if mv "${new_run_dir}" "${dest_dir}/"; then
-        log_success \
-          "pose_model=${pose_model} version=${version} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
-        rm -f "${before_file}" "${after_file}"
-        return 0
-      else
-        log_failure \
-          "pose_model=${pose_model} version=${version} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
-        rm -f "${before_file}" "${after_file}"
-        return 1
-      fi
+    if mv "${new_run_dir}" "${dest_dir}/"; then
+      log_success \
+        "pose_model=${pose_model} version=${version} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
+      cleanup_empty_profile_parent "${profile_parent}"
+      return 0
     else
       log_failure \
-        "pose_model=${pose_model} version=${version} classifier=${classifier} status=no_new_directory_found reason=diff_returned_non_directory path=${new_run_dir} cmd=\"${cmd_str}\""
-      rm -f "${before_file}" "${after_file}"
+        "pose_model=${pose_model} version=${version} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
       return 1
     fi
   else
     log_failure \
-      "pose_model=${pose_model} version=${version} classifier=${classifier} status=no_unique_new_directory_found cmd=\"${cmd_str}\""
-    rm -f "${before_file}" "${after_file}"
+      "pose_model=${pose_model} version=${version} classifier=${classifier} status=no_profile_run_directory_found profile_parent=${profile_parent} cmd=\"${cmd_str}\""
+    cleanup_empty_profile_parent "${profile_parent}"
     return 1
   fi
 }
@@ -910,6 +947,7 @@ run_one_alphapose_benchmark() {
   local dest_dir
   local cmd_str
   local rc=0
+  local profile_parent
   local detector_cfg_path
   local detector_weights_path
   local checkpoint_path
@@ -946,10 +984,16 @@ run_one_alphapose_benchmark() {
     return 2
   fi
 
+  profile_parent="$(make_profile_parent_dir "${dest_dir}")" || {
+    log_failure \
+      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=profile_parent_create_failed dest_dir=${dest_dir}"
+    return 1
+  }
+
   local cmd=()
   while IFS= read -r -d '' token; do
     cmd+=("$token")
-  done < <(build_alphapose_command "${classifier}" "${cls_weight}" "${alphapose_checkpoint}" "${alphapose_detector_weights}")
+  done < <(build_alphapose_command "${classifier}" "${cls_weight}" "${alphapose_checkpoint}" "${alphapose_detector_weights}" "${profile_parent}")
 
   cmd_str="$(join_cmd "${cmd[@]}")"
 
@@ -961,26 +1005,36 @@ run_one_alphapose_benchmark() {
   checkpoint_path="$(resolve_alphapose_check_path "${ALPHAPOSE_ROOT}" "${alphapose_checkpoint}")"
 
   # Pre-flight checks
-  require_file_or_log "${VIDEO_PATH}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "video" "${cmd_str}" || return 1
-  require_file_or_log "${cls_weight}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" || return 1
-  require_file_or_log "${detector_cfg_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_detector_cfg" "${cmd_str}" || return 1
-  require_file_or_log "${detector_weights_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_detector_weights" "${cmd_str}" || return 1
-  require_file_or_log "${checkpoint_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_fastpose_checkpoint" "${cmd_str}" || return 1
+  require_file_or_log "${VIDEO_PATH}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "video" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${cls_weight}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${detector_cfg_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_detector_cfg" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${detector_weights_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_detector_weights" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${checkpoint_path}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "alphapose_fastpose_checkpoint" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
 
   if [[ "${classifier}" == "motionbert" ]]; then
-    require_file_or_log "${MOTIONBERT_CONFIG}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" || return 1
+    require_file_or_log "${MOTIONBERT_CONFIG}" "${ALPHAPOSE_POSE_MODEL}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" || {
+      cleanup_empty_profile_parent "${profile_parent}"
+      return 1
+    }
   fi
-
-  local before_file after_file new_run_dir
-  before_file="$(mktemp)"
-  after_file="$(mktemp)"
-
-  snapshot_top_level_dirs > "${before_file}"
 
   run_with_benchmark_watchdog_retries "${ALPHAPOSE_POSE_MODEL} ${version} + ${classifier}" -- "${cmd[@]}"
   rc=$?
-
-  snapshot_top_level_dirs > "${after_file}"
 
   if [[ "${rc}" -ne 0 ]]; then
     if [[ "${rc}" -eq 124 ]]; then
@@ -1010,37 +1064,29 @@ run_one_alphapose_benchmark() {
       log_failure \
         "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
     fi
-    rm -f "${before_file}" "${after_file}"
+    cleanup_empty_profile_parent "${profile_parent}"
     return 1
   fi
 
-  if new_run_dir="$(find_new_run_dir "${before_file}" "${after_file}")"; then
-    if [[ -d "${new_run_dir}" ]]; then
-      local run_basename
-      run_basename="$(basename "${new_run_dir}")"
+  local new_run_dir run_basename
+  if new_run_dir="$(find_profile_run_dir "${profile_parent}" "${run_model_tag}")"; then
+    run_basename="$(basename "${new_run_dir}")"
 
-      if mv "${new_run_dir}" "${dest_dir}/"; then
-        log_success \
-          "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
-        rm -f "${before_file}" "${after_file}"
-        return 0
-      else
-        log_failure \
-          "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
-        rm -f "${before_file}" "${after_file}"
-        return 1
-      fi
+    if mv "${new_run_dir}" "${dest_dir}/"; then
+      log_success \
+        "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
+      cleanup_empty_profile_parent "${profile_parent}"
+      return 0
     else
       log_failure \
-        "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_new_directory_found reason=diff_returned_non_directory path=${new_run_dir} cmd=\"${cmd_str}\""
-      rm -f "${before_file}" "${after_file}"
+        "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
       return 1
     fi
   else
     log_failure \
-      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_unique_new_directory_found cmd=\"${cmd_str}\""
-    rm -f "${before_file}" "${after_file}"
-      return 1
+      "pose_model=${ALPHAPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_profile_run_directory_found profile_parent=${profile_parent} cmd=\"${cmd_str}\""
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
   fi
 }
 
@@ -1055,6 +1101,7 @@ run_one_vitpose_benchmark() {
   local dest_dir
   local cmd_str
   local rc=0
+  local profile_parent
   local run_model_tag
 
   vitpose_detector_model="$(vitpose_detector_model_for_version "${version}")" || {
@@ -1088,10 +1135,16 @@ run_one_vitpose_benchmark() {
     return 2
   fi
 
+  profile_parent="$(make_profile_parent_dir "${dest_dir}")" || {
+    log_failure \
+      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=profile_parent_create_failed dest_dir=${dest_dir}"
+    return 1
+  }
+
   local cmd=()
   while IFS= read -r -d '' token; do
     cmd+=("$token")
-  done < <(build_vitpose_command "${classifier}" "${cls_weight}" "${vitpose_detector_model}" "${vitpose_pose_model}")
+  done < <(build_vitpose_command "${classifier}" "${cls_weight}" "${vitpose_detector_model}" "${vitpose_pose_model}" "${profile_parent}")
 
   cmd_str="$(join_cmd "${cmd[@]}")"
 
@@ -1099,25 +1152,32 @@ run_one_vitpose_benchmark() {
     "${run_idx}" "${TOTAL_RUNS}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}"
 
   # Pre-flight checks
-  require_file_or_log "${VIDEO_PATH}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "video" "${cmd_str}" || return 1
-  require_file_or_log "${cls_weight}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" || return 1
-  require_model_source_or_log "${vitpose_detector_model}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "vitpose_detector_model" "${cmd_str}" || return 1
-  require_model_source_or_log "${vitpose_pose_model}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "vitpose_pose_model" "${cmd_str}" || return 1
+  require_file_or_log "${VIDEO_PATH}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "video" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${cls_weight}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_model_source_or_log "${vitpose_detector_model}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "vitpose_detector_model" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_model_source_or_log "${vitpose_pose_model}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "vitpose_pose_model" "${cmd_str}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
 
   if [[ "${classifier}" == "motionbert" ]]; then
-    require_file_or_log "${MOTIONBERT_CONFIG}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" || return 1
+    require_file_or_log "${MOTIONBERT_CONFIG}" "${VITPOSE_POSE_MODEL}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" || {
+      cleanup_empty_profile_parent "${profile_parent}"
+      return 1
+    }
   fi
-
-  local before_file after_file new_run_dir
-  before_file="$(mktemp)"
-  after_file="$(mktemp)"
-
-  snapshot_top_level_dirs > "${before_file}"
 
   run_with_benchmark_watchdog_retries "${VITPOSE_POSE_MODEL} ${version} + ${classifier}" -- "${cmd[@]}"
   rc=$?
-
-  snapshot_top_level_dirs > "${after_file}"
 
   if [[ "${rc}" -ne 0 ]]; then
     if [[ "${rc}" -eq 124 ]]; then
@@ -1147,36 +1207,28 @@ run_one_vitpose_benchmark() {
       log_failure \
         "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
     fi
-    rm -f "${before_file}" "${after_file}"
+    cleanup_empty_profile_parent "${profile_parent}"
     return 1
   fi
 
-  if new_run_dir="$(find_new_run_dir "${before_file}" "${after_file}")"; then
-    if [[ -d "${new_run_dir}" ]]; then
-      local run_basename
-      run_basename="$(basename "${new_run_dir}")"
+  local new_run_dir run_basename
+  if new_run_dir="$(find_profile_run_dir "${profile_parent}" "${run_model_tag}")"; then
+    run_basename="$(basename "${new_run_dir}")"
 
-      if mv "${new_run_dir}" "${dest_dir}/"; then
-        log_success \
-          "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
-        rm -f "${before_file}" "${after_file}"
-        return 0
-      else
-        log_failure \
-          "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
-        rm -f "${before_file}" "${after_file}"
-        return 1
-      fi
+    if mv "${new_run_dir}" "${dest_dir}/"; then
+      log_success \
+        "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
+      cleanup_empty_profile_parent "${profile_parent}"
+      return 0
     else
       log_failure \
-        "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_new_directory_found reason=diff_returned_non_directory path=${new_run_dir} cmd=\"${cmd_str}\""
-      rm -f "${before_file}" "${after_file}"
+        "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
       return 1
     fi
   else
     log_failure \
-      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_unique_new_directory_found cmd=\"${cmd_str}\""
-    rm -f "${before_file}" "${after_file}"
+      "pose_model=${VITPOSE_POSE_MODEL} version=${version} classifier=${classifier} status=no_profile_run_directory_found profile_parent=${profile_parent} cmd=\"${cmd_str}\""
+    cleanup_empty_profile_parent "${profile_parent}"
     return 1
   fi
 }

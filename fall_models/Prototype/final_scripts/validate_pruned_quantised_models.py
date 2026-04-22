@@ -463,9 +463,10 @@ def evaluate_engine(engine_path: Path, data_yaml: Path, args: argparse.Namespace
     }
 
     try:
-        model = YOLO(str(engine_path))
+        model = YOLO(str(engine_path), task="pose")
         val_output = model.val(
             data=str(data_yaml),
+            task="pose",
             split=args.split,
             batch=args.batch,
             imgsz=args.imgsz,
