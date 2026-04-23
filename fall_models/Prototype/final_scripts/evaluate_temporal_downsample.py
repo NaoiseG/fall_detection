@@ -14,9 +14,9 @@ Two summary JSON files are written to <output-root>:
   results_interpolate.json
   results_shrink.json
 
-Completed runs are detected by the presence of metrics_summary.csv (for
-cnnlstm/paper_stgcn) or a top1 entry in the MotionBERT summary JSON, and
-skipped automatically unless --force is passed.
+Completed runs are detected by the presence of the evaluator's
+metrics_summary.csv, including inside timestamped output folders, and skipped
+automatically unless --force is passed.
 
 Usage (from Prototype/):
   python -m final_scripts.evaluate_temporal_downsample [options]
@@ -111,6 +111,58 @@ def read_log_tail(path: Path, max_lines: int = 40) -> str:
             return "".join(f.readlines()[-max_lines:]).strip()
     except OSError:
         return ""
+
+
+def latest_child_metric_csv(
+    run_dir: Path,
+    *,
+    marker: str,
+    metric_relpath: Sequence[str],
+) -> Optional[Path]:
+    """Return the newest timestamped child metrics CSV matching marker."""
+    if not run_dir.is_dir():
+        return None
+    candidates: List[Path] = []
+    try:
+        for child in run_dir.iterdir():
+            if not child.is_dir() or marker not in child.name:
+                continue
+            csv_path = child.joinpath(*metric_relpath)
+            if csv_path.is_file():
+                candidates.append(csv_path)
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda p: p.relative_to(run_dir).parts[0])[-1]
+
+
+def find_eval_models_metrics_csv(run_dir: Path) -> Optional[Path]:
+    timestamped = latest_child_metric_csv(
+        run_dir,
+        marker="__models_",
+        metric_relpath=(SUMMARY_VARIANT_NAME, "metrics_summary.csv"),
+    )
+    if timestamped is not None:
+        return timestamped
+
+    # Backward-compatible path for non-timestamped eval_models outputs.
+    direct = run_dir / SUMMARY_VARIANT_NAME / "metrics_summary.csv"
+    return direct if direct.is_file() else None
+
+
+def find_motionbert_metrics_csv(run_dir: Path) -> Optional[Path]:
+    timestamped = latest_child_metric_csv(
+        run_dir,
+        marker="__motionbert_action__",
+        metric_relpath=("metrics_summary.csv",),
+    )
+    if timestamped is not None:
+        return timestamped
+
+    # Backward-compatible path for non-timestamped MotionBERT outputs.
+    direct = run_dir / "metrics_summary.csv"
+    return direct if direct.is_file() else None
 
 
 def run_subprocess(cmd: Sequence[str], *, cwd: Path, stdout_path: Path, stderr_path: Path) -> int:
@@ -227,15 +279,20 @@ def build_run_matrix(
 # ---------------------------------------------------------------------------
 
 def has_eval_models_output(run_dir: Path) -> bool:
-    variant_dir = run_dir / SUMMARY_VARIANT_NAME
-    return (variant_dir / "metrics_summary.csv").is_file()
+    return find_eval_models_metrics_csv(run_dir) is not None
 
 
 def has_motionbert_output(run_dir: Path) -> bool:
+    if find_motionbert_metrics_csv(run_dir) is not None:
+        return True
+
     status = read_json(run_dir / "run_status.json")
     if not isinstance(status, dict):
         return False
-    return str(status.get("status", "")) == "completed" and status.get("return_code") == 0
+    if str(status.get("status", "")) != "completed" or status.get("return_code") != 0:
+        return False
+    metrics = status.get("metrics", {})
+    return isinstance(metrics, dict) and any(v is not None for v in metrics.values())
 
 
 def is_completed(run: RunSpec) -> bool:
@@ -346,40 +403,112 @@ def build_motionbert_eval_command(
 # ---------------------------------------------------------------------------
 
 def extract_eval_models_metrics(run: RunSpec) -> Dict[str, Any]:
-    variant_dir = run.run_dir / SUMMARY_VARIANT_NAME
-    csv_path = variant_dir / "metrics_summary.csv"
-    if not csv_path.is_file():
+    csv_path = find_eval_models_metrics_csv(run.run_dir)
+    if csv_path is None:
         return {}
     try:
         import csv as _csv
         with csv_path.open(newline="", encoding="utf-8") as f:
             reader = _csv.DictReader(f)
             rows = list(reader)
+        if not rows:
+            return {}
+
+        model_rows = [
+            r for r in rows
+            if str(r.get("model", "")).strip().lower() == run.model.lower()
+        ]
+        if model_rows:
+            rows = model_rows
+
         # prefer combined split row; fall back to first row
         combined = [r for r in rows if str(r.get("eval_split", "")).strip().lower() == "combined"]
         row = combined[0] if combined else (rows[0] if rows else {})
+        row_lc = {str(k).strip().lower(): v for k, v in row.items()}
 
-        def _f(key: str) -> Optional[float]:
-            for k in row:
-                if k.strip().lower() == key:
-                    try:
-                        return float(row[k])
-                    except (ValueError, TypeError):
-                        return None
+        def _f(*keys: str) -> Optional[float]:
+            for key in keys:
+                value = row_lc.get(key.strip().lower())
+                try:
+                    if value in (None, ""):
+                        continue
+                    return float(value)
+                except (ValueError, TypeError):
+                    continue
             return None
 
+        def _accuracy_from_per_class() -> Optional[float]:
+            correct = 0.0
+            total = 0.0
+            for key_lc, support_raw in row_lc.items():
+                if not key_lc.startswith("support_"):
+                    continue
+                suffix = key_lc[len("support_"):]
+                recall_raw = row_lc.get(f"recall_{suffix}")
+                try:
+                    support = float(support_raw)
+                    recall = float(recall_raw)
+                except (ValueError, TypeError):
+                    continue
+                correct += support * recall
+                total += support
+            return (correct / total) if total > 0 else None
+
+        accuracy = _f("accuracy", "acc")
+        if accuracy is None:
+            accuracy = _accuracy_from_per_class()
+
         return {
-            "accuracy": _f("accuracy"),
-            "recall": _f("recall"),
-            "precision": _f("precision"),
+            "accuracy": accuracy,
+            "recall": _f("recall", "binary_sensitivity_avg", "bin_recall_avg"),
+            "precision": _f("precision", "binary_precision_avg", "bin_precision_avg"),
             "macro_f1": _f("macro_f1"),
-            "fall_f1": _f("fall_f1"),
+            "fall_f1": _f("fall_f1", "binary_f1_fall", "bin_f1_fall"),
+            "fall_recall": _f("fall_recall", "binary_sensitivity_fall", "bin_recall_fall"),
+            "fall_precision": _f("fall_precision", "binary_precision_fall", "bin_precision_fall"),
+            "metrics_csv": csv_path.as_posix(),
         }
     except Exception:
         return {}
 
 
 def extract_motionbert_metrics(run: RunSpec) -> Dict[str, Any]:
+    csv_path = find_motionbert_metrics_csv(run.run_dir)
+    if csv_path is not None:
+        try:
+            import csv as _csv
+            with csv_path.open(newline="", encoding="utf-8") as f:
+                reader = _csv.DictReader(f)
+                rows = list(reader)
+            if rows:
+                combined = [r for r in rows if str(r.get("eval_split", "")).strip().lower() == "combined"]
+                row = combined[0] if combined else rows[0]
+                row_lc = {str(k).strip().lower(): v for k, v in row.items()}
+
+                def _f(*keys: str) -> Optional[float]:
+                    for key in keys:
+                        value = row_lc.get(key.strip().lower())
+                        try:
+                            if value in (None, ""):
+                                continue
+                            return float(value)
+                        except (ValueError, TypeError):
+                            continue
+                    return None
+
+                return {
+                    "accuracy": _f("acc_top1", "top1", "accuracy"),
+                    "balanced_acc": _f("balanced_acc"),
+                    "macro_f1": _f("macro_f1"),
+                    "fall_fbeta": _f("fall_fbeta"),
+                    "fall_recall": _f("fall_recall", "bin_recall_fall"),
+                    "fall_f1": _f("bin_f1_fall", "fall_f1"),
+                    "metrics_csv": csv_path.as_posix(),
+                }
+        except Exception:
+            pass
+
+    # Backward-compatible fallback for status files written by newer runs.
     status = read_json(run.run_dir / "run_status.json")
     if not isinstance(status, dict):
         return {}
@@ -387,11 +516,13 @@ def extract_motionbert_metrics(run: RunSpec) -> Dict[str, Any]:
     if not isinstance(m, dict):
         return {}
     return {
-        "accuracy": m.get("top1"),
+        "accuracy": m.get("accuracy", m.get("top1")),
         "balanced_acc": m.get("balanced_acc"),
         "macro_f1": m.get("macro_f1"),
         "fall_fbeta": m.get("fall_fbeta"),
         "fall_recall": m.get("fall_recall"),
+        "fall_f1": m.get("fall_f1"),
+        "metrics_csv": m.get("metrics_csv"),
     }
 
 
@@ -539,11 +670,14 @@ def write_summary_jsons(
     results: Dict[str, Dict[str, Any]],
 ) -> None:
     for mode in MODES:
-        mode_entries = [
-            results.get(r.run_id, build_result_entry(r, "pending"))
-            for r in runs
-            if r.mode == mode
-        ]
+        mode_entries: List[Dict[str, Any]] = []
+        for r in runs:
+            if r.mode != mode:
+                continue
+            entry = results.get(r.run_id)
+            if entry is None:
+                entry = build_result_entry(r, "pending")
+            mode_entries.append(entry)
         payload = {
             "mode": mode,
             "generated_at": now_iso(),
@@ -646,8 +780,15 @@ def main() -> None:
         if run.k == 1 and run.mode == "shrink":
             # Results are identical to interpolate k=1; copy from there if available
             interp_run_id = f"{run.model}__k1__interpolate"
-            if interp_run_id in results and results[interp_run_id]["status"] == "completed":
-                entry = dict(results[interp_run_id])
+            interp_entry = results.get(interp_run_id)
+            if interp_entry is None:
+                interp_run = next((r for r in all_runs if r.run_id == interp_run_id), None)
+                if interp_run is not None and is_completed(interp_run):
+                    interp_entry = build_result_entry(interp_run, "completed")
+                    results[interp_run_id] = interp_entry
+
+            if interp_entry is not None and interp_entry.get("status") == "completed":
+                entry = dict(interp_entry)
                 entry["run_id"] = run.run_id
                 entry["mode"] = "shrink"
                 entry["note"] = "k=1: identical to interpolate, result copied"
@@ -688,7 +829,8 @@ def main() -> None:
     # Fill any runs not yet in results (e.g. filtered out but needed for summaries)
     for run in all_runs:
         if run.run_id not in results:
-            results[run.run_id] = build_result_entry(run, "pending")
+            status = "completed" if is_completed(run) else "pending"
+            results[run.run_id] = build_result_entry(run, status)
 
     write_summary_jsons(output_root, all_runs, results)
 
