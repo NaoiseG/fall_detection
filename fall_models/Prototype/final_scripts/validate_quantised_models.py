@@ -865,6 +865,7 @@ def create_alphapose_runner(target: dict[str, Any], args: argparse.Namespace):
         missing_str = ", ".join(missing)
         raise FileNotFoundError(f"Missing AlphaPose engine file(s): {missing_str}")
 
+    detector_max_det = min(32, max(1, int(args.max_det) * 2))
     cfg = AlphaPoseExportConfig(
         alphapose_root=str(args.alphapose_root.expanduser().resolve()),
         cfg_path=str(args.alphapose_cfg),
@@ -873,6 +874,7 @@ def create_alphapose_runner(target: dict[str, Any], args: argparse.Namespace):
         detector_weights=str(detector_path),
         conf_thres=float(args.conf),
         nms_thres=float(args.iou),
+        detector_max_det=detector_max_det,
         max_people=max(1, int(args.max_det)),
         render_video=False,
         save_csv=False,

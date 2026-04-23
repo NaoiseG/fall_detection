@@ -32,6 +32,7 @@ class AlphaPoseExportConfig:
     conf_thres: float = 0.1
     conf_min: float = 0.75
     nms_thres: float = 0.6
+    detector_max_det: Optional[int] = None
     fps: int = 30
     max_people: int = 1
     num_kpts: int = 17
@@ -1464,6 +1465,15 @@ class AlphaPoseRunner:
             ids = ids[dets[:, 0] == 0]
             if boxes.nelement() == 0:
                 return {"im_res": {"imgname": image_name, "result": []}, "people": []}
+
+            detector_max_det = getattr(self.config, "detector_max_det", None)
+            if detector_max_det is not None:
+                detector_max_det = max(1, int(detector_max_det))
+                if boxes.shape[0] > detector_max_det:
+                    order = torch.argsort(scores.view(-1), descending=True)[:detector_max_det]
+                    boxes = boxes[order]
+                    scores = scores[order]
+                    ids = ids[order]
 
             inps = torch.zeros(boxes.size(0), 3, *self.cfg.DATA_PRESET.IMAGE_SIZE)
             cropped_boxes = torch.zeros(boxes.size(0), 4)
