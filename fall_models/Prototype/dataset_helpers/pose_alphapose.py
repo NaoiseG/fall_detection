@@ -271,6 +271,51 @@ class TensorRTEngineRunner:
             self.static_batch_size = int(self.input_shape_template[0])
         else:
             self.static_batch_size = None
+        self.max_batch_size: Optional[int] = self._infer_max_batch_size()
+
+    def _infer_max_batch_size(self) -> Optional[int]:
+        if self.static_batch_size is not None and self.static_batch_size > 0:
+            return int(self.static_batch_size)
+
+        max_batch: Optional[int] = None
+
+        if self._name_api and hasattr(self.engine, "get_tensor_profile_shape"):
+            num_profiles = int(getattr(self.engine, "num_optimization_profiles", 1) or 1)
+            for profile_idx in range(max(1, num_profiles)):
+                try:
+                    profile_shapes = self.engine.get_tensor_profile_shape(self.input_name, int(profile_idx))
+                except Exception:
+                    continue
+                if not profile_shapes or len(profile_shapes) < 3:
+                    continue
+                try:
+                    max_shape = tuple(int(v) for v in profile_shapes[2])
+                except Exception:
+                    continue
+                if max_shape and max_shape[0] > 0:
+                    candidate = int(max_shape[0])
+                    max_batch = candidate if max_batch is None else max(max_batch, candidate)
+            return max_batch
+
+        if self.input_index is not None and hasattr(self.engine, "get_profile_shape"):
+            num_profiles = int(getattr(self.engine, "num_optimization_profiles", 1) or 1)
+            for profile_idx in range(max(1, num_profiles)):
+                try:
+                    profile_shapes = self.engine.get_profile_shape(int(profile_idx), int(self.input_index))
+                except Exception:
+                    continue
+                if not profile_shapes or len(profile_shapes) < 3:
+                    continue
+                try:
+                    max_shape = tuple(int(v) for v in profile_shapes[2])
+                except Exception:
+                    continue
+                if max_shape and max_shape[0] > 0:
+                    candidate = int(max_shape[0])
+                    max_batch = candidate if max_batch is None else max(max_batch, candidate)
+            return max_batch
+
+        return None
 
     def _trt_dtype_to_numpy(self, trt_dtype) -> np.dtype:
         try:
@@ -418,8 +463,11 @@ def _infer_engine_outputs_batched(engine_runner: TensorRTEngineRunner, x_batch: 
         raise ValueError("TensorRT inference batch must have at least one dimension.")
 
     static_bs = engine_runner.static_batch_size
+    max_bs = engine_runner.max_batch_size
     batch_size = int(x_np.shape[0])
-    if static_bs is None or static_bs <= 0 or batch_size == static_bs:
+    chunk_bs = static_bs if static_bs is not None and static_bs > 0 else max_bs
+
+    if chunk_bs is None or chunk_bs <= 0 or batch_size <= int(chunk_bs):
         try:
             return engine_runner.infer(x_np)
         except RuntimeError as exc:
@@ -454,13 +502,15 @@ def _infer_engine_outputs_batched(engine_runner: TensorRTEngineRunner, x_batch: 
     out_parts: Optional[List[List[np.ndarray]]] = None
     start = 0
     while start < batch_size:
-        end = min(start + int(static_bs), batch_size)
+        end = min(start + int(chunk_bs), batch_size)
         chunk = x_np[start:end]
         chunk_len = int(end - start)
-        if chunk_len < int(static_bs):
+        padded_input_bs = int(chunk.shape[0])
+        if static_bs is not None and static_bs > 0 and chunk_len < int(static_bs):
             pad_shape = (int(static_bs) - chunk_len, *chunk.shape[1:])
             pad = np.zeros(pad_shape, dtype=chunk.dtype)
             chunk = np.concatenate((chunk, pad), axis=0)
+            padded_input_bs = int(chunk.shape[0])
 
         chunk_outputs = engine_runner.infer(chunk)
         if out_parts is None:
@@ -470,7 +520,7 @@ def _infer_engine_outputs_batched(engine_runner: TensorRTEngineRunner, x_batch: 
 
         for out_idx, arr in enumerate(chunk_outputs):
             arr_np = np.asarray(arr)
-            if arr_np.ndim >= 1 and arr_np.shape[0] == int(static_bs):
+            if arr_np.ndim >= 1 and arr_np.shape[0] == padded_input_bs:
                 arr_np = arr_np[:chunk_len]
             elif arr_np.ndim == 0 and chunk_len != 1:
                 raise RuntimeError(
