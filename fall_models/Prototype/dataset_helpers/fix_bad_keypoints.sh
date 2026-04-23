@@ -40,6 +40,7 @@ Backend selection (default: yolo):
 
 YOLO backend arguments (required when --pose-backend yolo):
   --model-path PATH      YOLO pose model weights (.pt or .engine).
+  --imgsz SIZE           Optional YOLO inference image size passed to regeneration.
 
 AlphaPose backend arguments (required when --pose-backend alphapose):
   --alphapose-root PATH      AlphaPose repo root directory.
@@ -57,6 +58,10 @@ Optional arguments:
                          Defaults to subjects auto-detected from --keypoints-root,
                          then --upfall-root.
   --lock-settings NAME   Lock preset for regeneration. Defaults to strict_lock.
+  --camera1-lock-settings NAME
+                         Camera1 lock preset override. Defaults to --lock-settings.
+  --camera2-lock-settings NAME
+                         Camera2 lock preset override. Defaults to --lock-settings.
   --report-dir PATH      Directory for intermediate CSV reports.
   -h, --help             Show this help text.
 
@@ -194,6 +199,7 @@ UPFALL_ROOT=""
 POSE_BACKEND="${POSE_BACKEND:-yolo}"
 # yolo
 MODEL_PATH=""
+IMGSZ="${IMGSZ:-}"
 # alphapose
 ALPHAPOSE_ROOT=""
 FASTPOSE_WEIGHTS=""
@@ -205,6 +211,8 @@ DETECTOR_MODEL=""
 POSE_MODEL=""
 SUBJECTS="${SUBJECTS:-}"
 LOCK_SETTINGS="${LOCK_SETTINGS:-strict_lock}"
+CAMERA1_LOCK_SETTINGS="${CAMERA1_LOCK_SETTINGS:-}"
+CAMERA2_LOCK_SETTINGS="${CAMERA2_LOCK_SETTINGS:-}"
 REPORT_DIR="${REPORT_DIR:-}"
 
 while [[ $# -gt 0 ]]; do
@@ -227,6 +235,11 @@ while [[ $# -gt 0 ]]; do
     --model-path)
       require_value "$1" "${2:-}"
       MODEL_PATH="$2"
+      shift 2
+      ;;
+    --imgsz)
+      require_value "$1" "${2:-}"
+      IMGSZ="$2"
       shift 2
       ;;
     --alphapose-root)
@@ -272,6 +285,16 @@ while [[ $# -gt 0 ]]; do
     --lock-settings)
       require_value "$1" "${2:-}"
       LOCK_SETTINGS="$2"
+      shift 2
+      ;;
+    --camera1-lock-settings)
+      require_value "$1" "${2:-}"
+      CAMERA1_LOCK_SETTINGS="$2"
+      shift 2
+      ;;
+    --camera2-lock-settings)
+      require_value "$1" "${2:-}"
+      CAMERA2_LOCK_SETTINGS="$2"
       shift 2
       ;;
     --report-dir)
@@ -323,6 +346,12 @@ case "$POSE_BACKEND" in
 esac
 
 validate_lock_settings "$LOCK_SETTINGS"
+if [[ -n "$CAMERA1_LOCK_SETTINGS" ]]; then
+  validate_lock_settings "$CAMERA1_LOCK_SETTINGS"
+fi
+if [[ -n "$CAMERA2_LOCK_SETTINGS" ]]; then
+  validate_lock_settings "$CAMERA2_LOCK_SETTINGS"
+fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROTOTYPE_DIR="${PROTOTYPE_DIR:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
@@ -392,32 +421,56 @@ case "$POSE_BACKEND" in
 esac
 log "Subjects:       ${SUBJECTS} (${SUBJECT_SOURCE})"
 log "Lock settings:  ${LOCK_SETTINGS}"
+log "Camera1 lock:   ${CAMERA1_LOCK_SETTINGS:-$LOCK_SETTINGS}"
+log "Camera2 lock:   ${CAMERA2_LOCK_SETTINGS:-$LOCK_SETTINGS}"
+if [[ "$POSE_BACKEND" == "yolo" ]]; then
+  log "YOLO imgsz:     ${IMGSZ:-<default>}"
+fi
 log "Report dir:     ${REPORT_DIR}"
+
+lock_settings_for_camera() {
+  case "$1" in
+    1)
+      printf '%s' "${CAMERA1_LOCK_SETTINGS:-$LOCK_SETTINGS}"
+      ;;
+    2)
+      printf '%s' "${CAMERA2_LOCK_SETTINGS:-$LOCK_SETTINGS}"
+      ;;
+    *)
+      printf '%s' "$LOCK_SETTINGS"
+      ;;
+  esac
+}
 
 # Build the base regeneration command for the selected backend.
 # Usage: regen_cmd <camera> [extra-flags...]
 regen_cmd() {
   local camera="$1"
   shift
+  local regen_lock_settings
   local -a cmd
+  regen_lock_settings="$(lock_settings_for_camera "$camera")"
   case "$POSE_BACKEND" in
     yolo)
       cmd=(
         "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files
         --subjects "$SUBJECTS"
         --camera "$camera"
-        --lock-settings "$LOCK_SETTINGS"
+        --lock-settings "$regen_lock_settings"
         --upfall-root "$UPFALL_ROOT"
         --output-root "$KEYPOINTS_ROOT"
         --model-path "$MODEL_PATH"
       )
+      if [[ -n "$IMGSZ" ]]; then
+        cmd+=(--imgsz "$IMGSZ")
+      fi
       ;;
     alphapose)
       cmd=(
         "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files_alphapose
         --subjects "$SUBJECTS"
         --camera "$camera"
-        --lock-settings "$LOCK_SETTINGS"
+        --lock-settings "$regen_lock_settings"
         --upfall-root "$UPFALL_ROOT"
         --output-root "$KEYPOINTS_ROOT"
         --alphapose-root "$ALPHAPOSE_ROOT"
@@ -436,7 +489,7 @@ regen_cmd() {
         "$PYTHON_BIN" -m dataset_helpers.get_keypoints_files_ViTpose
         --subjects "$SUBJECTS"
         --camera "$camera"
-        --lock-settings "$LOCK_SETTINGS"
+        --lock-settings "$regen_lock_settings"
         --upfall-root "$UPFALL_ROOT"
         --output-root "$KEYPOINTS_ROOT"
       )
