@@ -3,6 +3,7 @@
 # Benchmark all combinations of:
 #   5 YOLO pose models x 4 versions, plus AlphaPose and ViTPose variants,
 #   plus full-pruned YOLO pose TensorRT engines,
+#   plus targeted YOLO sweeps for selected imgsz=576 and k=2 variants,
 #   across cnnlstm, paper_stgcn and motionbert classifiers.
 #
 # Run this script from:
@@ -23,6 +24,7 @@ VIDEO_PATH="../../Datasets/test_vids/activity_all.mp4"
 MOTIONBERT_CONFIG="../../web_app/models/classification/MotionBERT/configs/action/MB_ft_UPFall_xsub.yaml"
 MODELS_ROOT="../../pose_models/quantised"
 FULL_PRUNED_MODELS_ROOT="../../pose_models/full_pruned"
+IMG_DOWNSIZED_MODELS_ROOT="../../pose_models/img_downsized"
 BENCHMARK_STARTUP_TIMEOUT_S="${BENCHMARK_STARTUP_TIMEOUT_S:-300}"
 BENCHMARK_FIRST_FRAME_TIMEOUT_S="${BENCHMARK_FIRST_FRAME_TIMEOUT_S:-240}"
 BENCHMARK_PROGRESS_TIMEOUT_S="${BENCHMARK_PROGRESS_TIMEOUT_S:-180}"
@@ -31,6 +33,9 @@ BENCHMARK_MAX_ATTEMPTS="${BENCHMARK_MAX_ATTEMPTS:-3}"
 BENCHMARK_RETRY_SLEEP_S="${BENCHMARK_RETRY_SLEEP_S:-10}"
 TEMPORAL_WINDOW_SIZE=64
 TEMPORAL_WINDOW_STRIDE=48
+TARGETED_YOLO_SWEEP_BENCH_DIR="${BENCH_DIR}/targeted_yolo_sweeps"
+TARGETED_YOLO_SWEEP_IMGSZ=576
+TARGETED_YOLO_SWEEP_FRAME_STEP=2
 
 POSE_MODELS=(
   "yolo11n-pose"
@@ -92,6 +97,18 @@ CLASSIFIERS=(
   "motionbert"
 )
 
+TARGETED_YOLO_SWEEP_TARGETS=(
+  "yolo11x-pose|fp32"
+  "yolo11x-pose|fp16"
+  "yolo11l-pose|fp32"
+  "yolo11m-pose|fp32"
+)
+
+TARGETED_YOLO_SWEEP_KINDS=(
+  "imgsz_576"
+  "k_2"
+)
+
 # Classification checkpoint locations
 CNNLSTM_WEIGHT="../../web_app/models/classification/cnnlstm/yolo11l-pose/cnnlstm_best.pt"
 STGCN_WEIGHT="../../web_app/models/classification/stgcn/yolo11l-pose/stgcn_best.pt"
@@ -102,6 +119,7 @@ MOTIONBERT_WEIGHT="${MOTIONBERT_ROOT}/yolo11l-pose/${MOTIONBERT_RUN_DIR}/best_ep
 
 TOTAL_RUNS=$(( \
   ${#POSE_MODELS[@]} * ${#VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
+  ${#TARGETED_YOLO_SWEEP_TARGETS[@]} * ${#TARGETED_YOLO_SWEEP_KINDS[@]} * ${#CLASSIFIERS[@]} + \
   ${#FULL_PRUNED_MODELS[@]} * ${#FULL_PRUNED_VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
   ${#ALPHAPOSE_VERSIONS[@]} * ${#CLASSIFIERS[@]} + \
   ${#VITPOSE_VERSIONS[@]} * ${#CLASSIFIERS[@]} \
@@ -463,6 +481,33 @@ pose_weight_for_version() {
   esac
 }
 
+targeted_yolo_sweep_dest_dir() {
+  local pose_model="$1"
+  local version="$2"
+  local sweep_kind="$3"
+
+  printf '%s/%s/%s/%s' "${TARGETED_YOLO_SWEEP_BENCH_DIR}" "${pose_model}" "${version}" "${sweep_kind}"
+}
+
+pose_weight_for_targeted_yolo_sweep() {
+  local pose_model="$1"
+  local version="$2"
+  local sweep_kind="$3"
+
+  case "$sweep_kind" in
+    imgsz_576)
+      printf '%s/%s_imgsz%s_%s.engine' \
+        "${IMG_DOWNSIZED_MODELS_ROOT}" "${pose_model}" "${TARGETED_YOLO_SWEEP_IMGSZ}" "${version}"
+      ;;
+    k_2)
+      pose_weight_for_version "${pose_model}" "${version}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 motionbert_weight_for_pose_model() {
   printf '%s' "${MOTIONBERT_WEIGHT}"
 }
@@ -640,10 +685,15 @@ require_file_or_log() {
   local classifier="$4"
   local description="$5"
   local cmd_str="$6"
+  local extra_context="${7:-}"
+
+  if [[ -n "${extra_context}" ]]; then
+    extra_context=" ${extra_context}"
+  fi
 
   if [[ ! -f "$path" ]]; then
     log_failure \
-      "pose_model=${pose_model} version=${version} classifier=${classifier} status=missing_file missing=${description} path=${path} cmd=\"${cmd_str}\""
+      "pose_model=${pose_model} version=${version} classifier=${classifier}${extra_context} status=missing_file missing=${description} path=${path} cmd=\"${cmd_str}\""
     return 1
   fi
 
@@ -657,6 +707,11 @@ require_model_source_or_log() {
   local classifier="$4"
   local description="$5"
   local cmd_str="$6"
+  local extra_context="${7:-}"
+
+  if [[ -n "${extra_context}" ]]; then
+    extra_context=" ${extra_context}"
+  fi
 
   if [[ -e "$source" ]]; then
     return 0
@@ -665,18 +720,27 @@ require_model_source_or_log() {
   case "$source" in
     *.engine|*.pt|*.pth|*.onnx|*.bin|*.ckpt|/*|./*|../*)
       log_failure \
-        "pose_model=${pose_model} version=${version} classifier=${classifier} status=missing_source missing=${description} path=${source} cmd=\"${cmd_str}\""
+        "pose_model=${pose_model} version=${version} classifier=${classifier}${extra_context} status=missing_source missing=${description} path=${source} cmd=\"${cmd_str}\""
       return 1
       ;;
   esac
 
   if [[ -z "$source" ]]; then
     log_failure \
-      "pose_model=${pose_model} version=${version} classifier=${classifier} status=missing_source missing=${description} path=${source} cmd=\"${cmd_str}\""
+      "pose_model=${pose_model} version=${version} classifier=${classifier}${extra_context} status=missing_source missing=${description} path=${source} cmd=\"${cmd_str}\""
     return 1
   fi
 
   return 0
+}
+
+combination_already_done_in_dir() {
+  local dest_dir="$1"
+  local run_model_tag="$2"
+
+  [[ -d "${dest_dir}" ]] || return 1
+
+  find "${dest_dir}" -mindepth 1 -maxdepth 1 -type d -name "*__model_${run_model_tag}__*" -print -quit 2>/dev/null | grep -q .
 }
 
 combination_already_done() {
@@ -685,9 +749,7 @@ combination_already_done() {
   local run_model_tag="$3"
   local dest_dir="${BENCH_DIR}/${pose_model}/${version}"
 
-  [[ -d "${dest_dir}" ]] || return 1
-
-  find "${dest_dir}" -mindepth 1 -maxdepth 1 -type d -name "*__model_${run_model_tag}__*" -print -quit 2>/dev/null | grep -q .
+  combination_already_done_in_dir "${dest_dir}" "${run_model_tag}"
 }
 
 build_command() {
@@ -696,49 +758,76 @@ build_command() {
   local cls_weight="$3"
   local pose_weight="$4"
   local profile_out_dir="$5"
+  local imgsz_override="${6:-}"
+  local frame_step="${7:-1}"
   local half_flag
+  local cmd=()
 
   half_flag="$(half_flag_for_version "${version}")" || return 1
 
   if [[ "$classifier" == "motionbert" ]]; then
-    printf '%s\0' \
-      python -m inference.infer_motionbert_video \
-      --video "${VIDEO_PATH}" \
-      --model "${cls_weight}" \
-      --config "${MOTIONBERT_CONFIG}" \
-      --yolo-weights "${pose_weight}" \
-      --device cuda \
-      --half "${half_flag}" \
-      --win-len "${TEMPORAL_WINDOW_SIZE}" \
-      --win-step "${TEMPORAL_WINDOW_STRIDE}" \
-      --max-people 10 \
-      --max-det 10 \
-      --warmup-frames 5 \
-      --warmup-windows 0 \
-      --benchmark 1 \
-      --profile-out "${profile_out_dir}" \
-      --no-display 1 \
-      --out-csv "" \
-      --out-pkl ""
-  else
-    printf '%s\0' \
-      python -m inference.inference_on_video \
-      --video "${VIDEO_PATH}" \
-      --model "${cls_weight}" \
-      --yolo-weights "${pose_weight}" \
-      --arch "${classifier}" \
-      --device cuda \
-      --half "${half_flag}" \
-      --T "${TEMPORAL_WINDOW_SIZE}" \
-      --stride "${TEMPORAL_WINDOW_STRIDE}" \
-      --max-people 10 \
-      --max-det 10 \
-      --warmup-frames 5 \
-      --warmup-windows 0 \
-      --benchmark 1 \
-      --profile-out "${profile_out_dir}" \
+    cmd=(
+      python -m inference.infer_motionbert_video
+      --video "${VIDEO_PATH}"
+      --model "${cls_weight}"
+      --config "${MOTIONBERT_CONFIG}"
+      --yolo-weights "${pose_weight}"
+      --device cuda
+      --half "${half_flag}"
+    )
+
+    if [[ -n "${imgsz_override}" ]]; then
+      cmd+=(--imgsz "${imgsz_override}")
+    fi
+    if [[ "${frame_step}" -ne 1 ]]; then
+      cmd+=(--frame-step "${frame_step}")
+    fi
+
+    cmd+=(
+      --win-len "${TEMPORAL_WINDOW_SIZE}"
+      --win-step "${TEMPORAL_WINDOW_STRIDE}"
+      --max-people 10
+      --max-det 10
+      --warmup-frames 5
+      --warmup-windows 0
+      --benchmark 1
+      --profile-out "${profile_out_dir}"
       --no-display 1
+      --out-csv ""
+      --out-pkl ""
+    )
+  else
+    cmd=(
+      python -m inference.inference_on_video
+      --video "${VIDEO_PATH}"
+      --model "${cls_weight}"
+      --yolo-weights "${pose_weight}"
+    )
+
+    if [[ -n "${imgsz_override}" ]]; then
+      cmd+=(--imgsz "${imgsz_override}")
+    fi
+    if [[ "${frame_step}" -ne 1 ]]; then
+      cmd+=(--frame-step "${frame_step}")
+    fi
+
+    cmd+=(
+      --arch "${classifier}"
+      --device cuda
+      --half "${half_flag}"
+      --T "${TEMPORAL_WINDOW_SIZE}"
+      --stride "${TEMPORAL_WINDOW_STRIDE}"
+      --max-people 10
+      --max-det 10
+      --warmup-frames 5
+      --warmup-windows 0
+      --benchmark 1
+      --profile-out "${profile_out_dir}"
+      --no-display 1
+    )
   fi
+
+  printf '%s\0' "${cmd[@]}"
 }
 
 build_alphapose_command() {
@@ -966,6 +1055,159 @@ run_one_benchmark() {
   else
     log_failure \
       "pose_model=${pose_model} version=${version} classifier=${classifier} status=no_profile_run_directory_found profile_parent=${profile_parent} cmd=\"${cmd_str}\""
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  fi
+}
+
+run_one_targeted_yolo_sweep_benchmark() {
+  local run_idx="$1"
+  local pose_model="$2"
+  local version="$3"
+  local classifier="$4"
+  local sweep_kind="$5"
+
+  local pose_weight
+  local cls_weight
+  local dest_dir
+  local cmd_str
+  local profile_parent
+  local run_model_tag
+  local rc=0
+  local sweep_label
+  local imgsz_override=""
+  local frame_step=1
+
+  pose_weight="$(pose_weight_for_targeted_yolo_sweep "${pose_model}" "${version}" "${sweep_kind}")" || {
+    log_failure \
+      "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=internal_error reason=invalid_targeted_yolo_sweep_mapping"
+    return 1
+  }
+
+  case "$sweep_kind" in
+    imgsz_576)
+      imgsz_override="${TARGETED_YOLO_SWEEP_IMGSZ}"
+      sweep_label="imgsz=${TARGETED_YOLO_SWEEP_IMGSZ}"
+      ;;
+    k_2)
+      frame_step="${TARGETED_YOLO_SWEEP_FRAME_STEP}"
+      sweep_label="k=${TARGETED_YOLO_SWEEP_FRAME_STEP}"
+      ;;
+    *)
+      log_failure \
+        "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=internal_error reason=unknown_targeted_yolo_sweep_kind"
+      return 1
+      ;;
+  esac
+
+  cls_weight="$(classifier_weight_for_arch "${classifier}" "${pose_model}")" || {
+    log_failure \
+      "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=internal_error reason=invalid_classifier_mapping"
+    return 1
+  }
+
+  dest_dir="$(targeted_yolo_sweep_dest_dir "${pose_model}" "${version}" "${sweep_kind}")"
+  mkdir -p "${dest_dir}"
+
+  run_model_tag="${classifier}"
+  if combination_already_done_in_dir "${dest_dir}" "${run_model_tag}"; then
+    printf '[%d/%d] Skipping %s %s + %s (%s) (already benchmarked)\n' \
+      "${run_idx}" "${TOTAL_RUNS}" "${pose_model}" "${version}" "${classifier}" "${sweep_label}"
+
+    log_skip \
+      "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=skipped reason=already_benchmarked dest_dir=${dest_dir}"
+    return 2
+  fi
+
+  profile_parent="$(make_profile_parent_dir "${dest_dir}")" || {
+    log_failure \
+      "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=profile_parent_create_failed dest_dir=${dest_dir}"
+    return 1
+  }
+
+  local cmd=()
+  while IFS= read -r -d '' token; do
+    cmd+=("$token")
+  done < <(build_command "${classifier}" "${version}" "${cls_weight}" "${pose_weight}" "${profile_parent}" "${imgsz_override}" "${frame_step}")
+
+  cmd_str="$(join_cmd "${cmd[@]}")"
+
+  printf '[%d/%d] Running %s %s + %s (%s)\n' \
+    "${run_idx}" "${TOTAL_RUNS}" "${pose_model}" "${version}" "${classifier}" "${sweep_label}"
+
+  # Pre-flight checks
+  require_file_or_log "${VIDEO_PATH}" "${pose_model}" "${version}" "${classifier}" "video" "${cmd_str}" "sweep=${sweep_kind}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${pose_weight}" "${pose_model}" "${version}" "${classifier}" "pose_weight" "${cmd_str}" "sweep=${sweep_kind}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+  require_file_or_log "${cls_weight}" "${pose_model}" "${version}" "${classifier}" "classification_weight" "${cmd_str}" "sweep=${sweep_kind}" || {
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  }
+
+  if [[ "${classifier}" == "motionbert" ]]; then
+    require_file_or_log "${MOTIONBERT_CONFIG}" "${pose_model}" "${version}" "${classifier}" "motionbert_config" "${cmd_str}" "sweep=${sweep_kind}" || {
+      cleanup_empty_profile_parent "${profile_parent}"
+      return 1
+    }
+  fi
+
+  run_with_benchmark_watchdog_retries "${pose_model} ${version} + ${classifier} (${sweep_label})" -- "${cmd[@]}"
+  rc=$?
+
+  if [[ "${rc}" -ne 0 ]]; then
+    if [[ "${rc}" -eq 124 ]]; then
+      case "${WATCHDOG_TIMEOUT_KIND:-}" in
+        startup_marker_timeout)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=startup_marker_timeout timeout_s=${BENCHMARK_STARTUP_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        first_frame_timeout)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=first_frame_timeout timeout_s=${BENCHMARK_FIRST_FRAME_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        idle_progress_timeout)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=idle_progress_timeout timeout_s=${BENCHMARK_PROGRESS_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        total_runtime_timeout)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=total_runtime_timeout timeout_s=${BENCHMARK_TOTAL_TIMEOUT_S} attempts=${WATCHDOG_ATTEMPTS} cmd=\"${cmd_str}\""
+          ;;
+        *)
+          log_failure \
+            "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+          ;;
+      esac
+    else
+      log_failure \
+        "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=command_failed exit_code=${rc} cmd=\"${cmd_str}\""
+    fi
+    cleanup_empty_profile_parent "${profile_parent}"
+    return 1
+  fi
+
+  local new_run_dir run_basename
+  if new_run_dir="$(find_profile_run_dir "${profile_parent}" "${run_model_tag}")"; then
+    run_basename="$(basename "${new_run_dir}")"
+
+    if mv "${new_run_dir}" "${dest_dir}/"; then
+      log_success \
+        "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=ok moved_to=${dest_dir}/${run_basename} cmd=\"${cmd_str}\""
+      cleanup_empty_profile_parent "${profile_parent}"
+      return 0
+    else
+      log_failure \
+        "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=move_failed source=${new_run_dir} dest=${dest_dir} cmd=\"${cmd_str}\""
+      return 1
+    fi
+  else
+    log_failure \
+      "pose_model=${pose_model} version=${version} classifier=${classifier} sweep=${sweep_kind} status=no_profile_run_directory_found profile_parent=${profile_parent} cmd=\"${cmd_str}\""
     cleanup_empty_profile_parent "${profile_parent}"
     return 1
   fi
@@ -1312,6 +1554,13 @@ for pose_model in "${POSE_MODELS[@]}"; do
   done
 done
 
+for spec in "${TARGETED_YOLO_SWEEP_TARGETS[@]}"; do
+  IFS='|' read -r pose_model version <<< "${spec}"
+  for sweep_kind in "${TARGETED_YOLO_SWEEP_KINDS[@]}"; do
+    mkdir -p "$(targeted_yolo_sweep_dest_dir "${pose_model}" "${version}" "${sweep_kind}")"
+  done
+done
+
 for pose_model in "${FULL_PRUNED_MODELS[@]}"; do
   for version in "${FULL_PRUNED_VERSIONS[@]}"; do
     mkdir -p "${BENCH_DIR}/${pose_model}/${version}"
@@ -1337,6 +1586,26 @@ for pose_model in "${POSE_MODELS[@]}"; do
       run_idx=$((run_idx + 1))
 
       run_one_benchmark "${run_idx}" "${pose_model}" "${version}" "${classifier}"
+      rc=$?
+
+      if [[ "${rc}" -eq 0 ]]; then
+        success_count=$((success_count + 1))
+      elif [[ "${rc}" -eq 2 ]]; then
+        skip_count=$((skip_count + 1))
+      else
+        failure_count=$((failure_count + 1))
+      fi
+    done
+  done
+done
+
+for spec in "${TARGETED_YOLO_SWEEP_TARGETS[@]}"; do
+  IFS='|' read -r pose_model version <<< "${spec}"
+  for sweep_kind in "${TARGETED_YOLO_SWEEP_KINDS[@]}"; do
+    for classifier in "${CLASSIFIERS[@]}"; do
+      run_idx=$((run_idx + 1))
+
+      run_one_targeted_yolo_sweep_benchmark "${run_idx}" "${pose_model}" "${version}" "${classifier}" "${sweep_kind}"
       rc=$?
 
       if [[ "${rc}" -eq 0 ]]; then

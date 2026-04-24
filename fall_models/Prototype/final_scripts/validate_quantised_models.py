@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import io
 import json
 import os
@@ -818,6 +819,87 @@ def sanitize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
+class JsonArrayWriter:
+    def __init__(self, path: Path):
+        self.path = path.expanduser().resolve()
+        self.handle = None
+        self.count = 0
+        self._first = True
+
+    def __enter__(self) -> "JsonArrayWriter":
+        ensure_parent_dir(self.path)
+        self.handle = self.path.open("w", encoding="utf-8")
+        self.handle.write("[\n")
+        return self
+
+    def write(self, item: dict[str, Any]) -> None:
+        if self.handle is None:
+            raise RuntimeError("JsonArrayWriter is not open.")
+        if not self._first:
+            self.handle.write(",\n")
+        json.dump(item, self.handle, ensure_ascii=False)
+        self._first = False
+        self.count += 1
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.handle is not None:
+            self.handle.write("\n]\n")
+            self.handle.close()
+            self.handle = None
+
+
+def runtime_memory_summary() -> str:
+    parts: list[str] = []
+
+    status_path = Path("/proc/self/status")
+    if status_path.exists():
+        try:
+            metrics: dict[str, str] = {}
+            with status_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    if key in {"VmRSS", "VmHWM", "VmSwap"}:
+                        metrics[key] = value.strip()
+            for key in ("VmRSS", "VmHWM", "VmSwap"):
+                if key in metrics:
+                    parts.append(f"{key}={metrics[key]}")
+        except Exception:
+            pass
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                used_mb = (int(total_bytes) - int(free_bytes)) / (1024 * 1024)
+                total_mb = int(total_bytes) / (1024 * 1024)
+                parts.append(f"cuda_used={used_mb:.0f}MiB/{total_mb:.0f}MiB")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return ", ".join(parts) if parts else "memory=n/a"
+
+
+def maybe_release_runtime_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def evaluate_yolo_target(
     *,
     target: dict[str, Any],
@@ -1068,7 +1150,7 @@ def person_to_coco_prediction(person: dict[str, Any], *, image_id: int) -> dict[
 
 def evaluate_predictions_with_coco(
     *,
-    predictions: list[dict[str, Any]],
+    prediction_count: int,
     image_ids: Sequence[int],
     annotations_json: Path,
     pred_json_path: Path,
@@ -1077,11 +1159,7 @@ def evaluate_predictions_with_coco(
     COCO, COCOeval = load_coco_apis()
     coco_gt = COCO(str(annotations_json))
 
-    pred_json_path.parent.mkdir(parents=True, exist_ok=True)
-    with pred_json_path.open("w", encoding="utf-8") as handle:
-        json.dump(predictions, handle, indent=2)
-
-    if not predictions:
+    if prediction_count <= 0:
         summary_path.write_text("No predictions were produced.\n", encoding="utf-8")
         return {
             PRIMARY_POSE_MAP_KEY: 0.0,
@@ -1107,7 +1185,7 @@ def evaluate_predictions_with_coco(
     return {
         PRIMARY_POSE_MAP_KEY: map50_95,
         "metrics/mAP50(P)": map50,
-        "counts/predictions": len(predictions),
+        "counts/predictions": int(prediction_count),
         "counts/images_evaluated": len(image_ids),
     }
 
@@ -1146,35 +1224,49 @@ def evaluate_backend_target(
     else:
         raise ValueError(f"Unsupported backend for manual COCO evaluation: {backend}")
 
-    predictions: list[dict[str, Any]] = []
     total = len(image_records)
     keep_people = max(1, int(args.max_det))
-    for index, (image_id, image_path) in enumerate(image_records, start=1):
-        if index == 1 or index % 50 == 0 or index == total:
-            print(f"  progress: {index}/{total} images")
+    cleanup_interval = 25
+    memory_report_interval = 200
+    with JsonArrayWriter(pred_json_path) as prediction_writer:
+        for index, (image_id, image_path) in enumerate(image_records, start=1):
+            if index == 1 or index % 50 == 0 or index == total:
+                line = f"  progress: {index}/{total} images"
+                if index == 1 or index % memory_report_interval == 0 or index == total:
+                    line = f"{line} | {runtime_memory_summary()}"
+                print(line)
 
-        frame_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if frame_bgr is None:
-            raise RuntimeError(f"Failed to read image: {image_path}")
+            frame_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if frame_bgr is None:
+                raise RuntimeError(f"Failed to read image: {image_path}")
 
-        if backend == "alphapose":
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            infer_out = runner.infer(frame_rgb, image_name=image_path.name)
-            people = list(infer_out.get("people", []))
-        else:
-            people = list(runner.infer(frame_bgr))
+            frame_rgb = None
+            infer_out = None
+            if backend == "alphapose":
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                infer_out = runner.infer(frame_rgb, image_name=image_path.name)
+                people = list(infer_out.get("people", []))
+            else:
+                people = list(runner.infer(frame_bgr))
 
-        if people:
-            people.sort(key=select_instance_score, reverse=True)
-            people = people[:keep_people]
+            if people:
+                people.sort(key=select_instance_score, reverse=True)
+                people = people[:keep_people]
 
-        for person in people:
-            prediction = person_to_coco_prediction(person, image_id=image_id)
-            if prediction is not None:
-                predictions.append(prediction)
+            for person in people:
+                prediction = person_to_coco_prediction(person, image_id=image_id)
+                if prediction is not None:
+                    prediction_writer.write(prediction)
+
+            del people
+            del infer_out
+            del frame_rgb
+            del frame_bgr
+            if index % cleanup_interval == 0:
+                maybe_release_runtime_memory()
 
     metrics = evaluate_predictions_with_coco(
-        predictions=predictions,
+        prediction_count=prediction_writer.count,
         image_ids=[image_id for image_id, _ in image_records],
         annotations_json=annotations_json,
         pred_json_path=pred_json_path,
