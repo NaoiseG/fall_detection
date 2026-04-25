@@ -28,13 +28,17 @@ except ImportError as e:
     raise SystemExit("Missing dependency: ultralytics. Install with `pip install ultralytics`.") from e
 
 
-YOLO_ENGINE_RE = re.compile(
-    r"^(?P<arch>yolo\d+[nslmx]-pose)(?:_(?P<version>[^.]+))?\.engine$",
+YOLO_MODEL_RE = re.compile(
+    r"^(?P<arch>yolo\d+[nslmx]-pose)(?:_(?P<version>[^.]+))?\.(?P<suffix>engine|pt)$",
     re.IGNORECASE,
 )
 PRIMARY_POSE_MAP_KEY = "metrics/mAP50-95(P)"
 DEFAULT_ALPHAPOSE_CFG = "configs/coco/resnet/256x192_res50_lr1e-3_1x.yaml"
 DEFAULT_ALPHAPOSE_DETECTOR_CFG = "detector/yolo/cfg/yolov3-spp.cfg"
+DEFAULT_ALPHAPOSE_CHECKPOINT = "pretrained_models/fast_res50_256x192.pth"
+DEFAULT_ALPHAPOSE_DETECTOR_WEIGHTS = "detector/yolo/data/yolov3-spp.weights"
+DEFAULT_VITPOSE_DETECTOR_MODEL = "PekingU/rtdetr_r50vd_coco_o365"
+DEFAULT_VITPOSE_POSE_MODEL = "usyd-community/vitpose-base"
 ARCHITECTURE_ORDER = ("yolo", "alphapose", "vitpose")
 ARCHITECTURE_ALIASES = {
     "all": "all",
@@ -90,6 +94,10 @@ def default_project_dir() -> Path:
 
 def default_alphapose_root() -> Path:
     return prototype_root_from_script() / "pose_models" / "AlphaPose"
+
+
+def default_base_yolo_root() -> Path:
+    return prototype_root_from_script() / "pose_models" / "ultralytics"
 
 
 def now_iso() -> str:
@@ -154,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=default_models_root(),
         help="Root directory containing quantised pose model folders.",
+    )
+    parser.add_argument(
+        "--base-yolo-root",
+        type=Path,
+        default=default_base_yolo_root(),
+        help="Root directory searched for base Ultralytics YOLO pose .pt models.",
     )
     parser.add_argument(
         "--data-yaml",
@@ -245,6 +259,30 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_ALPHAPOSE_DETECTOR_CFG,
         help="AlphaPose detector cfg relative to --alphapose-root.",
+    )
+    parser.add_argument(
+        "--alphapose-base-checkpoint",
+        type=str,
+        default=DEFAULT_ALPHAPOSE_CHECKPOINT,
+        help="Base AlphaPose checkpoint path, absolute or relative to --alphapose-root.",
+    )
+    parser.add_argument(
+        "--alphapose-base-detector-weights",
+        type=str,
+        default=DEFAULT_ALPHAPOSE_DETECTOR_WEIGHTS,
+        help="Base AlphaPose detector weights path, absolute or relative to --alphapose-root.",
+    )
+    parser.add_argument(
+        "--vitpose-base-detector-model",
+        type=str,
+        default=DEFAULT_VITPOSE_DETECTOR_MODEL,
+        help="Base ViTPose detector model source.",
+    )
+    parser.add_argument(
+        "--vitpose-base-pose-model",
+        type=str,
+        default=DEFAULT_VITPOSE_POSE_MODEL,
+        help="Base ViTPose pose model source.",
     )
     parser.add_argument(
         "--vitpose-detector-processor",
@@ -657,22 +695,22 @@ def build_dataset_context(
     }
 
 
-def infer_yolo_metadata(engine_path: Path) -> dict[str, Any]:
-    match = YOLO_ENGINE_RE.match(engine_path.name)
+def infer_yolo_metadata(model_path: Path) -> dict[str, Any]:
+    match = YOLO_MODEL_RE.match(model_path.name)
     if match:
         architecture = str(match.group("arch"))
-        version = str(match.group("version") or "engine")
+        version = str(match.group("version") or ("base" if match.group("suffix").lower() == "pt" else "engine"))
     else:
-        stem_parts = engine_path.stem.split("_")
-        architecture = stem_parts[0] if stem_parts else engine_path.parent.name
+        stem_parts = model_path.stem.split("_")
+        architecture = stem_parts[0] if stem_parts else model_path.parent.name
         version = stem_parts[1] if len(stem_parts) > 1 else "unknown"
     return {
         "backend": "yolo",
         "architecture": architecture,
         "version": version,
-        "engine_name": engine_path.name,
-        "engine_path": normalize_path(engine_path),
-        "engine_key": normalize_path(engine_path),
+        "engine_name": model_path.name,
+        "engine_path": normalize_path(model_path),
+        "engine_key": normalize_path(model_path),
         "detector_engine_path": None,
         "pose_engine_path": None,
     }
@@ -686,15 +724,55 @@ def discover_yolo_targets(models_root: Path) -> list[dict[str, Any]]:
     for path in sorted(root.rglob("*.engine")):
         if not path.is_file():
             continue
-        if not YOLO_ENGINE_RE.match(path.name):
+        if not YOLO_MODEL_RE.match(path.name):
             continue
         targets.append(infer_yolo_metadata(path))
     return targets
 
 
+def discover_base_yolo_targets(base_yolo_root: Path) -> list[dict[str, Any]]:
+    root = base_yolo_root.expanduser().resolve()
+    if not root.exists():
+        return []
+    targets = []
+    for path in sorted(root.rglob("*.pt")):
+        if path.is_file() and YOLO_MODEL_RE.match(path.name):
+            targets.append(infer_yolo_metadata(path))
+    return targets
+
+
+def resolve_optional_local_model_source(source: str, *, root: Path) -> str:
+    raw = Path(os.path.expanduser(str(source)))
+    if raw.is_absolute():
+        return normalize_path(raw)
+    candidate = (root / raw).expanduser().resolve()
+    if candidate.exists():
+        return normalize_path(candidate)
+    return str(source)
+
+
 def build_alphapose_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
     alpha_root = args.models_root.expanduser().resolve() / "alphapose"
-    targets: list[dict[str, Any]] = []
+    base_detector_path = resolve_optional_local_model_source(
+        args.alphapose_base_detector_weights,
+        root=args.alphapose_root,
+    )
+    base_pose_path = resolve_optional_local_model_source(
+        args.alphapose_base_checkpoint,
+        root=args.alphapose_root,
+    )
+    targets: list[dict[str, Any]] = [
+        {
+            "backend": "alphapose",
+            "architecture": "alphapose",
+            "version": "base",
+            "engine_name": "alphapose_base",
+            "engine_path": f"detector={base_detector_path} ; pose={base_pose_path}",
+            "engine_key": f"alphapose::base::{base_detector_path}::{base_pose_path}",
+            "detector_engine_path": base_detector_path,
+            "pose_engine_path": base_pose_path,
+        }
+    ]
     for version, detector_precision, pose_precision in ALPHAPOSE_VARIANTS:
         detector_path = alpha_root / f"yolov3_spp_{detector_precision}.engine"
         pose_path = alpha_root / f"fastpose_{pose_precision}.engine"
@@ -715,7 +793,20 @@ def build_alphapose_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def build_vitpose_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
     vit_root = args.models_root.expanduser().resolve() / "vitpose_trt" / "engines"
-    targets: list[dict[str, Any]] = []
+    base_detector_model = str(args.vitpose_base_detector_model)
+    base_pose_model = str(args.vitpose_base_pose_model)
+    targets: list[dict[str, Any]] = [
+        {
+            "backend": "vitpose",
+            "architecture": "vitpose",
+            "version": "base",
+            "engine_name": "vitpose_base",
+            "engine_path": f"detector={base_detector_model} ; pose={base_pose_model}",
+            "engine_key": f"vitpose::base::{base_detector_model}::{base_pose_model}",
+            "detector_engine_path": base_detector_model,
+            "pose_engine_path": base_pose_model,
+        }
+    ]
     for version, detector_precision, pose_precision in VITPOSE_VARIANTS:
         detector_path = vit_root / f"detector_pekingu_rtdetr_r50vd_coco_o365_{detector_precision}.engine"
         pose_path = vit_root / f"pose_usyd_community_vitpose_base_{pose_precision}.engine"
@@ -740,6 +831,7 @@ def build_requested_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
         if architecture not in args.architectures:
             continue
         if architecture == "yolo":
+            targets.extend(discover_base_yolo_targets(args.base_yolo_root))
             targets.extend(discover_yolo_targets(args.models_root))
         elif architecture == "alphapose":
             targets.extend(build_alphapose_targets(args))
@@ -967,17 +1059,23 @@ def create_vitpose_runner(target: dict[str, Any], args: argparse.Namespace):
     ensure_prototype_root_on_path()
     from dataset_helpers.get_keypoints_files_ViTpose import VitPoseExportConfig, VitPoseRunner
 
-    detector_path = Path(str(target["detector_engine_path"]))
-    pose_path = Path(str(target["pose_engine_path"]))
-    missing = [str(path) for path in (detector_path, pose_path) if not path.exists()]
+    detector_source = str(target["detector_engine_path"])
+    pose_source = str(target["pose_engine_path"])
+    detector_path = Path(detector_source)
+    pose_path = Path(pose_source)
+    missing = [
+        str(path)
+        for path in (detector_path, pose_path)
+        if path.suffix.lower() == ".engine" and not path.exists()
+    ]
     if missing:
         missing_str = ", ".join(missing)
         raise FileNotFoundError(f"Missing ViTPose engine file(s): {missing_str}")
 
     cfg = VitPoseExportConfig(
-        detector_model=str(detector_path),
+        detector_model=detector_source,
         detector_processor=args.vitpose_detector_processor,
-        pose_model=str(pose_path),
+        pose_model=pose_source,
         pose_processor=args.vitpose_pose_processor,
         person_threshold=float(args.conf),
         pose_threshold=float(args.vitpose_pose_threshold),
@@ -1433,6 +1531,7 @@ def main() -> int:
     args = parse_args()
     args.architectures = normalize_architectures(args.architectures)
     args.models_root = args.models_root.expanduser().resolve()
+    args.base_yolo_root = args.base_yolo_root.expanduser().resolve()
     args.data_yaml = args.data_yaml.expanduser().resolve()
     args.project = args.project.expanduser().resolve()
     args.alphapose_root = args.alphapose_root.expanduser().resolve()
