@@ -11,6 +11,15 @@ requested optimised keypoint variants:
       yolo11l-pose/fp32_576
       yolo11m-pose/fp32_576
 
+and k=2 temporal downsampling evaluations for the base image-size
+quantised YOLO keypoint variants:
+
+    /home/jetson/NaoiseG/fall_detection/Datasets/UPFall_keypoints/
+      yolo11m/fp32
+      yolo11l/fp32
+      yolo11x/fp32
+      yolo11x/fp16
+
 For each discovered variant, this runner evaluates:
   - paper_stgcn
   - cnnlstm
@@ -22,7 +31,8 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import eval_downsized_models as base
 
@@ -37,15 +47,75 @@ PROTOTYPE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEYPOINTS_ROOT = Path(
     "/home/jetson/NaoiseG/fall_detection/Datasets/UPFall_keypoints_img_downsize"
 )
+DEFAULT_BASE_KEYPOINTS_ROOT = Path(
+    "/home/jetson/NaoiseG/fall_detection/Datasets/UPFall_keypoints"
+)
 DEFAULT_CLASSIFICATION_ROOT = WORKSPACE_ROOT / "web_app" / "models" / "classification"
 DEFAULT_OUTPUT_ROOT = PROTOTYPE_ROOT / "eval_outputs" / "optimised_pipeline_evals"
 
-PIPELINE_SPECS: Tuple[Tuple[str, str, int], ...] = (
-    ("yolo11m-pose", "fp32_576", 576),
-    ("yolo11l-pose", "fp32_576", 576),
-    ("yolo11x-pose", "fp16_576", 576),
-    ("yolo11x-pose", "fp32_576", 576),
-)
+TEMPORAL_DOWNSAMPLE_MODES: Tuple[str, ...] = ("interpolate", "shrink")
+
+
+@dataclass(frozen=True)
+class PipelineSpec:
+    pose_dir_name: str
+    variant_name: str
+    imgsz: int
+    npz_root: Path
+    checkpoint_tag: str
+    frame_step: int = 1
+    temporal_downsample_mode: Optional[str] = None
+
+
+def build_pipeline_specs(keypoints_root: Path, base_keypoints_root: Path) -> Tuple[PipelineSpec, ...]:
+    return (
+        PipelineSpec(
+            pose_dir_name="yolo11m-pose",
+            variant_name="fp32_576",
+            imgsz=576,
+            npz_root=keypoints_root / "yolo11m-pose" / "fp32_576",
+            checkpoint_tag="yolo11m-pose",
+        ),
+        PipelineSpec(
+            pose_dir_name="yolo11l-pose",
+            variant_name="fp32_576",
+            imgsz=576,
+            npz_root=keypoints_root / "yolo11l-pose" / "fp32_576",
+            checkpoint_tag="yolo11l-pose",
+        ),
+        PipelineSpec(
+            pose_dir_name="yolo11x-pose",
+            variant_name="fp16_576",
+            imgsz=576,
+            npz_root=keypoints_root / "yolo11x-pose" / "fp16_576",
+            checkpoint_tag="yolo11x-pose",
+        ),
+        PipelineSpec(
+            pose_dir_name="yolo11x-pose",
+            variant_name="fp32_576",
+            imgsz=576,
+            npz_root=keypoints_root / "yolo11x-pose" / "fp32_576",
+            checkpoint_tag="yolo11x-pose",
+        ),
+        *(
+            PipelineSpec(
+                pose_dir_name=f"{pose_name}-pose",
+                variant_name=f"{precision}_base_k2_{mode}",
+                imgsz=640,
+                npz_root=base_keypoints_root / pose_name / precision,
+                checkpoint_tag=f"{pose_name}-pose",
+                frame_step=2,
+                temporal_downsample_mode=mode,
+            )
+            for pose_name, precision in (
+                ("yolo11m", "fp32"),
+                ("yolo11l", "fp32"),
+                ("yolo11x", "fp32"),
+                ("yolo11x", "fp16"),
+            )
+            for mode in TEMPORAL_DOWNSAMPLE_MODES
+        ),
+    )
 
 
 def pipeline_sort_key(variant: base.KeypointVariant) -> Tuple[int, str, str]:
@@ -65,27 +135,221 @@ def pipeline_sort_key(variant: base.KeypointVariant) -> Tuple[int, str, str]:
     )
 
 
-def discover_variants(paths: base.SweepPaths) -> Tuple[List[base.KeypointVariant], List[str]]:
+def get_temporal_config(run: base.RunSpec) -> Tuple[int, Optional[str]]:
+    marker = "_k"
+    if marker not in run.variant_name:
+        return 1, None
+    prefix, _, suffix = run.variant_name.rpartition(marker)
+    if not prefix:
+        return 1, None
+    step_text, _, mode = suffix.partition("_")
+    try:
+        frame_step = int(step_text)
+    except ValueError:
+        return 1, None
+    if frame_step <= 1 or mode not in TEMPORAL_DOWNSAMPLE_MODES:
+        return 1, None
+    return frame_step, mode
+
+
+def add_temporal_args(command: List[str], run: base.RunSpec) -> List[str]:
+    frame_step, mode = get_temporal_config(run)
+    if frame_step > 1 and mode is not None:
+        command += ["--frame-step", str(frame_step), "--temporal-downsample-mode", mode]
+    return command
+
+
+def build_eval_models_command(paths: base.SweepPaths, config: base.SweepConfig, run: base.RunSpec) -> List[str]:
+    return add_temporal_args(base.build_eval_models_command(paths, config, run), run)
+
+
+def build_motionbert_eval_command(config: base.SweepConfig, run: base.RunSpec) -> List[str]:
+    return add_temporal_args(base.build_motionbert_eval_command(config, run), run)
+
+
+def add_temporal_metadata(payload: Dict[str, Any], run: base.RunSpec) -> Dict[str, Any]:
+    frame_step, mode = get_temporal_config(run)
+    payload["frame_step"] = frame_step
+    payload["temporal_downsample_mode"] = mode
+    return payload
+
+
+def build_run_status_payload(run: base.RunSpec, **kwargs: Any) -> Dict[str, Any]:
+    return add_temporal_metadata(base.build_run_status_payload(run, **kwargs), run)
+
+
+def build_summary_entry_from_status(run: base.RunSpec, run_status: Dict[str, Any]) -> Dict[str, Any]:
+    return add_temporal_metadata(base.build_summary_entry_from_status(run, run_status), run)
+
+
+def load_existing_summary_entries(all_runs: Sequence[base.RunSpec]) -> Dict[str, Dict[str, Any]]:
+    entries = base.load_existing_summary_entries(all_runs)
+    for run in all_runs:
+        entries[run.run_id] = add_temporal_metadata(entries[run.run_id], run)
+    return entries
+
+
+def annotate_run_status_file(run: base.RunSpec) -> None:
+    payload = base.read_json(run.run_status_path)
+    if isinstance(payload, dict):
+        base.write_run_status(run, add_temporal_metadata(payload, run))
+
+
+def execute_run(paths: base.SweepPaths, config: base.SweepConfig, run: base.RunSpec) -> Dict[str, Any]:
+    base.ensure_parent_dirs_for_run(run)
+    existing_output_dirs = base.discover_complete_output_dirs(run.run_dir)
+    started_at = base.now_iso()
+
+    prepare_command: Optional[List[str]] = None
+    prepare_cwd: Optional[Path] = None
+    if run.classifier_model == "MotionBERT":
+        if run.motionbert_repo_root is None:
+            raise ValueError("MotionBERT run is missing motionbert_repo_root.")
+        prepare_command = base.build_motionbert_prepare_command(config, paths, run)
+        prepare_cwd = paths.repo_root
+        command = build_motionbert_eval_command(config, run)
+        command_cwd = run.motionbert_repo_root
+    else:
+        command = build_eval_models_command(paths, config, run)
+        command_cwd = paths.repo_root
+
+    running_payload = build_run_status_payload(
+        run,
+        status="running",
+        started_at=started_at,
+        finished_at=None,
+        return_code=None,
+        cwd=command_cwd,
+        command=command,
+        discovered_output_dir=None,
+        metrics=base.default_metrics(),
+        prepare_command=prepare_command,
+    )
+    base.write_run_status(run, running_payload)
+
+    prepare_return_code: Optional[int] = None
+    reused_motionbert_pkl: Optional[bool] = None
+    return_code: Optional[int] = None
+    metrics = base.default_metrics()
+    error_message: Optional[str] = None
+
+    try:
+        with run.stdout_log_path.open("w", encoding="utf-8") as stdout_handle, run.stderr_log_path.open(
+            "w", encoding="utf-8"
+        ) as stderr_handle:
+            if run.classifier_model == "MotionBERT":
+                should_reuse_pkl = (
+                    not config.force_regenerate_motionbert_pkl
+                    and base.valid_motionbert_pkl(
+                        run.motionbert_pkl_path,
+                        run.motionbert_label_map_path,
+                        run.npz_root,
+                    )
+                )
+                if should_reuse_pkl:
+                    reused_motionbert_pkl = True
+                    stdout_handle.write(
+                        f"[{base.now_iso()}] Reusing existing MotionBERT PKL: "
+                        f"{run.motionbert_pkl_path.as_posix()}\n\n"
+                    )
+                    stdout_handle.flush()
+                else:
+                    reused_motionbert_pkl = False
+                    prepare_return_code = base.run_subprocess_to_logs(
+                        prepare_command or [],
+                        cwd=prepare_cwd or paths.repo_root,
+                        stdout_handle=stdout_handle,
+                        stderr_handle=stderr_handle,
+                        title="prepare_motionbert_dataset",
+                    )
+                    if prepare_return_code != 0:
+                        stderr_tail = base.read_log_tail(run.stderr_log_path)
+                        tail_suffix = "" if not stderr_tail else f" Last stderr lines:\n{stderr_tail}"
+                        raise RuntimeError(
+                            f"MotionBERT dataset preparation failed with return code {prepare_return_code}."
+                            f"{tail_suffix}"
+                        )
+                    if not base.valid_motionbert_pkl(
+                        run.motionbert_pkl_path,
+                        run.motionbert_label_map_path,
+                        run.npz_root,
+                    ):
+                        raise RuntimeError(
+                            "MotionBERT dataset preparation completed but the expected PKL/label map files "
+                            "were not produced or looked invalid."
+                        )
+
+            return_code = base.run_subprocess_to_logs(
+                command,
+                cwd=command_cwd,
+                stdout_handle=stdout_handle,
+                stderr_handle=stderr_handle,
+                title="evaluation",
+            )
+    except Exception as exc:
+        error_message = str(exc)
+
+    discovered_output_dir = base.find_new_output_dir(run, existing_output_dirs)
+    finished_at = base.now_iso()
+
+    status = "failed"
+    if error_message is None and return_code == 0 and base.has_complete_evaluator_artifacts(discovered_output_dir):
+        status = "completed"
+        try:
+            metrics = base.parse_run_metrics(run, discovered_output_dir)
+        except Exception as exc:
+            error_message = f"Evaluation completed but metric parsing failed: {exc}"
+    else:
+        if error_message is None:
+            if return_code != 0:
+                stderr_tail = base.read_log_tail(run.stderr_log_path)
+                tail_suffix = "" if not stderr_tail else f" Last stderr lines:\n{stderr_tail}"
+                error_message = f"Evaluation subprocess failed with return code {return_code}.{tail_suffix}"
+            else:
+                error_message = (
+                    "Evaluation subprocess finished without a complete evaluator output directory "
+                    "containing metrics_summary.csv and report.html."
+                )
+
+    payload = build_run_status_payload(
+        run,
+        status=status,
+        started_at=started_at,
+        finished_at=finished_at,
+        return_code=return_code,
+        cwd=command_cwd,
+        command=command,
+        discovered_output_dir=discovered_output_dir,
+        metrics=metrics,
+        error_message=error_message,
+        prepare_command=prepare_command,
+        prepare_return_code=prepare_return_code,
+        reused_motionbert_pkl=reused_motionbert_pkl,
+    )
+    base.write_run_status(run, payload)
+    return build_summary_entry_from_status(run, payload)
+
+
+def discover_variants(specs: Sequence[PipelineSpec]) -> Tuple[List[base.KeypointVariant], List[str]]:
     issues: List[str] = []
+    issue_set = set()
     variants: List[base.KeypointVariant] = []
 
-    if not paths.keypoints_root.is_dir():
-        issues.append(f"Optimised keypoints root not found: {paths.keypoints_root.as_posix()}")
-        return variants, issues
-
-    for pose_dir_name, variant_name, imgsz in PIPELINE_SPECS:
-        npz_root = paths.keypoints_root / pose_dir_name / variant_name
-        if not npz_root.is_dir():
-            issues.append(f"Missing optimised keypoint variant: {npz_root.as_posix()}")
+    for spec in specs:
+        if not spec.npz_root.is_dir():
+            issue = f"Missing optimised keypoint variant: {spec.npz_root.as_posix()}"
+            if issue not in issue_set:
+                issue_set.add(issue)
+                issues.append(issue)
             continue
 
         variants.append(
             base.KeypointVariant(
-                pose_model_size=pose_dir_name,
-                checkpoint_tag=pose_dir_name,
-                variant_name=variant_name,
-                imgsz=imgsz,
-                npz_root=npz_root,
+                pose_model_size=spec.pose_dir_name,
+                checkpoint_tag=spec.checkpoint_tag,
+                variant_name=spec.variant_name,
+                imgsz=spec.imgsz,
+                npz_root=spec.npz_root,
             )
         )
 
@@ -140,10 +404,10 @@ def build_run_matrix(paths: base.SweepPaths, variants: Sequence[base.KeypointVar
     return runs
 
 
-def normalize_pose_filters(values: Sequence[str] | None) -> Tuple[str, ...] | None:
+def normalize_pose_filters(values: Sequence[str] | None, specs: Sequence[PipelineSpec]) -> Tuple[str, ...] | None:
     if values is None:
         return None
-    allowed = tuple(sorted({pose for pose, _, _ in PIPELINE_SPECS}))
+    allowed = tuple(sorted({spec.pose_dir_name for spec in specs}))
     return base.normalize_filter_tokens(
         values,
         allowed=allowed,
@@ -152,10 +416,10 @@ def normalize_pose_filters(values: Sequence[str] | None) -> Tuple[str, ...] | No
     )
 
 
-def normalize_variant_filters(values: Sequence[str] | None) -> Tuple[str, ...] | None:
+def normalize_variant_filters(values: Sequence[str] | None, specs: Sequence[PipelineSpec]) -> Tuple[str, ...] | None:
     if values is None:
         return None
-    allowed = tuple(sorted({variant for _, variant, _ in PIPELINE_SPECS}))
+    allowed = tuple(sorted({spec.variant_name for spec in specs}))
     return base.normalize_filter_tokens(
         values,
         allowed=allowed,
@@ -170,7 +434,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--only-models", nargs="+", default=None)
     parser.add_argument("--only-pose-sizes", nargs="+", default=None)
-    parser.add_argument("--only-variants", nargs="+", default=None, help="Subset of fp32_576 fp16_576")
+    parser.add_argument(
+        "--only-variants",
+        nargs="+",
+        default=None,
+        help="Subset of variants, e.g. fp32_576 fp16_576 fp32_base_k2_interpolate fp32_base_k2_shrink.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force-rerun", action="store_true")
     parser.add_argument("--force-regenerate-motionbert-pkl", action="store_true")
@@ -185,6 +454,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--keypoints-root", type=Path, default=DEFAULT_KEYPOINTS_ROOT)
+    parser.add_argument("--base-keypoints-root", type=Path, default=DEFAULT_BASE_KEYPOINTS_ROOT)
     parser.add_argument("--classification-root", type=Path, default=DEFAULT_CLASSIFICATION_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--motionbert-pkl-root", type=Path, default=None)
@@ -228,8 +498,12 @@ def main() -> int:
     args = parse_args()
     paths = build_paths(args)
     config = build_config(args)
+    specs = build_pipeline_specs(
+        keypoints_root=args.keypoints_root.expanduser(),
+        base_keypoints_root=args.base_keypoints_root.expanduser(),
+    )
 
-    variants, discovery_issues = discover_variants(paths)
+    variants, discovery_issues = discover_variants(specs)
     if not variants:
         print("No optimised pipeline variants were discovered.", file=sys.stderr)
         for issue in discovery_issues:
@@ -238,7 +512,7 @@ def main() -> int:
 
     all_runs = build_run_matrix(paths, variants)
     summary_json_path = paths.output_root / SUMMARY_JSON_NAME
-    summary_entries = base.load_existing_summary_entries(all_runs)
+    summary_entries = load_existing_summary_entries(all_runs)
 
     selected_models = base.normalize_filter_tokens(
         (base.normalize_model_token(token) for token in args.only_models) if args.only_models is not None else None,
@@ -246,8 +520,8 @@ def main() -> int:
         kind="model",
         transform=str,
     )
-    selected_pose_sizes = normalize_pose_filters(args.only_pose_sizes)
-    selected_variants = normalize_variant_filters(args.only_variants)
+    selected_pose_sizes = normalize_pose_filters(args.only_pose_sizes, specs)
+    selected_variants = normalize_variant_filters(args.only_variants, specs)
 
     selected_runs = [
         run
@@ -286,7 +560,8 @@ def main() -> int:
             print("  missing inputs:")
             for item in missing_inputs:
                 print(f"    - {item}")
-            entry = base.handle_missing_inputs(run, missing_inputs)
+            entry = add_temporal_metadata(base.handle_missing_inputs(run, missing_inputs), run)
+            annotate_run_status_file(run)
             summary_entries[run.run_id] = entry
             skipped_missing += 1
             base.write_summary_json(summary_json_path, paths, all_runs, summary_entries)
@@ -298,7 +573,8 @@ def main() -> int:
             existing = base.detect_completed_run(run)
             if existing is not None:
                 print("  reusing completed run")
-                entry = base.process_existing_completed_run(run)
+                entry = add_temporal_metadata(base.process_existing_completed_run(run), run)
+                annotate_run_status_file(run)
                 summary_entries[run.run_id] = entry
                 completed += 1
                 base.write_summary_json(summary_json_path, paths, all_runs, summary_entries)
@@ -306,7 +582,7 @@ def main() -> int:
 
         if run.classifier_model == "MotionBERT":
             prepare_command = base.build_motionbert_prepare_command(config, paths, run)
-            eval_command = base.build_motionbert_eval_command(config, run)
+            eval_command = build_motionbert_eval_command(config, run)
             if args.dry_run:
                 base.print_dry_run_line(
                     run,
@@ -316,7 +592,7 @@ def main() -> int:
                 )
                 continue
         else:
-            eval_command = base.build_eval_models_command(paths, config, run)
+            eval_command = build_eval_models_command(paths, config, run)
             if args.dry_run:
                 base.print_dry_run_line(
                     run,
@@ -325,7 +601,7 @@ def main() -> int:
                 )
                 continue
 
-        entry = base.execute_run(paths, config, run)
+        entry = execute_run(paths, config, run)
         summary_entries[run.run_id] = entry
         base.write_summary_json(summary_json_path, paths, all_runs, summary_entries)
 
