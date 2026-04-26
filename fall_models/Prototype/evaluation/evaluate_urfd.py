@@ -94,6 +94,15 @@ DEFAULT_FRAME_EXTS = (".png", ".jpg", ".jpeg")
 DEFAULT_TEST_SEQUENCES_PER_CLASS = 5
 DEFAULT_DECISION_SEARCH_MIN_VALUES = (1, 2, 3, 4, 5)
 DEFAULT_DECISION_SEARCH_CSV_NAME = "decision_rule_search.csv"
+DEFAULT_DECISION_SEARCH_PRIMARY_METRIC = "balanced_accuracy"
+DECISION_SEARCH_PRIMARY_METRIC_CHOICES = (
+    "balanced_accuracy",
+    "f1",
+    "accuracy",
+    "recall",
+    "precision",
+    "specificity",
+)
 DEFAULT_MOTIONBERT_CONFIG = "configs/action/MB_ft_UPFall_xsub.yaml"
 DEFAULT_STRICT_EARLY_TOLERANCE_FRAMES = 0
 
@@ -222,7 +231,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "After inference, sweep threshold and min-consecutive-positive combinations on the saved window scores "
-            "and select the combination with the highest video-level accuracy."
+            f"and select the combination with the best --decision-search-primary-metric. Default: "
+            f"{DEFAULT_DECISION_SEARCH_PRIMARY_METRIC}."
+        ),
+    )
+    parser.add_argument(
+        "--decision-search-primary-metric",
+        type=str,
+        default=DEFAULT_DECISION_SEARCH_PRIMARY_METRIC,
+        choices=DECISION_SEARCH_PRIMARY_METRIC_CHOICES,
+        help=(
+            "Primary video-level metric optimized by --optimize-video-decision. "
+            "Use accuracy to reproduce the old behavior. Default: balanced_accuracy."
         ),
     )
     parser.add_argument(
@@ -610,8 +630,9 @@ def default_decision_search_thresholds() -> List[float]:
 
 
 def normalize_search_thresholds(values: Optional[Sequence[float]], *, configured_threshold: float) -> List[float]:
-    raw_values = list(values) if values else default_decision_search_thresholds()
-    raw_values.append(float(configured_threshold))
+    raw_values = list(values) if values is not None else default_decision_search_thresholds()
+    if values is None:
+        raw_values.append(float(configured_threshold))
 
     deduped: Dict[float, float] = {}
     for value in raw_values:
@@ -631,8 +652,9 @@ def normalize_search_min_consecutive_values(
     *,
     configured_min_consecutive_positive: int,
 ) -> List[int]:
-    raw_values = list(values) if values else list(DEFAULT_DECISION_SEARCH_MIN_VALUES)
-    raw_values.append(int(configured_min_consecutive_positive))
+    raw_values = list(values) if values is not None else list(DEFAULT_DECISION_SEARCH_MIN_VALUES)
+    if values is None:
+        raw_values.append(int(configured_min_consecutive_positive))
 
     normalized = sorted({int(value) for value in raw_values})
     if not normalized:
@@ -1220,11 +1242,18 @@ def search_best_video_decision(
     *,
     thresholds: Sequence[float],
     min_consecutive_values: Sequence[int],
+    primary_metric: str,
     configured_threshold: float,
     configured_min_consecutive_positive: int,
     strict_early_tolerance_frames: int,
     strict_late_tolerance_frames: int,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if primary_metric not in DECISION_SEARCH_PRIMARY_METRIC_CHOICES:
+        raise ValueError(
+            "--decision-search-primary-metric must be one of: "
+            + ", ".join(DECISION_SEARCH_PRIMARY_METRIC_CHOICES)
+        )
+
     search_rows: List[Dict[str, Any]] = []
 
     for threshold in thresholds:
@@ -1263,12 +1292,21 @@ def search_best_video_decision(
     if not search_rows:
         raise RuntimeError("Decision-rule search produced no candidate combinations.")
 
+    metric_priority = [
+        primary_metric,
+        "balanced_accuracy",
+        "f1",
+        "accuracy",
+        "recall",
+        "specificity",
+        "precision",
+    ]
+    metric_priority = list(dict.fromkeys(metric_priority))
+
     best_row = max(
         search_rows,
         key=lambda row: (
-            float(row["accuracy"]),
-            float(row["balanced_accuracy"]),
-            float(row["f1"]),
+            *(float(row[metric]) for metric in metric_priority),
             -abs(float(row["threshold"]) - float(configured_threshold)),
             -abs(int(row["min_consecutive_positive"]) - int(configured_min_consecutive_positive)),
             -float(row["threshold"]),
@@ -1581,25 +1619,29 @@ def print_decision_search_summary(
     configured_metrics: Dict[str, Any],
     best_search_row: Dict[str, Any],
     num_combinations: int,
+    primary_metric: str,
 ) -> None:
     print()
     print("Decision-rule search")
     print(f"  Evaluated {num_combinations} threshold/min-consecutive combinations.")
+    print(f"  Primary metric: {primary_metric}")
     print(
         "  Configured: "
         f"threshold={float(configured_threshold):.4f} "
         f"min_consecutive_positive={int(configured_min_consecutive_positive)} "
+        f"{primary_metric}={float(configured_metrics[primary_metric]):.4f} "
         f"accuracy={float(configured_metrics['accuracy']):.4f}"
     )
     print(
         "  Selected:   "
         f"threshold={float(best_search_row['threshold']):.4f} "
         f"min_consecutive_positive={int(best_search_row['min_consecutive_positive'])} "
+        f"{primary_metric}={float(best_search_row[primary_metric]):.4f} "
         f"accuracy={float(best_search_row['accuracy']):.4f}"
     )
     print(
-        "  Tie-breaks: balanced_accuracy, f1, closeness to the configured values, "
-        "then smaller threshold/min-consecutive."
+        "  Tie-breaks: balanced_accuracy, f1, accuracy, recall, specificity, precision, "
+        "closeness to the configured values, then smaller threshold/min-consecutive."
     )
 
 
@@ -1906,6 +1948,7 @@ def main() -> int:
             sequence_results,
             thresholds=decision_search_thresholds,
             min_consecutive_values=decision_search_min_values,
+            primary_metric=str(args.decision_search_primary_metric),
             configured_threshold=float(args.threshold),
             configured_min_consecutive_positive=int(args.min_consecutive_positive),
             strict_early_tolerance_frames=int(strict_early_tolerance_frames),
@@ -2104,9 +2147,10 @@ def main() -> int:
                 ),
                 "decision_rule_search": {
                     "enabled": bool(args.optimize_video_decision),
-                    "selection_metric": "accuracy",
+                    "selection_metric": str(args.decision_search_primary_metric),
                     "search_thresholds": decision_search_thresholds,
                     "search_min_consecutive_values": decision_search_min_values,
+                    "primary_metric": str(args.decision_search_primary_metric),
                     "configured_threshold": float(args.threshold),
                     "configured_min_consecutive_positive": int(args.min_consecutive_positive),
                     "selected_threshold": float(selected_threshold),
@@ -2119,6 +2163,10 @@ def main() -> int:
                     "tie_breakers": [
                         "balanced_accuracy",
                         "f1",
+                        "accuracy",
+                        "recall",
+                        "specificity",
+                        "precision",
                         "closeness_to_configured_threshold",
                         "closeness_to_configured_min_consecutive_positive",
                         "lower_threshold",
@@ -2147,6 +2195,7 @@ def main() -> int:
         "selected_threshold": float(selected_threshold),
         "selected_min_consecutive_positive": int(selected_min_consecutive_positive),
         "optimize_video_decision": bool(args.optimize_video_decision),
+        "decision_search_primary_metric": str(args.decision_search_primary_metric),
         "decision_search_thresholds": decision_search_thresholds,
         "decision_search_min_consecutive_values": decision_search_min_values,
         "arch": args.arch if args.arch is not None else classifier_name,
@@ -2207,6 +2256,7 @@ def main() -> int:
             configured_metrics=configured_metrics,
             best_search_row=decision_search_best_row,
             num_combinations=int(len(decision_search_rows or [])),
+            primary_metric=str(args.decision_search_primary_metric),
         )
     print_metrics(metrics, title=f"{DATASET_NAME} clip-level video metrics")
     if strict_video_metrics is not None:
