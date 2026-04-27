@@ -108,6 +108,7 @@ DEFAULT_STRICT_EARLY_TOLERANCE_FRAMES = 0
 GT_PHASE_MODE_CHOICES = ("transition_and_post", "transition_only")
 VIDEO_DECISION_MODE_CHOICES = ("consecutive", "max_score")
 SCORE_SMOOTHING_CHOICES = ("none", "sma", "ema")
+PAD_SHORT_CLIPS_CHOICES = ("none", "replicate_last", "replicate_first", "mirror")
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -260,6 +261,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.4,
         help="EMA alpha for --score-smoothing ema. Default: 0.4.",
+    )
+    parser.add_argument(
+        "--pad-short-clips",
+        type=str,
+        default="none",
+        choices=PAD_SHORT_CLIPS_CHOICES,
+        help=(
+            "Opt-in padding mode for clips shorter than the classifier window length so they produce one "
+            "evaluated window. Default: none."
+        ),
     )
     parser.add_argument(
         "--strict-early-tolerance-frames",
@@ -842,6 +853,7 @@ def read_cached_window_predictions(path: Path) -> List[Dict[str, Any]]:
         "is_positive",
         "event_decision",
         "confirmed_detection_alert",
+        "padded_window",
         "timing_annotation_available",
         "overlaps_annotated_fall_event",
         "overlaps_transition_phase",
@@ -1120,6 +1132,60 @@ def apply_timing_annotation_to_window_row(
     row["overlaps_post_fall_phase"] = bool(overlaps_post_fall_phase)
 
 
+def pad_sampled_sequences_for_short_clip(
+    sampled_xy: List[np.ndarray],
+    sampled_cf: List[np.ndarray],
+    sampled_raw_idx: List[int],
+    *,
+    target_len: int,
+    pad_mode: str,
+) -> None:
+    if pad_mode not in PAD_SHORT_CLIPS_CHOICES:
+        raise ValueError("--pad-short-clips must be one of: " + ", ".join(PAD_SHORT_CLIPS_CHOICES))
+    if pad_mode == "none" or len(sampled_xy) == 0:
+        return
+
+    needed = int(target_len) - int(len(sampled_xy))
+    if needed <= 0:
+        return
+
+    if pad_mode == "replicate_first":
+        first_xy = sampled_xy[0].copy()
+        first_cf = sampled_cf[0].copy()
+        first_raw_idx = int(sampled_raw_idx[0])
+        prepend_raw_idx = [max(0, first_raw_idx - needed + idx) for idx in range(needed)]
+        sampled_xy[:0] = [first_xy.copy() for _ in range(needed)]
+        sampled_cf[:0] = [first_cf.copy() for _ in range(needed)]
+        sampled_raw_idx[:0] = prepend_raw_idx
+        return
+
+    if pad_mode == "replicate_last":
+        last_xy = sampled_xy[-1].copy()
+        last_cf = sampled_cf[-1].copy()
+        last_raw_idx = int(sampled_raw_idx[-1])
+        for offset in range(1, needed + 1):
+            sampled_xy.append(last_xy.copy())
+            sampled_cf.append(last_cf.copy())
+            sampled_raw_idx.append(int(last_raw_idx + offset))
+        return
+
+    if pad_mode == "mirror":
+        source_len = int(len(sampled_xy))
+        for offset in range(1, needed + 1):
+            if source_len == 1:
+                source_idx = 0
+            else:
+                period = max(1, 2 * source_len - 2)
+                phase = int(offset) % int(period)
+                source_idx = source_len - 1 - phase if phase < source_len else phase - source_len + 1
+            sampled_xy.append(sampled_xy[source_idx].copy())
+            sampled_cf.append(sampled_cf[source_idx].copy())
+            sampled_raw_idx.append(int(sampled_raw_idx[-1]) + 1)
+        return
+
+    raise ValueError("--pad-short-clips must be one of: " + ", ".join(PAD_SHORT_CLIPS_CHOICES))
+
+
 def _append_window_row(
     rows: List[Dict[str, Any]],
     *,
@@ -1137,6 +1203,7 @@ def _append_window_row(
     assembly_ms: float,
     fps: float,
     conf_thres: float,
+    padded_window: bool = False,
 ) -> None:
     valid_pose_frames = int(np.sum(np.any(window_data.conf_seq > float(conf_thres), axis=1)))
     missing_pose_frames = int(window_data.conf_seq.shape[0] - valid_pose_frames)
@@ -1161,6 +1228,7 @@ def _append_window_row(
         "is_positive": bool(float(fall_score) >= float(threshold)),
         "consecutive_positive_count": 0,
         "event_decision": False,
+        "padded_window": bool(padded_window),
         "predicted_class_id": int(prediction.pred_id),
         "predicted_class_name": str(prediction.pred_label),
         "prediction_confidence": float(prediction.confidence) if prediction.confidence is not None else None,
@@ -1580,6 +1648,7 @@ def evaluate_sequence(
     score_smoothing: str,
     score_smoothing_window: int,
     score_smoothing_alpha: float,
+    pad_short_clips: str,
     strict_early_tolerance_frames: int,
     strict_late_tolerance_frames: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1597,6 +1666,7 @@ def evaluate_sequence(
     sampled_pose_found_frames = 0
     next_window_id = 0
     next_window_start = 0
+    num_padded_windows = 0
     image_shape_hw: Optional[Tuple[int, int]] = None
     policy = classifier.window_policy
     conf_thres = float(getattr(classifier, "conf_thres", 0.0))
@@ -1717,6 +1787,58 @@ def evaluate_sequence(
             next_window_id += 1
             next_window_start += int(policy.sampled_window_stride)
 
+    if (
+        str(pad_short_clips) != "none"
+        and int(next_window_id) == 0
+        and image_shape_hw is not None
+        and len(sampled_xy) > 0
+        and len(sampled_xy) < int(policy.sampled_window_len)
+    ):
+        pad_sampled_sequences_for_short_clip(
+            sampled_xy,
+            sampled_cf,
+            sampled_raw_idx,
+            target_len=int(policy.sampled_window_len),
+            pad_mode=str(pad_short_clips),
+        )
+        assembled = _assemble_window(
+            sampled_xy=sampled_xy,
+            sampled_cf=sampled_cf,
+            sampled_raw_idx=sampled_raw_idx,
+            sampled_start=int(next_window_start),
+            sampled_len=int(policy.sampled_window_len),
+            cap_done=True,
+            pad_tail=False,
+            image_shape=(int(image_shape_hw[0]), int(image_shape_hw[1])),
+            video_stem=sequence.video_id,
+        )
+        if assembled is not None:
+            window_data, assembly_ms = assembled
+            prepared_input, prep_metrics = classifier.prepare_window(window_data=window_data, sync_cuda_timing=False)
+            prediction, infer_metrics = classifier.infer(prepared_input=prepared_input, sync_cuda_timing=False)
+            fall_score, probs_np, fall_score_source = resolve_fall_score(classifier, prepared_input, prediction)
+            _append_window_row(
+                window_rows,
+                sequence=sequence,
+                timing_annotation=timing_annotation,
+                window_id=next_window_id,
+                window_data=window_data,
+                prediction=prediction,
+                fall_score=fall_score,
+                probs_np=probs_np,
+                fall_score_source=fall_score_source,
+                threshold=threshold,
+                prep_metrics=prep_metrics,
+                infer_metrics=infer_metrics,
+                assembly_ms=assembly_ms,
+                fps=fps,
+                conf_thres=conf_thres,
+                padded_window=True,
+            )
+            next_window_id += 1
+            next_window_start += int(policy.sampled_window_stride)
+            num_padded_windows += 1
+
     annotated_event_start_frame: Optional[int] = None
     annotated_event_end_frame: Optional[int] = None
     annotated_event_start_time_s: Optional[float] = None
@@ -1737,6 +1859,7 @@ def evaluate_sequence(
         "gt_phase_mode": str(gt_phase_mode),
         "num_frames": int(len(sequence.frame_paths)),
         "num_windows": int(len(window_rows)),
+        "num_padded_windows": int(num_padded_windows),
         "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
         "annotated_event_start_frame": annotated_event_start_frame,
         "annotated_event_end_frame": annotated_event_end_frame,
@@ -1800,6 +1923,7 @@ def build_sequence_results_from_cached_windows(
             row["video_id"] = sequence.video_id
             row["video_path"] = str(sequence.frame_dir)
             row["video_label"] = sequence.video_label
+            row["padded_window"] = bool(row.get("padded_window", False))
             if row.get("start_frame") is not None:
                 row["start_time_s"] = frame_time_seconds(int(row["start_frame"]) - 1, fps)
             if row.get("end_frame") is not None:
@@ -1830,6 +1954,7 @@ def build_sequence_results_from_cached_windows(
             "gt_phase_mode": str(gt_phase_mode),
             "num_frames": int(len(sequence.frame_paths)),
             "num_windows": int(len(window_rows)),
+            "num_padded_windows": int(sum(1 for row in window_rows if bool(row.get("padded_window", False)))),
             "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
             "annotated_event_start_frame": annotated_event_start_frame,
             "annotated_event_end_frame": annotated_event_end_frame,
@@ -2050,6 +2175,8 @@ def main() -> int:
         or float(args.score_smoothing_alpha) > 1.0
     ):
         raise ValueError("--score-smoothing-alpha must be a finite value in [0, 1].")
+    if str(args.pad_short_clips) not in PAD_SHORT_CLIPS_CHOICES:
+        raise ValueError("--pad-short-clips must be one of: " + ", ".join(PAD_SHORT_CLIPS_CHOICES))
     if args.search_thresholds is not None:
         for value in args.search_thresholds:
             if (not math.isfinite(float(value))) or float(value) < 0.0 or float(value) > 1.0:
@@ -2230,6 +2357,7 @@ def main() -> int:
                                 "gt_phase_mode": str(args.gt_phase_mode),
                                 "num_frames": 0,
                                 "num_windows": 0,
+                                "num_padded_windows": 0,
                                 "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
                                 "annotated_event_start_frame": annotated_event_start_frame,
                                 "annotated_event_end_frame": annotated_event_end_frame,
@@ -2274,6 +2402,7 @@ def main() -> int:
                     score_smoothing=str(args.score_smoothing),
                     score_smoothing_window=int(args.score_smoothing_window),
                     score_smoothing_alpha=float(args.score_smoothing_alpha),
+                    pad_short_clips=str(args.pad_short_clips),
                     strict_early_tolerance_frames=int(strict_early_tolerance_frames),
                     strict_late_tolerance_frames=int(strict_late_tolerance_frames),
                 )
@@ -2292,6 +2421,7 @@ def main() -> int:
                                 "gt_phase_mode": str(args.gt_phase_mode),
                                 "num_frames": int(len(sequence.frame_paths)),
                                 "num_windows": 0,
+                                "num_padded_windows": 0,
                                 "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
                                 "annotated_event_start_frame": annotated_event_start_frame,
                                 "annotated_event_end_frame": annotated_event_end_frame,
@@ -2465,6 +2595,7 @@ def main() -> int:
         "consecutive_positive_count",
         "event_decision",
         "confirmed_detection_alert",
+        "padded_window",
         "predicted_class_id",
         "predicted_class_name",
         "prediction_confidence",
@@ -2499,6 +2630,7 @@ def main() -> int:
         "video_label",
         "num_frames",
         "num_windows",
+        "num_padded_windows",
         "num_positive_windows",
         "max_fall_score",
         "first_positive_window_id",
@@ -2630,6 +2762,7 @@ def main() -> int:
         "score_smoothing": str(args.score_smoothing),
         "score_smoothing_window": int(args.score_smoothing_window),
         "score_smoothing_alpha": float(args.score_smoothing_alpha),
+        "pad_short_clips": str(args.pad_short_clips),
         "strict_metric_alert_anchor": "first_confirmed_positive_window_end_frame",
         "strict_early_tolerance_frames": int(strict_early_tolerance_frames),
         "strict_late_tolerance_frames": int(strict_late_tolerance_frames),
