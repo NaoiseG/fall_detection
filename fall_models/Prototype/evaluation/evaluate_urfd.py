@@ -171,6 +171,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory where window_predictions.csv, video_summary.csv, metrics.json, and run_config.json are written.",
     )
     parser.add_argument(
+        "--reuse-window-predictions",
+        type=Path,
+        default=None,
+        help=(
+            "Optional existing window_predictions.csv to reuse instead of rerunning pose/classifier inference. "
+            "The script rebuilds video summaries, metrics, GT phase overlaps, smoothing, and decision search from "
+            "the cached fall_score values."
+        ),
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -774,6 +784,92 @@ def write_csv(path: Path, rows: Sequence[Dict[str, Any]], fieldnames: Sequence[s
             writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
+def parse_cached_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "y"}
+
+
+def parse_cached_optional_int(value: Any) -> Optional[int]:
+    text = str(value).strip()
+    if not text:
+        return None
+    return int(float(text))
+
+
+def parse_cached_optional_float(value: Any) -> Optional[float]:
+    text = str(value).strip()
+    if not text:
+        return None
+    return float(text)
+
+
+def read_cached_window_predictions(path: Path) -> List[Dict[str, Any]]:
+    int_fields = {
+        "window_id",
+        "start_frame",
+        "end_frame",
+        "num_frames_in_window",
+        "consecutive_positive_count",
+        "predicted_class_id",
+        "window_start_raw_idx",
+        "window_end_raw_idx",
+        "sampled_start_idx",
+        "sampled_end_idx",
+        "num_sampled_frames_in_window",
+        "valid_pose_frames_in_window",
+        "missing_pose_frames_in_window",
+        "annotated_event_start_frame",
+        "annotated_event_end_frame",
+        "annotated_positive_frames_in_window",
+    }
+    float_fields = {
+        "start_time_s",
+        "end_time_s",
+        "fall_score",
+        "fall_score_smoothed",
+        "threshold",
+        "prediction_confidence",
+        "window_assembly_ms",
+        "temporal_prep_ms",
+        "temporal_forward_ms",
+        "temporal_total_ms",
+        "annotated_event_start_time_s",
+        "annotated_event_end_time_s",
+    }
+    bool_fields = {
+        "is_positive",
+        "event_decision",
+        "confirmed_detection_alert",
+        "timing_annotation_available",
+        "overlaps_annotated_fall_event",
+        "overlaps_transition_phase",
+        "overlaps_post_fall_phase",
+    }
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows: List[Dict[str, Any]] = []
+        for raw_row in reader:
+            row: Dict[str, Any] = {}
+            for key, value in raw_row.items():
+                if key is None:
+                    continue
+                if key in int_fields:
+                    row[key] = parse_cached_optional_int(value)
+                elif key in float_fields:
+                    row[key] = parse_cached_optional_float(value)
+                elif key in bool_fields:
+                    row[key] = parse_cached_bool(value)
+                else:
+                    row[key] = "" if value is None else value
+            if "fall_score_smoothed" not in row or row.get("fall_score_smoothed") is None:
+                row["fall_score_smoothed"] = float(row.get("fall_score") or 0.0)
+            rows.append(row)
+    return rows
+
+
 def count_field_values(
     rows: Sequence[Dict[str, Any]],
     key: str,
@@ -957,6 +1053,73 @@ def to_human_frame(frame_idx_0based: int) -> int:
     return int(frame_idx_0based) + 1
 
 
+def apply_timing_annotation_to_window_row(
+    row: Dict[str, Any],
+    *,
+    sequence: URFDSequence,
+    timing_annotation: Optional[URFDFallTimingAnnotation],
+    fps: float,
+) -> None:
+    start_frame_1based = int(row.get("start_frame") or 0)
+    end_frame_1based = int(row.get("end_frame") or 0)
+
+    has_timing_annotation = bool(sequence.video_label == "fall" and timing_annotation is not None)
+    annotated_event_start_frame = None
+    annotated_event_end_frame = None
+    overlaps_annotated_fall_event = False
+    annotated_positive_frames_in_window = 0
+    annotated_phase = "non_event"
+    overlaps_transition_phase = False
+    overlaps_post_fall_phase = False
+
+    if has_timing_annotation and timing_annotation is not None:
+        annotated_event_start_frame = int(timing_annotation.event_start_frame)
+        annotated_event_end_frame = int(timing_annotation.event_end_frame)
+        overlap_start = max(start_frame_1based, int(timing_annotation.event_start_frame))
+        overlap_end = min(end_frame_1based, int(timing_annotation.event_end_frame))
+        if overlap_start <= overlap_end:
+            overlaps_annotated_fall_event = True
+            annotated_positive_frames_in_window = int(overlap_end - overlap_start + 1)
+
+        if timing_annotation.transition_start_frame is not None and timing_annotation.transition_end_frame is not None:
+            transition_start = max(start_frame_1based, int(timing_annotation.transition_start_frame))
+            transition_end = min(end_frame_1based, int(timing_annotation.transition_end_frame))
+            overlaps_transition_phase = bool(transition_start <= transition_end)
+
+        if timing_annotation.post_fall_start_frame is not None and timing_annotation.post_fall_end_frame is not None:
+            post_start = max(start_frame_1based, int(timing_annotation.post_fall_start_frame))
+            post_end = min(end_frame_1based, int(timing_annotation.post_fall_end_frame))
+            overlaps_post_fall_phase = bool(post_start <= post_end)
+
+        if overlaps_transition_phase and overlaps_post_fall_phase:
+            annotated_phase = "mixed_event"
+        elif overlaps_transition_phase:
+            annotated_phase = "transition"
+        elif overlaps_post_fall_phase:
+            annotated_phase = "post_fall"
+        elif overlaps_annotated_fall_event:
+            annotated_phase = "event"
+
+    row["timing_annotation_available"] = bool(has_timing_annotation)
+    row["annotated_event_start_frame"] = annotated_event_start_frame
+    row["annotated_event_end_frame"] = annotated_event_end_frame
+    row["annotated_event_start_time_s"] = (
+        frame_time_seconds(int(annotated_event_start_frame) - 1, fps)
+        if annotated_event_start_frame is not None
+        else None
+    )
+    row["annotated_event_end_time_s"] = (
+        frame_time_seconds(int(annotated_event_end_frame) - 1, fps)
+        if annotated_event_end_frame is not None
+        else None
+    )
+    row["overlaps_annotated_fall_event"] = bool(overlaps_annotated_fall_event)
+    row["annotated_positive_frames_in_window"] = int(annotated_positive_frames_in_window)
+    row["annotated_phase"] = str(annotated_phase)
+    row["overlaps_transition_phase"] = bool(overlaps_transition_phase)
+    row["overlaps_post_fall_phase"] = bool(overlaps_post_fall_phase)
+
+
 def _append_window_row(
     rows: List[Dict[str, Any]],
     *,
@@ -979,43 +1142,6 @@ def _append_window_row(
     missing_pose_frames = int(window_data.conf_seq.shape[0] - valid_pose_frames)
     start_frame_1based = to_human_frame(int(window_data.raw_start_idx))
     end_frame_1based = to_human_frame(int(window_data.raw_end_idx))
-
-    has_timing_annotation = bool(sequence.video_label == "fall" and timing_annotation is not None)
-    annotated_event_start_frame = None
-    annotated_event_end_frame = None
-    overlaps_annotated_fall_event = False
-    annotated_positive_frames_in_window = 0
-    annotated_phase = "non_event"
-    overlaps_transition_phase = False
-    overlaps_post_fall_phase = False
-
-    if has_timing_annotation and timing_annotation is not None:
-        annotated_event_start_frame = int(timing_annotation.event_start_frame)
-        annotated_event_end_frame = int(timing_annotation.event_end_frame)
-        overlap_start = max(int(start_frame_1based), int(timing_annotation.event_start_frame))
-        overlap_end = min(int(end_frame_1based), int(timing_annotation.event_end_frame))
-        if overlap_start <= overlap_end:
-            overlaps_annotated_fall_event = True
-            annotated_positive_frames_in_window = int(overlap_end - overlap_start + 1)
-
-        if timing_annotation.transition_start_frame is not None and timing_annotation.transition_end_frame is not None:
-            transition_start = max(int(start_frame_1based), int(timing_annotation.transition_start_frame))
-            transition_end = min(int(end_frame_1based), int(timing_annotation.transition_end_frame))
-            overlaps_transition_phase = bool(transition_start <= transition_end)
-
-        if timing_annotation.post_fall_start_frame is not None and timing_annotation.post_fall_end_frame is not None:
-            post_start = max(int(start_frame_1based), int(timing_annotation.post_fall_start_frame))
-            post_end = min(int(end_frame_1based), int(timing_annotation.post_fall_end_frame))
-            overlaps_post_fall_phase = bool(post_start <= post_end)
-
-        if overlaps_transition_phase and overlaps_post_fall_phase:
-            annotated_phase = "mixed_event"
-        elif overlaps_transition_phase:
-            annotated_phase = "transition"
-        elif overlaps_post_fall_phase:
-            annotated_phase = "post_fall"
-        elif overlaps_annotated_fall_event:
-            annotated_phase = "event"
 
     row = {
         "dataset": sequence.dataset,
@@ -1050,21 +1176,13 @@ def _append_window_row(
         "temporal_prep_ms": float(prep_metrics.get("temporal_prep_ms", 0.0)),
         "temporal_forward_ms": float(infer_metrics.get("temporal_forward_ms", 0.0)),
         "temporal_total_ms": float(prep_metrics.get("temporal_prep_ms", 0.0)) + float(infer_metrics.get("temporal_forward_ms", 0.0)),
-        "timing_annotation_available": bool(has_timing_annotation),
-        "annotated_event_start_frame": annotated_event_start_frame,
-        "annotated_event_end_frame": annotated_event_end_frame,
-        "annotated_event_start_time_s": (
-            frame_time_seconds(int(annotated_event_start_frame) - 1, fps) if annotated_event_start_frame is not None else None
-        ),
-        "annotated_event_end_time_s": (
-            frame_time_seconds(int(annotated_event_end_frame) - 1, fps) if annotated_event_end_frame is not None else None
-        ),
-        "overlaps_annotated_fall_event": bool(overlaps_annotated_fall_event),
-        "annotated_positive_frames_in_window": int(annotated_positive_frames_in_window),
-        "annotated_phase": str(annotated_phase),
-        "overlaps_transition_phase": bool(overlaps_transition_phase),
-        "overlaps_post_fall_phase": bool(overlaps_post_fall_phase),
     }
+    apply_timing_annotation_to_window_row(
+        row,
+        sequence=sequence,
+        timing_annotation=timing_annotation,
+        fps=float(fps),
+    )
     if probs_np is not None:
         row["class_probs"] = json.dumps([float(x) for x in probs_np.tolist()])
     rows.append(row)
@@ -1647,6 +1765,106 @@ def evaluate_sequence(
     return window_rows, video_summary
 
 
+def build_sequence_results_from_cached_windows(
+    sequences: Sequence[URFDSequence],
+    cached_window_rows: Sequence[Dict[str, Any]],
+    *,
+    timing_annotations: Dict[str, URFDFallTimingAnnotation],
+    fps: float,
+    threshold: float,
+    min_consecutive_positive: int,
+    gt_phase_mode: str,
+    decision_mode: str,
+    score_smoothing: str,
+    score_smoothing_window: int,
+    score_smoothing_alpha: float,
+    strict_early_tolerance_frames: int,
+    strict_late_tolerance_frames: int,
+) -> List[Dict[str, Any]]:
+    rows_by_video: Dict[str, List[Dict[str, Any]]] = {}
+    for row in cached_window_rows:
+        video_id = str(row.get("video_id", "")).strip()
+        if not video_id:
+            continue
+        rows_by_video.setdefault(video_id, []).append(dict(row))
+
+    sequence_results: List[Dict[str, Any]] = []
+    for sequence in sequences:
+        timing_annotation = timing_annotations.get(infer_urfd_csv_video_id(sequence.video_id))
+        window_rows = sorted(
+            rows_by_video.get(sequence.video_id, []),
+            key=lambda row: int(row.get("window_id") or 0),
+        )
+        for row in window_rows:
+            row["dataset"] = sequence.dataset
+            row["video_id"] = sequence.video_id
+            row["video_path"] = str(sequence.frame_dir)
+            row["video_label"] = sequence.video_label
+            if row.get("start_frame") is not None:
+                row["start_time_s"] = frame_time_seconds(int(row["start_frame"]) - 1, fps)
+            if row.get("end_frame") is not None:
+                row["end_time_s"] = frame_time_seconds(int(row["end_frame"]) - 1, fps)
+            apply_timing_annotation_to_window_row(
+                row,
+                sequence=sequence,
+                timing_annotation=timing_annotation,
+                fps=float(fps),
+            )
+
+        annotated_event_start_frame: Optional[int] = None
+        annotated_event_end_frame: Optional[int] = None
+        annotated_event_start_time_s: Optional[float] = None
+        annotated_event_end_time_s: Optional[float] = None
+        if timing_annotation is not None and sequence.video_label == "fall":
+            annotated_event_start_frame = int(timing_annotation.event_start_frame)
+            annotated_event_end_frame = int(timing_annotation.event_end_frame)
+            annotated_event_start_time_s = frame_time_seconds(int(annotated_event_start_frame) - 1, fps)
+            annotated_event_end_time_s = frame_time_seconds(int(annotated_event_end_frame) - 1, fps)
+
+        base_video_summary = {
+            "dataset": sequence.dataset,
+            "video_id": sequence.video_id,
+            "video_path": str(sequence.frame_dir),
+            "video_label": sequence.video_label,
+            "fps": float(fps),
+            "gt_phase_mode": str(gt_phase_mode),
+            "num_frames": int(len(sequence.frame_paths)),
+            "num_windows": int(len(window_rows)),
+            "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
+            "annotated_event_start_frame": annotated_event_start_frame,
+            "annotated_event_end_frame": annotated_event_end_frame,
+            "annotated_event_start_time_s": annotated_event_start_time_s,
+            "annotated_event_end_time_s": annotated_event_end_time_s,
+            "num_readable_frames": None,
+            "num_unreadable_frames": None,
+            "pose_found_frames": None,
+            "sampled_pose_found_frames": None,
+            "sequence_root": str(sequence.sequence_root),
+            "frame_dir": str(sequence.frame_dir),
+            "warning": "Loaded from cached window predictions." if window_rows else "No cached window predictions for this sequence.",
+        }
+        video_summary = build_video_summary_for_decision(
+            base_video_summary,
+            window_rows=window_rows,
+            threshold=float(threshold),
+            min_consecutive_positive=int(min_consecutive_positive),
+            decision_mode=str(decision_mode),
+            score_smoothing=str(score_smoothing),
+            score_smoothing_window=int(score_smoothing_window),
+            score_smoothing_alpha=float(score_smoothing_alpha),
+            strict_early_tolerance_frames=int(strict_early_tolerance_frames),
+            strict_late_tolerance_frames=int(strict_late_tolerance_frames),
+            apply_to_rows=True,
+        )
+        sequence_results.append(
+            {
+                "window_rows": window_rows,
+                "base_video_summary": dict(video_summary),
+            }
+        )
+    return sequence_results
+
+
 def compute_metrics(
     video_rows: Sequence[Dict[str, Any]],
     *,
@@ -1855,12 +2073,18 @@ def main() -> int:
     keypoint_weights = args.keypoint_weights.expanduser().resolve()
     classifier_model = args.classifier_model.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
+    reuse_window_predictions = (
+        args.reuse_window_predictions.expanduser().resolve()
+        if args.reuse_window_predictions is not None
+        else None
+    )
     frame_exts = normalize_frame_exts(args.frame_exts)
 
     args.urfd_root = urfd_root
     args.keypoint_weights = keypoint_weights
     args.classifier_model = classifier_model
     args.output_dir = output_dir
+    args.reuse_window_predictions = reuse_window_predictions
 
     if not urfd_root.exists():
         raise FileNotFoundError(f"--urfd-root not found: {urfd_root}")
@@ -1868,6 +2092,8 @@ def main() -> int:
         raise FileNotFoundError(f"--keypoint-weights not found: {keypoint_weights}")
     if not classifier_model.exists():
         raise FileNotFoundError(f"--classifier-model not found: {classifier_model}")
+    if reuse_window_predictions is not None and not reuse_window_predictions.is_file():
+        raise FileNotFoundError(f"--reuse-window-predictions not found: {reuse_window_predictions}")
 
     sequences_all = discover_urfd_sequences(urfd_root, frame_exts)
     if not sequences_all:
@@ -1931,7 +2157,9 @@ def main() -> int:
         args.strict_late_tolerance_frames,
         classifier.window_policy.raw_window_len,
     )
-    pose_pipeline = build_pose_pipeline(args, device=device, keypoint_weights=keypoint_weights, imgsz=resolved_imgsz)
+    pose_pipeline: Optional[PosePipeline] = None
+    if reuse_window_predictions is None:
+        pose_pipeline = build_pose_pipeline(args, device=device, keypoint_weights=keypoint_weights, imgsz=resolved_imgsz)
 
     LOGGER.info(
         "Using classifier arch=%s | raw window=%d stride=%d | sampled window=%d stride=%d | frame_step=%d",
@@ -1942,7 +2170,10 @@ def main() -> int:
         classifier.window_policy.sampled_window_stride,
         classifier.window_policy.frame_step,
     )
-    LOGGER.info("Using pose imgsz=%s on device=%s", f"{resolved_imgsz:g}", device)
+    if pose_pipeline is not None:
+        LOGGER.info("Using pose imgsz=%s on device=%s", f"{resolved_imgsz:g}", device)
+    else:
+        LOGGER.info("Reusing cached window predictions; pose inference will be skipped.")
     LOGGER.info(
         "Strict timing metric: alert uses first confirmed window end frame with allowed interval [fall_start - %d, fall_end + %d].",
         strict_early_tolerance_frames,
@@ -1952,128 +2183,149 @@ def main() -> int:
     sequence_results: List[Dict[str, Any]] = []
 
     start_time = time.perf_counter()
-    seq_iter: Iterable[URFDSequence] = iter_progress(sequences, desc="URFD sequences", total=len(sequences), leave=True)
-    for sequence in seq_iter:
-        timing_annotation = timing_annotations.get(infer_urfd_csv_video_id(sequence.video_id))
-        annotated_event_start_frame: Optional[int] = None
-        annotated_event_end_frame: Optional[int] = None
-        annotated_event_start_time_s: Optional[float] = None
-        annotated_event_end_time_s: Optional[float] = None
-        if timing_annotation is not None and sequence.video_label == "fall":
-            annotated_event_start_frame = int(timing_annotation.event_start_frame)
-            annotated_event_end_frame = int(timing_annotation.event_end_frame)
-            annotated_event_start_time_s = frame_time_seconds(int(annotated_event_start_frame) - 1, float(args.fps))
-            annotated_event_end_time_s = frame_time_seconds(int(annotated_event_end_frame) - 1, float(args.fps))
-
-        if len(sequence.frame_paths) == 0:
-            LOGGER.warning("Sequence has no frames: %s", sequence.frame_dir)
-            sequence_results.append(
-                {
-                    "window_rows": [],
-                    "base_video_summary": build_video_summary_for_decision(
-                        {
-                            "dataset": sequence.dataset,
-                            "video_id": sequence.video_id,
-                            "video_path": str(sequence.frame_dir),
-                            "video_label": sequence.video_label,
-                            "fps": float(args.fps),
-                            "gt_phase_mode": str(args.gt_phase_mode),
-                            "num_frames": 0,
-                            "num_windows": 0,
-                            "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
-                            "annotated_event_start_frame": annotated_event_start_frame,
-                            "annotated_event_end_frame": annotated_event_end_frame,
-                            "annotated_event_start_time_s": annotated_event_start_time_s,
-                            "annotated_event_end_time_s": annotated_event_end_time_s,
-                            "num_readable_frames": 0,
-                            "num_unreadable_frames": 0,
-                            "pose_found_frames": 0,
-                            "sampled_pose_found_frames": 0,
-                            "sequence_root": str(sequence.sequence_root),
-                            "frame_dir": str(sequence.frame_dir),
-                            "warning": "Sequence has no frames.",
-                        },
-                        window_rows=[],
-                        threshold=float(args.threshold),
-                        min_consecutive_positive=int(args.min_consecutive_positive),
-                        decision_mode=str(args.video_decision_mode),
-                        score_smoothing=str(args.score_smoothing),
-                        score_smoothing_window=int(args.score_smoothing_window),
-                        score_smoothing_alpha=float(args.score_smoothing_alpha),
-                        strict_early_tolerance_frames=int(strict_early_tolerance_frames),
-                        strict_late_tolerance_frames=int(strict_late_tolerance_frames),
-                        apply_to_rows=True,
-                    ),
-                }
-            )
-            continue
-
-        try:
-            window_rows, video_summary = evaluate_sequence(
-                sequence,
-                pose_pipeline=pose_pipeline,
-                classifier=classifier,
-                timing_annotation=timing_annotation,
-                fps=float(args.fps),
-                threshold=float(args.threshold),
-                min_consecutive_positive=int(args.min_consecutive_positive),
-                gt_phase_mode=str(args.gt_phase_mode),
-                decision_mode=str(args.video_decision_mode),
-                score_smoothing=str(args.score_smoothing),
-                score_smoothing_window=int(args.score_smoothing_window),
-                score_smoothing_alpha=float(args.score_smoothing_alpha),
-                strict_early_tolerance_frames=int(strict_early_tolerance_frames),
-                strict_late_tolerance_frames=int(strict_late_tolerance_frames),
-            )
-        except Exception as exc:
-            LOGGER.warning("Failed to evaluate %s: %s", sequence.video_id, exc)
-            sequence_results.append(
-                {
-                    "window_rows": [],
-                    "base_video_summary": build_video_summary_for_decision(
-                        {
-                            "dataset": sequence.dataset,
-                            "video_id": sequence.video_id,
-                            "video_path": str(sequence.frame_dir),
-                            "video_label": sequence.video_label,
-                            "fps": float(args.fps),
-                            "gt_phase_mode": str(args.gt_phase_mode),
-                            "num_frames": int(len(sequence.frame_paths)),
-                            "num_windows": 0,
-                            "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
-                            "annotated_event_start_frame": annotated_event_start_frame,
-                            "annotated_event_end_frame": annotated_event_end_frame,
-                            "annotated_event_start_time_s": annotated_event_start_time_s,
-                            "annotated_event_end_time_s": annotated_event_end_time_s,
-                            "num_readable_frames": 0,
-                            "num_unreadable_frames": 0,
-                            "pose_found_frames": 0,
-                            "sampled_pose_found_frames": 0,
-                            "sequence_root": str(sequence.sequence_root),
-                            "frame_dir": str(sequence.frame_dir),
-                            "warning": str(exc),
-                        },
-                        window_rows=[],
-                        threshold=float(args.threshold),
-                        min_consecutive_positive=int(args.min_consecutive_positive),
-                        decision_mode=str(args.video_decision_mode),
-                        score_smoothing=str(args.score_smoothing),
-                        score_smoothing_window=int(args.score_smoothing_window),
-                        score_smoothing_alpha=float(args.score_smoothing_alpha),
-                        strict_early_tolerance_frames=int(strict_early_tolerance_frames),
-                        strict_late_tolerance_frames=int(strict_late_tolerance_frames),
-                        apply_to_rows=True,
-                    ),
-                }
-            )
-            continue
-
-        sequence_results.append(
-            {
-                "window_rows": window_rows,
-                "base_video_summary": dict(video_summary),
-            }
+    if reuse_window_predictions is not None:
+        print(f"Reusing cached window predictions from {reuse_window_predictions}")
+        cached_window_rows = read_cached_window_predictions(reuse_window_predictions)
+        sequence_results = build_sequence_results_from_cached_windows(
+            sequences,
+            cached_window_rows,
+            timing_annotations=timing_annotations,
+            fps=float(args.fps),
+            threshold=float(args.threshold),
+            min_consecutive_positive=int(args.min_consecutive_positive),
+            gt_phase_mode=str(args.gt_phase_mode),
+            decision_mode=str(args.video_decision_mode),
+            score_smoothing=str(args.score_smoothing),
+            score_smoothing_window=int(args.score_smoothing_window),
+            score_smoothing_alpha=float(args.score_smoothing_alpha),
+            strict_early_tolerance_frames=int(strict_early_tolerance_frames),
+            strict_late_tolerance_frames=int(strict_late_tolerance_frames),
         )
+    else:
+        seq_iter: Iterable[URFDSequence] = iter_progress(sequences, desc="URFD sequences", total=len(sequences), leave=True)
+        for sequence in seq_iter:
+            timing_annotation = timing_annotations.get(infer_urfd_csv_video_id(sequence.video_id))
+            annotated_event_start_frame: Optional[int] = None
+            annotated_event_end_frame: Optional[int] = None
+            annotated_event_start_time_s: Optional[float] = None
+            annotated_event_end_time_s: Optional[float] = None
+            if timing_annotation is not None and sequence.video_label == "fall":
+                annotated_event_start_frame = int(timing_annotation.event_start_frame)
+                annotated_event_end_frame = int(timing_annotation.event_end_frame)
+                annotated_event_start_time_s = frame_time_seconds(int(annotated_event_start_frame) - 1, float(args.fps))
+                annotated_event_end_time_s = frame_time_seconds(int(annotated_event_end_frame) - 1, float(args.fps))
+
+            if len(sequence.frame_paths) == 0:
+                LOGGER.warning("Sequence has no frames: %s", sequence.frame_dir)
+                sequence_results.append(
+                    {
+                        "window_rows": [],
+                        "base_video_summary": build_video_summary_for_decision(
+                            {
+                                "dataset": sequence.dataset,
+                                "video_id": sequence.video_id,
+                                "video_path": str(sequence.frame_dir),
+                                "video_label": sequence.video_label,
+                                "fps": float(args.fps),
+                                "gt_phase_mode": str(args.gt_phase_mode),
+                                "num_frames": 0,
+                                "num_windows": 0,
+                                "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
+                                "annotated_event_start_frame": annotated_event_start_frame,
+                                "annotated_event_end_frame": annotated_event_end_frame,
+                                "annotated_event_start_time_s": annotated_event_start_time_s,
+                                "annotated_event_end_time_s": annotated_event_end_time_s,
+                                "num_readable_frames": 0,
+                                "num_unreadable_frames": 0,
+                                "pose_found_frames": 0,
+                                "sampled_pose_found_frames": 0,
+                                "sequence_root": str(sequence.sequence_root),
+                                "frame_dir": str(sequence.frame_dir),
+                                "warning": "Sequence has no frames.",
+                            },
+                            window_rows=[],
+                            threshold=float(args.threshold),
+                            min_consecutive_positive=int(args.min_consecutive_positive),
+                            decision_mode=str(args.video_decision_mode),
+                            score_smoothing=str(args.score_smoothing),
+                            score_smoothing_window=int(args.score_smoothing_window),
+                            score_smoothing_alpha=float(args.score_smoothing_alpha),
+                            strict_early_tolerance_frames=int(strict_early_tolerance_frames),
+                            strict_late_tolerance_frames=int(strict_late_tolerance_frames),
+                            apply_to_rows=True,
+                        ),
+                    }
+                )
+                continue
+
+            try:
+                if pose_pipeline is None:
+                    raise RuntimeError("Pose pipeline is unavailable while not using cached window predictions.")
+                window_rows, video_summary = evaluate_sequence(
+                    sequence,
+                    pose_pipeline=pose_pipeline,
+                    classifier=classifier,
+                    timing_annotation=timing_annotation,
+                    fps=float(args.fps),
+                    threshold=float(args.threshold),
+                    min_consecutive_positive=int(args.min_consecutive_positive),
+                    gt_phase_mode=str(args.gt_phase_mode),
+                    decision_mode=str(args.video_decision_mode),
+                    score_smoothing=str(args.score_smoothing),
+                    score_smoothing_window=int(args.score_smoothing_window),
+                    score_smoothing_alpha=float(args.score_smoothing_alpha),
+                    strict_early_tolerance_frames=int(strict_early_tolerance_frames),
+                    strict_late_tolerance_frames=int(strict_late_tolerance_frames),
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to evaluate %s: %s", sequence.video_id, exc)
+                sequence_results.append(
+                    {
+                        "window_rows": [],
+                        "base_video_summary": build_video_summary_for_decision(
+                            {
+                                "dataset": sequence.dataset,
+                                "video_id": sequence.video_id,
+                                "video_path": str(sequence.frame_dir),
+                                "video_label": sequence.video_label,
+                                "fps": float(args.fps),
+                                "gt_phase_mode": str(args.gt_phase_mode),
+                                "num_frames": int(len(sequence.frame_paths)),
+                                "num_windows": 0,
+                                "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
+                                "annotated_event_start_frame": annotated_event_start_frame,
+                                "annotated_event_end_frame": annotated_event_end_frame,
+                                "annotated_event_start_time_s": annotated_event_start_time_s,
+                                "annotated_event_end_time_s": annotated_event_end_time_s,
+                                "num_readable_frames": 0,
+                                "num_unreadable_frames": 0,
+                                "pose_found_frames": 0,
+                                "sampled_pose_found_frames": 0,
+                                "sequence_root": str(sequence.sequence_root),
+                                "frame_dir": str(sequence.frame_dir),
+                                "warning": str(exc),
+                            },
+                            window_rows=[],
+                            threshold=float(args.threshold),
+                            min_consecutive_positive=int(args.min_consecutive_positive),
+                            decision_mode=str(args.video_decision_mode),
+                            score_smoothing=str(args.score_smoothing),
+                            score_smoothing_window=int(args.score_smoothing_window),
+                            score_smoothing_alpha=float(args.score_smoothing_alpha),
+                            strict_early_tolerance_frames=int(strict_early_tolerance_frames),
+                            strict_late_tolerance_frames=int(strict_late_tolerance_frames),
+                            apply_to_rows=True,
+                        ),
+                    }
+                )
+                continue
+
+            sequence_results.append(
+                {
+                    "window_rows": window_rows,
+                    "base_video_summary": dict(video_summary),
+                }
+            )
 
     elapsed_s = time.perf_counter() - start_time
 
@@ -2365,6 +2617,7 @@ def main() -> int:
         "urfd_root": str(urfd_root),
         "keypoint_weights": str(keypoint_weights),
         "classifier_model": str(classifier_model),
+        "reuse_window_predictions": None if reuse_window_predictions is None else str(reuse_window_predictions),
         "device": str(device),
         "resolved_pose_imgsz": float(resolved_imgsz),
         "resolved_pose_half": bool(resolve_pose_half_arg(args.half, keypoint_weights, device)),
