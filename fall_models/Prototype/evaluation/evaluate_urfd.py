@@ -105,6 +105,9 @@ DECISION_SEARCH_PRIMARY_METRIC_CHOICES = (
 )
 DEFAULT_MOTIONBERT_CONFIG = "configs/action/MB_ft_UPFall_xsub.yaml"
 DEFAULT_STRICT_EARLY_TOLERANCE_FRAMES = 0
+GT_PHASE_MODE_CHOICES = ("transition_and_post", "transition_only")
+VIDEO_DECISION_MODE_CHOICES = ("consecutive", "max_score")
+SCORE_SMOOTHING_CHOICES = ("none", "sma", "ema")
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -126,6 +129,7 @@ class URFDSequence:
 class URFDFallTimingAnnotation:
     csv_video_id: str
     source_csv: Path
+    gt_phase_mode: str
     event_start_frame: int
     event_end_frame: int
     transition_start_frame: Optional[int]
@@ -207,6 +211,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MIN_CONSECUTIVE_POSITIVE,
         help="Minimum consecutive positive windows required to mark a sequence as detected_fall. Default: 3.",
+    )
+    parser.add_argument(
+        "--gt-phase-mode",
+        type=str,
+        default="transition_and_post",
+        choices=GT_PHASE_MODE_CHOICES,
+        help=(
+            "URFD timing CSV phases used as the annotated fall event. transition_and_post keeps phases >= 0; "
+            "transition_only uses only phase 0. Default: transition_and_post."
+        ),
+    )
+    parser.add_argument(
+        "--video-decision-mode",
+        type=str,
+        default="consecutive",
+        choices=VIDEO_DECISION_MODE_CHOICES,
+        help=(
+            "Video-level decision rule. consecutive uses --min-consecutive-positive; max_score triggers on any "
+            "window at or above --threshold. Default: consecutive."
+        ),
+    )
+    parser.add_argument(
+        "--score-smoothing",
+        type=str,
+        default="none",
+        choices=SCORE_SMOOTHING_CHOICES,
+        help="Optional temporal smoothing applied to fall_score before video-decision logic. Default: none.",
+    )
+    parser.add_argument(
+        "--score-smoothing-window",
+        type=int,
+        default=5,
+        help="Trailing window size for --score-smoothing sma. Default: 5.",
+    )
+    parser.add_argument(
+        "--score-smoothing-alpha",
+        type=float,
+        default=0.4,
+        help="EMA alpha for --score-smoothing ema. Default: 0.4.",
     )
     parser.add_argument(
         "--strict-early-tolerance-frames",
@@ -560,7 +603,14 @@ def _safe_int_from_csv(value: str) -> Optional[int]:
         return None
 
 
-def load_urfd_fall_timing_annotations(urfd_root: Path) -> Tuple[Dict[str, URFDFallTimingAnnotation], Optional[Path]]:
+def load_urfd_fall_timing_annotations(
+    urfd_root: Path,
+    *,
+    gt_phase_mode: str = "transition_and_post",
+) -> Tuple[Dict[str, URFDFallTimingAnnotation], Optional[Path]]:
+    if gt_phase_mode not in GT_PHASE_MODE_CHOICES:
+        raise ValueError("--gt-phase-mode must be one of: " + ", ".join(GT_PHASE_MODE_CHOICES))
+
     csv_path = find_urfd_annotation_csv(urfd_root, "urfall-cam0-falls.csv")
     if csv_path is None:
         return {}, None
@@ -580,14 +630,18 @@ def load_urfd_fall_timing_annotations(urfd_root: Path) -> Tuple[Dict[str, URFDFa
     annotations: Dict[str, URFDFallTimingAnnotation] = {}
     for csv_video_id, values in rows_by_video.items():
         values.sort(key=lambda item: item[0])
-        event_frames = [frame for frame, phase in values if phase >= 0]
-        if not event_frames:
-            continue
         transition_frames = [frame for frame, phase in values if phase == 0]
         post_fall_frames = [frame for frame, phase in values if phase == 1]
+        if gt_phase_mode == "transition_only":
+            event_frames = list(transition_frames)
+        else:
+            event_frames = [frame for frame, phase in values if phase >= 0]
+        if not event_frames:
+            continue
         annotations[csv_video_id] = URFDFallTimingAnnotation(
             csv_video_id=csv_video_id,
             source_csv=csv_path,
+            gt_phase_mode=str(gt_phase_mode),
             event_start_frame=int(min(event_frames)),
             event_end_frame=int(max(event_frames)),
             transition_start_frame=int(min(transition_frames)) if transition_frames else None,
@@ -662,6 +716,35 @@ def normalize_search_min_consecutive_values(
     if any(int(value) <= 0 for value in normalized):
         raise ValueError("All decision-search min-consecutive-positive values must be >= 1.")
     return normalized
+
+
+def smooth_fall_scores(
+    scores: Sequence[float],
+    *,
+    score_smoothing: str,
+    score_smoothing_window: int,
+    score_smoothing_alpha: float,
+) -> List[float]:
+    raw_scores = [float(score) for score in scores]
+    if score_smoothing == "none":
+        return raw_scores
+    if score_smoothing == "sma":
+        window = max(1, int(score_smoothing_window))
+        smoothed: List[float] = []
+        for idx in range(len(raw_scores)):
+            start_idx = max(0, idx - window + 1)
+            values = raw_scores[start_idx:idx + 1]
+            smoothed.append(float(sum(values) / len(values)))
+        return smoothed
+    if score_smoothing == "ema":
+        if not raw_scores:
+            return []
+        alpha = float(score_smoothing_alpha)
+        smoothed = [float(raw_scores[0])]
+        for score in raw_scores[1:]:
+            smoothed.append(float(alpha * float(score) + (1.0 - alpha) * smoothed[-1]))
+        return smoothed
+    raise ValueError("--score-smoothing must be one of: " + ", ".join(SCORE_SMOOTHING_CHOICES))
 
 
 def resolve_strict_late_tolerance_frames(explicit_value: Optional[int], raw_window_len: int) -> int:
@@ -946,6 +1029,7 @@ def _append_window_row(
         "end_time_s": frame_time_seconds(int(window_data.raw_end_idx), fps),
         "num_frames_in_window": int(window_data.raw_end_idx - window_data.raw_start_idx + 1),
         "fall_score": float(fall_score),
+        "fall_score_smoothed": float(fall_score),
         "predicted_label": "fall" if int(prediction.pred_id) == 0 else "non_fall",
         "threshold": float(threshold),
         "is_positive": bool(float(fall_score) >= float(threshold)),
@@ -994,12 +1078,27 @@ def compute_video_decision_fields(
     annotated_event_start_time_s: Optional[float],
     threshold: float,
     min_consecutive_positive: int,
+    decision_mode: str,
+    score_smoothing: str,
+    score_smoothing_window: int,
+    score_smoothing_alpha: float,
     apply_to_rows: bool,
 ) -> Dict[str, Any]:
+    if decision_mode not in VIDEO_DECISION_MODE_CHOICES:
+        raise ValueError("--video-decision-mode must be one of: " + ", ".join(VIDEO_DECISION_MODE_CHOICES))
+
     ordered_rows = sorted(window_rows, key=lambda row: int(row.get("window_id", 0)))
+    smoothed_scores = smooth_fall_scores(
+        [float(row.get("fall_score", 0.0)) for row in ordered_rows],
+        score_smoothing=str(score_smoothing),
+        score_smoothing_window=int(score_smoothing_window),
+        score_smoothing_alpha=float(score_smoothing_alpha),
+    )
 
     consecutive_positive = 0
-    detected_fall = False
+    consecutive_detected_fall = False
+    consecutive_detection_run_start_row: Optional[Dict[str, Any]] = None
+    consecutive_confirmed_detection_row: Optional[Dict[str, Any]] = None
     detection_run_start_row: Optional[Dict[str, Any]] = None
     confirmed_detection_row: Optional[Dict[str, Any]] = None
     max_fall_score = 0.0
@@ -1008,15 +1107,19 @@ def compute_video_decision_fields(
     timing_hit_row: Optional[Dict[str, Any]] = None
 
     for idx, row in enumerate(ordered_rows):
-        fall_score = float(row.get("fall_score", 0.0))
+        fall_score = float(smoothed_scores[idx])
         is_positive = bool(fall_score >= float(threshold))
-        confirmed_detection_alert = False
+        selected_confirmed_detection_alert = False
 
         if is_positive:
             num_positive_windows += 1
             consecutive_positive += 1
             if first_positive_window_id is None:
                 first_positive_window_id = int(row["window_id"])
+            if decision_mode == "max_score" and confirmed_detection_row is None:
+                detection_run_start_row = row
+                confirmed_detection_row = row
+                selected_confirmed_detection_alert = True
             if timing_hit_row is None and bool(row.get("overlaps_annotated_fall_event", False)):
                 timing_hit_row = row
         else:
@@ -1024,19 +1127,28 @@ def compute_video_decision_fields(
 
         max_fall_score = max(max_fall_score, fall_score)
 
-        if (not detected_fall) and consecutive_positive >= int(min_consecutive_positive):
-            detected_fall = True
+        if (not consecutive_detected_fall) and consecutive_positive >= int(min_consecutive_positive):
+            consecutive_detected_fall = True
             start_idx = max(0, idx - int(min_consecutive_positive) + 1)
-            detection_run_start_row = ordered_rows[start_idx]
-            confirmed_detection_row = row
-            confirmed_detection_alert = True
+            consecutive_detection_run_start_row = ordered_rows[start_idx]
+            consecutive_confirmed_detection_row = row
+            if decision_mode == "consecutive":
+                detection_run_start_row = consecutive_detection_run_start_row
+                confirmed_detection_row = consecutive_confirmed_detection_row
+                selected_confirmed_detection_alert = True
 
         if apply_to_rows:
+            row["fall_score_smoothed"] = float(fall_score)
             row["threshold"] = float(threshold)
             row["is_positive"] = bool(is_positive)
             row["consecutive_positive_count"] = int(consecutive_positive)
-            row["event_decision"] = bool(detected_fall)
-            row["confirmed_detection_alert"] = bool(confirmed_detection_alert)
+            row["event_decision"] = bool(consecutive_detected_fall)
+            row["confirmed_detection_alert"] = bool(selected_confirmed_detection_alert)
+
+    if decision_mode == "max_score":
+        detected_fall = bool(confirmed_detection_row is not None and max_fall_score >= float(threshold))
+    else:
+        detected_fall = bool(consecutive_detected_fall)
 
     first_detection_frame: Optional[int] = None
     first_detection_time_s: Optional[float] = None
@@ -1211,6 +1323,10 @@ def build_video_summary_for_decision(
     window_rows: Sequence[Dict[str, Any]],
     threshold: float,
     min_consecutive_positive: int,
+    decision_mode: str,
+    score_smoothing: str,
+    score_smoothing_window: int,
+    score_smoothing_alpha: float,
     strict_early_tolerance_frames: int,
     strict_late_tolerance_frames: int,
     apply_to_rows: bool,
@@ -1224,6 +1340,10 @@ def build_video_summary_for_decision(
             annotated_event_start_time_s=summary.get("annotated_event_start_time_s"),
             threshold=float(threshold),
             min_consecutive_positive=int(min_consecutive_positive),
+            decision_mode=str(decision_mode),
+            score_smoothing=str(score_smoothing),
+            score_smoothing_window=int(score_smoothing_window),
+            score_smoothing_alpha=float(score_smoothing_alpha),
             apply_to_rows=apply_to_rows,
         )
     )
@@ -1245,6 +1365,10 @@ def search_best_video_decision(
     primary_metric: str,
     configured_threshold: float,
     configured_min_consecutive_positive: int,
+    decision_mode: str,
+    score_smoothing: str,
+    score_smoothing_window: int,
+    score_smoothing_alpha: float,
     strict_early_tolerance_frames: int,
     strict_late_tolerance_frames: int,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -1253,6 +1377,10 @@ def search_best_video_decision(
             "--decision-search-primary-metric must be one of: "
             + ", ".join(DECISION_SEARCH_PRIMARY_METRIC_CHOICES)
         )
+    if decision_mode not in VIDEO_DECISION_MODE_CHOICES:
+        raise ValueError("--video-decision-mode must be one of: " + ", ".join(VIDEO_DECISION_MODE_CHOICES))
+    if decision_mode == "max_score":
+        min_consecutive_values = [1]
 
     search_rows: List[Dict[str, Any]] = []
 
@@ -1264,6 +1392,10 @@ def search_best_video_decision(
                     window_rows=result["window_rows"],
                     threshold=float(threshold),
                     min_consecutive_positive=int(min_consecutive_positive),
+                    decision_mode=str(decision_mode),
+                    score_smoothing=str(score_smoothing),
+                    score_smoothing_window=int(score_smoothing_window),
+                    score_smoothing_alpha=float(score_smoothing_alpha),
                     strict_early_tolerance_frames=int(strict_early_tolerance_frames),
                     strict_late_tolerance_frames=int(strict_late_tolerance_frames),
                     apply_to_rows=False,
@@ -1325,6 +1457,11 @@ def evaluate_sequence(
     fps: float,
     threshold: float,
     min_consecutive_positive: int,
+    gt_phase_mode: str,
+    decision_mode: str,
+    score_smoothing: str,
+    score_smoothing_window: int,
+    score_smoothing_alpha: float,
     strict_early_tolerance_frames: int,
     strict_late_tolerance_frames: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1479,6 +1616,7 @@ def evaluate_sequence(
         "video_path": str(sequence.frame_dir),
         "video_label": sequence.video_label,
         "fps": float(fps),
+        "gt_phase_mode": str(gt_phase_mode),
         "num_frames": int(len(sequence.frame_paths)),
         "num_windows": int(len(window_rows)),
         "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
@@ -1498,6 +1636,10 @@ def evaluate_sequence(
         window_rows=window_rows,
         threshold=float(threshold),
         min_consecutive_positive=int(min_consecutive_positive),
+        decision_mode=str(decision_mode),
+        score_smoothing=str(score_smoothing),
+        score_smoothing_window=int(score_smoothing_window),
+        score_smoothing_alpha=float(score_smoothing_alpha),
         strict_early_tolerance_frames=int(strict_early_tolerance_frames),
         strict_late_tolerance_frames=int(strict_late_tolerance_frames),
         apply_to_rows=True,
@@ -1682,6 +1824,14 @@ def main() -> int:
         raise ValueError("--threshold must be a finite value in [0, 1].")
     if int(args.min_consecutive_positive) <= 0:
         raise ValueError("--min-consecutive-positive must be >= 1.")
+    if int(args.score_smoothing_window) <= 0:
+        raise ValueError("--score-smoothing-window must be >= 1.")
+    if (
+        (not math.isfinite(float(args.score_smoothing_alpha)))
+        or float(args.score_smoothing_alpha) < 0.0
+        or float(args.score_smoothing_alpha) > 1.0
+    ):
+        raise ValueError("--score-smoothing-alpha must be a finite value in [0, 1].")
     if args.search_thresholds is not None:
         for value in args.search_thresholds:
             if (not math.isfinite(float(value))) or float(value) < 0.0 or float(value) > 1.0:
@@ -1744,7 +1894,10 @@ def main() -> int:
             f"(limit {DEFAULT_TEST_SEQUENCES_PER_CLASS} per class)."
         )
 
-    timing_annotations, timing_annotation_csv = load_urfd_fall_timing_annotations(urfd_root)
+    timing_annotations, timing_annotation_csv = load_urfd_fall_timing_annotations(
+        urfd_root,
+        gt_phase_mode=str(args.gt_phase_mode),
+    )
     if timing_annotation_csv is not None:
         matched_timing_annotations_all = sum(
             1
@@ -1824,6 +1977,7 @@ def main() -> int:
                             "video_path": str(sequence.frame_dir),
                             "video_label": sequence.video_label,
                             "fps": float(args.fps),
+                            "gt_phase_mode": str(args.gt_phase_mode),
                             "num_frames": 0,
                             "num_windows": 0,
                             "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
@@ -1842,6 +1996,10 @@ def main() -> int:
                         window_rows=[],
                         threshold=float(args.threshold),
                         min_consecutive_positive=int(args.min_consecutive_positive),
+                        decision_mode=str(args.video_decision_mode),
+                        score_smoothing=str(args.score_smoothing),
+                        score_smoothing_window=int(args.score_smoothing_window),
+                        score_smoothing_alpha=float(args.score_smoothing_alpha),
                         strict_early_tolerance_frames=int(strict_early_tolerance_frames),
                         strict_late_tolerance_frames=int(strict_late_tolerance_frames),
                         apply_to_rows=True,
@@ -1859,6 +2017,11 @@ def main() -> int:
                 fps=float(args.fps),
                 threshold=float(args.threshold),
                 min_consecutive_positive=int(args.min_consecutive_positive),
+                gt_phase_mode=str(args.gt_phase_mode),
+                decision_mode=str(args.video_decision_mode),
+                score_smoothing=str(args.score_smoothing),
+                score_smoothing_window=int(args.score_smoothing_window),
+                score_smoothing_alpha=float(args.score_smoothing_alpha),
                 strict_early_tolerance_frames=int(strict_early_tolerance_frames),
                 strict_late_tolerance_frames=int(strict_late_tolerance_frames),
             )
@@ -1874,6 +2037,7 @@ def main() -> int:
                             "video_path": str(sequence.frame_dir),
                             "video_label": sequence.video_label,
                             "fps": float(args.fps),
+                            "gt_phase_mode": str(args.gt_phase_mode),
                             "num_frames": int(len(sequence.frame_paths)),
                             "num_windows": 0,
                             "timing_annotation_available": bool(sequence.video_label == "fall" and timing_annotation is not None),
@@ -1892,6 +2056,10 @@ def main() -> int:
                         window_rows=[],
                         threshold=float(args.threshold),
                         min_consecutive_positive=int(args.min_consecutive_positive),
+                        decision_mode=str(args.video_decision_mode),
+                        score_smoothing=str(args.score_smoothing),
+                        score_smoothing_window=int(args.score_smoothing_window),
+                        score_smoothing_alpha=float(args.score_smoothing_alpha),
                         strict_early_tolerance_frames=int(strict_early_tolerance_frames),
                         strict_late_tolerance_frames=int(strict_late_tolerance_frames),
                         apply_to_rows=True,
@@ -1942,6 +2110,8 @@ def main() -> int:
         args.search_min_consecutive_values,
         configured_min_consecutive_positive=int(args.min_consecutive_positive),
     )
+    if str(args.video_decision_mode) == "max_score":
+        decision_search_min_values = [1]
 
     if bool(args.optimize_video_decision):
         decision_search_best_row, decision_search_rows = search_best_video_decision(
@@ -1951,6 +2121,10 @@ def main() -> int:
             primary_metric=str(args.decision_search_primary_metric),
             configured_threshold=float(args.threshold),
             configured_min_consecutive_positive=int(args.min_consecutive_positive),
+            decision_mode=str(args.video_decision_mode),
+            score_smoothing=str(args.score_smoothing),
+            score_smoothing_window=int(args.score_smoothing_window),
+            score_smoothing_alpha=float(args.score_smoothing_alpha),
             strict_early_tolerance_frames=int(strict_early_tolerance_frames),
             strict_late_tolerance_frames=int(strict_late_tolerance_frames),
         )
@@ -1965,6 +2139,10 @@ def main() -> int:
                     window_rows=result["window_rows"],
                     threshold=float(selected_threshold),
                     min_consecutive_positive=int(selected_min_consecutive_positive),
+                    decision_mode=str(args.video_decision_mode),
+                    score_smoothing=str(args.score_smoothing),
+                    score_smoothing_window=int(args.score_smoothing_window),
+                    score_smoothing_alpha=float(args.score_smoothing_alpha),
                     strict_early_tolerance_frames=int(strict_early_tolerance_frames),
                     strict_late_tolerance_frames=int(strict_late_tolerance_frames),
                     apply_to_rows=True,
@@ -1978,6 +2156,10 @@ def main() -> int:
                 window_rows=result["window_rows"],
                 threshold=float(selected_threshold),
                 min_consecutive_positive=int(selected_min_consecutive_positive),
+                decision_mode=str(args.video_decision_mode),
+                score_smoothing=str(args.score_smoothing),
+                score_smoothing_window=int(args.score_smoothing_window),
+                score_smoothing_alpha=float(args.score_smoothing_alpha),
                 strict_early_tolerance_frames=int(strict_early_tolerance_frames),
                 strict_late_tolerance_frames=int(strict_late_tolerance_frames),
                 apply_to_rows=True,
@@ -2024,6 +2206,7 @@ def main() -> int:
         "end_time_s",
         "num_frames_in_window",
         "fall_score",
+        "fall_score_smoothed",
         "predicted_label",
         "threshold",
         "is_positive",
@@ -2189,6 +2372,11 @@ def main() -> int:
         "fps": float(args.fps),
         "threshold": float(args.threshold),
         "min_consecutive_positive": int(args.min_consecutive_positive),
+        "gt_phase_mode": str(args.gt_phase_mode),
+        "video_decision_mode": str(args.video_decision_mode),
+        "score_smoothing": str(args.score_smoothing),
+        "score_smoothing_window": int(args.score_smoothing_window),
+        "score_smoothing_alpha": float(args.score_smoothing_alpha),
         "strict_metric_alert_anchor": "first_confirmed_positive_window_end_frame",
         "strict_early_tolerance_frames": int(strict_early_tolerance_frames),
         "strict_late_tolerance_frames": int(strict_late_tolerance_frames),
@@ -2236,7 +2424,11 @@ def main() -> int:
                 if seq.video_label == "fall" and infer_urfd_csv_video_id(seq.video_id) in timing_annotations
             )
         ),
-        "timing_ground_truth_positive_rule": "window overlaps annotated frames where urfall-cam0-falls.csv phase_label >= 0",
+        "timing_ground_truth_positive_rule": (
+            "window overlaps annotated frames where urfall-cam0-falls.csv phase_label == 0"
+            if str(args.gt_phase_mode) == "transition_only"
+            else "window overlaps annotated frames where urfall-cam0-falls.csv phase_label >= 0"
+        ),
         "test_mode": bool(args.test),
         "test_sequences_per_class": int(DEFAULT_TEST_SEQUENCES_PER_CLASS),
         "num_sequences_found_total": int(len(sequences_all)),
