@@ -19,7 +19,6 @@ CLASSIFICATION_MODELS = {
     "tcn": "tcn",
     "cnn-lstm": "cnnlstm",
     "st-gcn": "stgcn",
-    "gru": "gru",
     "motionbert": "MotionBERT",
 }
 
@@ -28,8 +27,7 @@ CLASSIFICATION_MODELS = {
 CLASSIFICATION_WEIGHT_FILENAMES = {
     "tcn": "tcn_best.pt",
     "cnn-lstm": "cnnlstm_best.pt",
-    "st-gcn": "stgcn_best.pt",
-    "gru": "gru_best.pt",
+    "st-gcn": "paper_stgcn_best.pt",
     "motionbert": "best_epoch.bin",
 }
 

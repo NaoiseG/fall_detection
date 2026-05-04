@@ -58,9 +58,13 @@ import inference.helpers.dataset as ds
 from inference.helpers.keypoint_runtime import KeypointRuntime
 
 from models.classification.tcn.simple_tcn import TCNBaseline
-from models.classification.gru.simple_gru import GRUBaseline
-from models.classification.stgcn.simple_stgcn import STGCNBaseline
+from models.classification.stgcn.paper_stgcn import PaperSTGCNClassifier
 from models.classification.cnnlstm.cnn_lstm import CNNLSTMTwoHead
+
+try:
+    from models.classification.gru.simple_gru import GRUBaseline
+except ModuleNotFoundError:
+    GRUBaseline = None  # type: ignore[assignment,misc]
 
 K = 17  # COCO-17 joints for Ultralytics pose models
 
@@ -1129,6 +1133,8 @@ def build_temporal_model(
             dropout=0.1,
         )
     elif arch == "gru":
+        if GRUBaseline is None:
+            raise RuntimeError("GRUBaseline import failed (models/classification/gru not found).")
         model = GRUBaseline(
             in_features=in_features,
             num_classes=num_classes,
@@ -1141,14 +1147,13 @@ def build_temporal_model(
     elif arch == "stgcn":
         if node_features is None:
             raise ValueError("STGCN requires node_features (in_features must be divisible by 17).")
-        model = STGCNBaseline(
+        model = PaperSTGCNClassifier(
             num_nodes=17,
             node_features=int(node_features),
             num_classes=num_classes,
-            hidden_channels=128,
-            num_blocks=4,
+            channels=(64, 64, 64, 64, 128, 128, 128, 256, 256, 256),
             t_kernel=9,
-            dropout=0.1,
+            dropout=0.2,
         )
     elif arch == "cnnlstm":
         if CNNLSTMTwoHead is None:
