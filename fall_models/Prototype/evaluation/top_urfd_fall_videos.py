@@ -219,12 +219,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sequences_all = urfd_eval.discover_urfd_sequences(urfd_root, frame_exts)
     if not sequences_all:
         raise RuntimeError(f"No URFD sequences found under {urfd_root}")
-    sequences = urfd_eval.select_test_sequences(sequences_all) if bool(args.test) else sequences_all
+    selected_sequences = urfd_eval.select_test_sequences(sequences_all) if bool(args.test) else sequences_all
+    sequences = [seq for seq in selected_sequences if seq.video_label == "fall"]
+    LOGGER.info("Selected %d URFD fall videos.", len(sequences))
 
-    fall_sequences = [seq for seq in sequences if seq.video_label == "fall"]
-    LOGGER.info("Selected %d URFD videos (%d fall videos).", len(sequences), len(fall_sequences))
-
-    timing_annotations = urfd_eval.load_urfd_fall_timing_annotations(
+    timing_annotations, timing_annotation_csv = urfd_eval.load_urfd_fall_timing_annotations(
         urfd_root,
         gt_phase_mode=str(args.gt_phase_mode),
     )
@@ -232,6 +231,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.warning(
             "No URFD timing annotations were loaded. Fall videos need timing annotations for per-window accuracy."
         )
+    elif timing_annotation_csv is not None:
+        LOGGER.info("Loaded URFD timing annotations from %s.", timing_annotation_csv)
 
     device = str(urfd_eval.pick_device(args.device))
     resolved_imgsz = float(args.imgsz) if args.imgsz is not None else float(urfd_eval.infer_imgsz_from_path(keypoint_weights) or 640.0)
@@ -244,10 +245,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     start_time = time.perf_counter()
     summaries: List[Dict[str, Any]] = []
-    for sequence in urfd_eval.iter_progress(sequences, desc="URFD videos", total=len(sequences)):
-        timing_annotation = None
-        if sequence.video_label == "fall":
-            timing_annotation = timing_annotations.get(urfd_eval.infer_urfd_csv_video_id(sequence.video_id))
+    for sequence in urfd_eval.iter_progress(sequences, desc="URFD fall videos", total=len(sequences)):
+        timing_annotation = timing_annotations.get(urfd_eval.infer_urfd_csv_video_id(sequence.video_id))
         window_rows, _video_summary = urfd_eval.evaluate_sequence(
             sequence,
             pose_pipeline=pose_pipeline,
@@ -265,14 +264,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             strict_early_tolerance_frames=0,
             strict_late_tolerance_frames=int(strict_late_tolerance_frames),
         )
-        if sequence.video_label == "fall":
-            summaries.append(
-                summarize_fall_video_accuracy(
-                    sequence,
-                    window_rows,
-                    threshold=float(args.threshold),
-                )
+        summaries.append(
+            summarize_fall_video_accuracy(
+                sequence,
+                window_rows,
+                threshold=float(args.threshold),
             )
+        )
 
     ranked = [
         row for row in summaries
@@ -289,10 +287,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print_top_table(ranked, top_k=int(args.top_k))
     print()
-    print(f"Evaluated videos: {len(sequences)}")
-    print(f"Fall videos ranked: {len(ranked)} / {len(fall_sequences)}")
+    print(f"Evaluated fall videos: {len(sequences)}")
+    print(f"Fall videos ranked: {len(ranked)} / {len(sequences)}")
     print(f"Elapsed: {time.perf_counter() - start_time:.2f}s")
-    if len(ranked) < len(fall_sequences):
+    if len(ranked) < len(sequences):
         print("Skipped fall videos had no timing-aware window ground truth.")
     return 0
 
