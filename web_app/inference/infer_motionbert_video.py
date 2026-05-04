@@ -1242,8 +1242,6 @@ def run_inference_stream_packets(
                 class_names_out = base_names
 
     fall_idx = infer_fall_indices(class_names_out)
-    standing_label = next((str(name) for name in class_names_out if "stand" in str(name).lower()), "standing")
-
     predict_kwargs = dict(
         model=model,
         device=run_device,
@@ -1482,9 +1480,6 @@ def run_inference_stream_packets(
             start -= int(win_step)
         return None
 
-    hud_delay_frames = 32
-    hud_delay_buf: "deque[List[str]]" = deque()
-
     try:
         while int(sampled_total) < int(clip_len) and not cap_done:
             process_next_frame()
@@ -1506,6 +1501,7 @@ def run_inference_stream_packets(
             )
 
         fps_ema: Optional[float] = None
+        stream_pace_fps_ema: Optional[float] = None
         ema_alpha = 0.1
 
         while True:
@@ -1513,6 +1509,7 @@ def run_inference_stream_packets(
                 break
 
             t_frame_start = time.perf_counter()
+            cap_done_at_frame_start = bool(cap_done)
 
             display_sample_idx = int(display_idx) // int(frame_step)
             target_sampled = int(display_sample_idx) + int(clip_len) + 1
@@ -1561,19 +1558,7 @@ def run_inference_stream_packets(
             if p_fall is not None:
                 hud.append(f"fall_prob: {float(p_fall):.2f}")
 
-            hud_delay_buf.append(list(hud))
-            show_current_hud = bool(cap_done) and len(frames_buf) <= int(hud_delay_frames)
-            if show_current_hud:
-                hud_to_draw = list(hud)
-            elif len(hud_delay_buf) <= int(hud_delay_frames):
-                hud_to_draw = list(hud)
-                if len(hud_to_draw) > 2:
-                    hud_to_draw[2] = f"pose: {standing_label} (1.00)"
-                for i, line in enumerate(hud_to_draw):
-                    if line.startswith("fall_prob:"):
-                        hud_to_draw[i] = "fall_prob: 0.00"
-            else:
-                hud_to_draw = hud_delay_buf.popleft()
+            hud_to_draw = list(hud)
 
             if on_packet is not None:
                 ok_jpg, encoded = cv2.imencode(
@@ -1662,14 +1647,23 @@ def run_inference_stream_packets(
                     key = cv2.waitKey(int(wait_ms)) & 0xFF
 
             if bool(realtime) and is_packet_stream:
+                pace_fps = float(fps_play)
+                if cap_done_at_frame_start and stream_pace_fps_ema is not None and float(stream_pace_fps_ema) > 1e-6:
+                    pace_fps = min(float(fps_play), float(stream_pace_fps_ema))
                 elapsed_s = time.perf_counter() - t_frame_start
-                remaining_s = frame_period_s - elapsed_s
+                remaining_s = (1.0 / max(1e-6, float(pace_fps))) - elapsed_s
                 if remaining_s > 0.0:
                     time.sleep(remaining_s)
 
             total_ms = (time.perf_counter() - t_frame_start) * 1000.0
             inst_fps = 1000.0 / max(1e-6, total_ms)
             fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+            if is_packet_stream and not cap_done_at_frame_start:
+                stream_pace_fps_ema = (
+                    float(fps_ema)
+                    if stream_pace_fps_ema is None
+                    else (1.0 - ema_alpha) * float(stream_pace_fps_ema) + ema_alpha * float(fps_ema)
+                )
 
             should_quit = key in (ord("q"), 27)
 

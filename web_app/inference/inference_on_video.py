@@ -1696,8 +1696,6 @@ def run_inference_stream_packets(
     merge_fall_11_to_7 = int(num_classes) == 11
     display_num_classes = 7 if merge_fall_11_to_7 else int(num_classes)
     class_names = load_class_names(num_classes=display_num_classes, meta=meta, labels_file=labels_file)
-    standing_label = next((str(name) for name in class_names if "stand" in str(name).lower()), "standing")
-
     in_features = expected_in_features(
         use_conf=use_conf,
         add_vel=add_vel,
@@ -1775,9 +1773,6 @@ def run_inference_stream_packets(
         frames_buf: deque[np.ndarray] = deque()
         draw_xy_buf: deque[np.ndarray] = deque()
         draw_cf_buf: deque[np.ndarray] = deque()
-        hud_delay_frames = 32
-        hud_delay_buf: deque[List[str]] = deque()
-
         sample_xy_seq: List[np.ndarray] = []
         sample_cf_seq: List[np.ndarray] = []
 
@@ -1946,12 +1941,14 @@ def run_inference_stream_packets(
 
         window_name = "inference_on_video"
         fps_ema: Optional[float] = None
+        stream_pace_fps_ema: Optional[float] = None
         ema_alpha = 0.1
         while True:
             if not frames_buf and cap_done:
                 break
 
             t_frame_start = time.perf_counter()
+            cap_done_at_frame_start = bool(cap_done)
             display_sample_idx = int(display_idx // max(1, int(frame_step)))
 
             target_sampled = int(display_sample_idx) + int(T_final) + 1
@@ -1990,19 +1987,7 @@ def run_inference_stream_packets(
             ]
             if p_fall is not None:
                 hud.append(f"fall_prob: {float(p_fall):.2f}")
-            hud_delay_buf.append(list(hud))
-            show_current_hud = bool(cap_done) and len(frames_buf) <= int(hud_delay_frames)
-            if show_current_hud:
-                hud_to_draw = list(hud)
-            elif len(hud_delay_buf) <= int(hud_delay_frames):
-                hud_to_draw = list(hud)
-                if len(hud_to_draw) > 2:
-                    hud_to_draw[2] = f"pose: {standing_label} (1.00)"
-                for i, line in enumerate(hud_to_draw):
-                    if line.startswith("fall_prob:"):
-                        hud_to_draw[i] = "fall_prob: 0.00"
-            else:
-                hud_to_draw = hud_delay_buf.popleft()
+            hud_to_draw = list(hud)
 
             if on_packet is not None:
                 ok_jpg, encoded = cv2.imencode(
@@ -2084,14 +2069,23 @@ def run_inference_stream_packets(
                     key = cv2.waitKey(wait_ms) & 0xFF
 
             if bool(realtime) and is_packet_stream:
+                pace_fps = float(fps_play)
+                if cap_done_at_frame_start and stream_pace_fps_ema is not None and float(stream_pace_fps_ema) > 1e-6:
+                    pace_fps = min(float(fps_play), float(stream_pace_fps_ema))
                 elapsed_s = time.perf_counter() - t_frame_start
-                remaining_s = frame_period_s - elapsed_s
+                remaining_s = (1.0 / max(1e-6, float(pace_fps))) - elapsed_s
                 if remaining_s > 0.0:
                     time.sleep(remaining_s)
 
             total_ms = (time.perf_counter() - t_frame_start) * 1000.0
             inst_fps = 1000.0 / max(1e-6, total_ms)
             fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
+            if is_packet_stream and not cap_done_at_frame_start:
+                stream_pace_fps_ema = (
+                    float(fps_ema)
+                    if stream_pace_fps_ema is None
+                    else (1.0 - ema_alpha) * float(stream_pace_fps_ema) + ema_alpha * float(fps_ema)
+                )
 
             should_quit = (key in (ord("q"), 27))
 
@@ -2376,8 +2370,6 @@ def main() -> int:
     merge_fall_11_to_7 = int(num_classes) == 11
     display_num_classes = 7 if merge_fall_11_to_7 else int(num_classes)
     class_names = load_class_names(num_classes=display_num_classes, meta=meta, labels_file=args.labels_file)
-    standing_label = next((str(name) for name in class_names if "stand" in str(name).lower()), "standing")
-
     in_features = expected_in_features(
         use_conf=use_conf,
         add_vel=add_vel,
@@ -2464,9 +2456,6 @@ def main() -> int:
         draw_cf_buf: deque[np.ndarray] = deque()
         prep_ms_buf: deque[float] = deque()
         yolo_ms_buf: deque[float] = deque()
-        hud_delay_frames = 32
-        hud_delay_buf: deque[List[str]] = deque()
-
         sample_xy_seq: List[np.ndarray] = []
         sample_cf_seq: List[np.ndarray] = []
 
@@ -2786,16 +2775,7 @@ def main() -> int:
             ]
             if p_fall is not None:
                 hud.append(f"fall_prob: {float(p_fall):.2f}")
-            hud_delay_buf.append(list(hud))
-            if len(hud_delay_buf) <= int(hud_delay_frames):
-                hud_to_draw = list(hud)
-                if len(hud_to_draw) > 2:
-                    hud_to_draw[2] = f"pose: {standing_label} (1.00)"
-                for i, line in enumerate(hud_to_draw):
-                    if line.startswith("fall_prob:"):
-                        hud_to_draw[i] = "fall_prob: 0.00"
-            else:
-                hud_to_draw = hud_delay_buf.popleft()
+            hud_to_draw = list(hud)
             frame = draw_hud(frame, hud_to_draw)
             draw_ms = (time.perf_counter() - t_draw0) * 1000.0
 
