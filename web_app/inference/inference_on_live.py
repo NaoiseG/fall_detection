@@ -34,11 +34,14 @@ from inference.inference_on_video import (  # noqa: E402
     SKELETON,
     build_temporal_model,
     clean_state_dict,
+    draw_hud,
+    draw_pose,
     expected_in_features,
     infer_one_window,
     load_checkpoint,
     load_class_names,
     make_window_features,
+    open_video_writer,
     pick_device,
     pose_on_frame,
     resolve_ckpt_and_arch,
@@ -128,6 +131,7 @@ def run_inference_live(
     classification_model_path: Path,
     keypoint_model_path: Path,
     on_packet: Optional[Callable[[Dict[str, Any]], None]] = None,
+    save_path: Optional[Path] = None,
     arch: Optional[str] = None,
     labels_file: Optional[str] = None,
     device: Optional[str] = None,
@@ -291,10 +295,21 @@ def run_inference_live(
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera at index {camera_index}.")
 
+    writer: Optional[cv2.VideoWriter] = None
+    out_w = 0
+    out_h = 0
     try:
         # Use camera native resolution to set rp normalisation dimensions.
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+        out_w = int(frame_w)
+        out_h = int(frame_h)
+        if save_path is not None:
+            writer = open_video_writer(
+                save_path=Path(save_path).expanduser(),
+                fps=float(training_fps),
+                frame_size=(out_w, out_h),
+            )
         if rp_img_w_final is None:
             rp_img_w_final = frame_w
         if rp_img_h_final is None:
@@ -529,6 +544,14 @@ def run_inference_live(
                         packet["pred"]["fall_prob"] = float(p_fall)
                     on_packet(packet)
 
+            if writer is not None:
+                frame_to_write = draw_pose(frame.copy(), xy, cf, conf_thres=conf_thres)
+                frame_to_write = draw_hud(frame_to_write, hud)
+                frame_h, frame_w = frame_to_write.shape[:2]
+                if frame_w != out_w or frame_h != out_h:
+                    frame_to_write = cv2.resize(frame_to_write, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                writer.write(frame_to_write)
+
             # ------------------------------------------------- fps tracking
             total_ms = (time.perf_counter() - t_frame_start) * 1000.0
             inst_fps = 1000.0 / max(1e-6, total_ms)
@@ -541,5 +564,7 @@ def run_inference_live(
 
     finally:
         cap.release()
+        if writer is not None:
+            writer.release()
 
     return 0

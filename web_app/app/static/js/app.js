@@ -7,6 +7,7 @@ const cameraSelect = document.getElementById("camera-select");
 const windowSizeInput = document.getElementById("window-size");
 const strideOverlapInput = document.getElementById("stride-overlap");
 const samplingKInput = document.getElementById("sampling-k");
+const saveOutputInput = document.getElementById("save-output");
 const runButton = document.getElementById("run-inference");
 const stopButton = document.getElementById("stop-inference");
 const responseBox = document.getElementById("response");
@@ -63,6 +64,8 @@ function setRunReady() {
   }
   runButton.textContent = "Run";
   if (stopButton) {
+    stopButton.disabled = false;
+    stopButton.textContent = "Stop";
     stopButton.style.display = "none";
   }
 }
@@ -107,6 +110,20 @@ function renderStartInfo(data) {
   ];
   if (data.stop_url) {
     lines.push(`stop_url: ${data.stop_url}`);
+  }
+  if (data.save_path) {
+    lines.push(`saving_to: ${data.save_path}`);
+  }
+  responseBox.textContent = lines.join("\n");
+}
+
+function renderDoneInfo(data = {}) {
+  if (!responseBox) {
+    return;
+  }
+  const lines = ["Inference stream finished."];
+  if (data.save_path) {
+    lines.push(`saved_to: ${data.save_path}`);
   }
   responseBox.textContent = lines.join("\n");
 }
@@ -355,10 +372,15 @@ function attachStreamHandlers(streamUrl, statusUrl) {
     }
   });
 
-  activeEventSource.addEventListener("done", () => {
+  activeEventSource.addEventListener("done", (event) => {
     streamTerminated = true;
     setOutputState(true);
     setLiveStatus("Done.");
+    try {
+      renderDoneInfo(JSON.parse(event.data || "{}"));
+    } catch (_parseError) {
+      renderDoneInfo();
+    }
     closeActiveStream();
     setRunReady();
   });
@@ -390,6 +412,7 @@ function attachStreamHandlers(streamUrl, statusUrl) {
       streamTerminated = true;
       setOutputState(true);
       setLiveStatus("Done.");
+      renderDoneInfo(status);
     } else {
       const message = status?.error || "Stream disconnected.";
       renderError(message);
@@ -538,6 +561,7 @@ async function runInference() {
     keypoint_model: keypointSelect.value,
     keypoint_precision: keypointPrecisionSelect ? keypointPrecisionSelect.value : "FP32",
     video: videoSelect.value,
+    save_output: saveOutputInput ? saveOutputInput.checked : false,
     T: knobs.T,
     stride: knobs.overlapPercent,
     overlap_percent: knobs.overlapPercent,
@@ -552,7 +576,9 @@ async function runInference() {
   statusLabel.textContent = "Running...";
   statusLabel.classList.remove("status-success", "status-error");
   responseBox.classList.remove("output-success", "output-error");
-  responseBox.textContent = "Starting inference stream...";
+  responseBox.textContent = saveOutputInput && saveOutputInput.checked
+    ? "Starting inference stream with save mode enabled..."
+    : "Starting inference stream...";
   setLiveStatus("Starting inference...");
 
   try {

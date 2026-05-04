@@ -88,6 +88,10 @@ def get_test_videos_dir() -> Path:
     return (get_repo_root() / "Datasets" / "test_vids").resolve()
 
 
+def get_saved_outputs_dir() -> Path:
+    return (get_web_app_root() / "saved_outputs").resolve()
+
+
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev")
     UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "app/static/uploads")

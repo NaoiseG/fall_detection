@@ -21,6 +21,7 @@ def _format_sse_event(event_name: str, payload_json: str) -> str:
 @dataclass
 class InferenceStreamJob:
     job_id: str
+    save_path: Optional[Path] = None
     status: str = "running"  # running | done | error
     error: Optional[str] = None
     packet_queue: "queue.Queue[str]" = field(default_factory=lambda: queue.Queue(maxsize=64))
@@ -31,7 +32,11 @@ class InferenceStreamJob:
 
     def snapshot(self) -> Dict[str, Optional[str]]:
         with self.lock:
-            return {"status": self.status, "error": self.error}
+            return {
+                "status": self.status,
+                "error": self.error,
+                "save_path": str(self.save_path) if self.save_path is not None else None,
+            }
 
     def request_stop(self) -> None:
         self.stop_event.set()
@@ -83,8 +88,10 @@ class InferenceStreamJobManager:
         classification_model_path: Path,
         keypoint_model_path: Path,
         inference_options: Optional[Dict[str, Any]] = None,
+        save_path: Optional[Path] = None,
     ) -> InferenceStreamJob:
-        job = InferenceStreamJob(job_id=uuid.uuid4().hex)
+        resolved_save_path = Path(save_path).resolve() if save_path is not None else None
+        job = InferenceStreamJob(job_id=uuid.uuid4().hex, save_path=resolved_save_path)
         with self._jobs_lock:
             self._jobs[job.job_id] = job
 
@@ -97,6 +104,7 @@ class InferenceStreamJobManager:
                 "classification_model_path": classification_model_path.resolve(),
                 "keypoint_model_path": keypoint_model_path.resolve(),
                 "inference_options": dict(inference_options or {}),
+                "save_path": job.save_path,
             },
             daemon=True,
             name=f"inference-stream-job-{job.job_id}",
@@ -112,8 +120,10 @@ class InferenceStreamJobManager:
         classification_model_path: Path,
         keypoint_model_path: Path,
         inference_options: Optional[Dict[str, Any]] = None,
+        save_path: Optional[Path] = None,
     ) -> InferenceStreamJob:
-        job = InferenceStreamJob(job_id=uuid.uuid4().hex)
+        resolved_save_path = Path(save_path).resolve() if save_path is not None else None
+        job = InferenceStreamJob(job_id=uuid.uuid4().hex, save_path=resolved_save_path)
         with self._jobs_lock:
             self._jobs[job.job_id] = job
 
@@ -126,6 +136,7 @@ class InferenceStreamJobManager:
                 "classification_model_path": classification_model_path.resolve(),
                 "keypoint_model_path": keypoint_model_path.resolve(),
                 "inference_options": dict(inference_options or {}),
+                "save_path": job.save_path,
             },
             daemon=True,
             name=f"inference-live-job-{job.job_id}",
@@ -180,7 +191,8 @@ class InferenceStreamJobManager:
                 )
                 yield _format_sse_event("error", payload)
             else:
-                payload = json.dumps({"type": "done"}, separators=(",", ":"), ensure_ascii=True)
+                payload_dict = {"type": "done", "save_path": snapshot.get("save_path")}
+                payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=True)
                 yield _format_sse_event("done", payload)
 
         return _iter()
@@ -194,6 +206,7 @@ class InferenceStreamJobManager:
         classification_model_path: Path,
         keypoint_model_path: Path,
         inference_options: Dict[str, Any],
+        save_path: Optional[Path],
     ) -> None:
         try:
             model_key = str(classification_model).strip().lower()
@@ -207,6 +220,7 @@ class InferenceStreamJobManager:
                 classification_model_path=classification_model_path,
                 keypoint_model_path=keypoint_model_path,
                 on_packet=job.push_packet,
+                save_path=save_path,
                 no_display=True,
                 **dict(inference_options),
             )
@@ -226,6 +240,7 @@ class InferenceStreamJobManager:
         classification_model_path: Path,
         keypoint_model_path: Path,
         inference_options: Dict[str, Any],
+        save_path: Optional[Path],
     ) -> None:
         try:
             model_key = str(classification_model).strip().lower()
@@ -240,6 +255,7 @@ class InferenceStreamJobManager:
                 classification_model_path=classification_model_path,
                 keypoint_model_path=keypoint_model_path,
                 on_packet=job.push_packet,
+                save_path=save_path,
                 **dict(inference_options),
             )
             if int(return_code) != 0:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,6 +19,7 @@ from app.config import (
     KEYPOINT_YOLO_FP16_WEIGHT_FILENAMES,
     KEYPOINT_YOLO_WEIGHT_FILENAMES,
     VIDEO_EXTENSIONS,
+    get_saved_outputs_dir,
     get_test_videos_dir,
     get_web_app_root,
 )
@@ -301,6 +303,35 @@ def _validate_int(value: Any, *, name: str, min_value: int = 0) -> int:
     return out
 
 
+def _validate_bool(value: Any, *, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"Invalid {name}.")
+
+
+def _timestamped_save_path(*, mode: str, video_name: Optional[str] = None) -> Path:
+    output_dir = get_saved_outputs_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    if mode == "live":
+        stem = f"live_{timestamp}"
+    else:
+        source_stem = secure_filename(Path(str(video_name or "video")).stem) or "video"
+        stem = f"{source_stem}_{timestamp}"
+    return (output_dir / f"{stem}.mp4").resolve()
+
+
 def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Invalid JSON body. Expected an object.")
@@ -356,6 +387,10 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     use_half = int(keypoint_backend == "yolo" and keypoint_precision == "FP16")
 
     realtime = bool(payload.get("realtime", True))
+    save_output = _validate_bool(
+        payload.get("save_output", payload.get("save_mode", False)),
+        name="save_output",
+    )
     display_fps = _validate_float(payload.get("display_fps", 18.0), name="display_fps", min_value=0.0)
     window_size = _validate_int(payload.get("T", 64), name="T", min_value=1)
     sampling_k = _validate_int(payload.get("k", 1), name="k", min_value=1)
@@ -395,6 +430,10 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         "classification_model_path": classification_weights_path,
         "keypoint_model_path": keypoint_weights_path,
         "inference_options": inference_options,
+        "save_path": _timestamped_save_path(
+            mode="live" if is_live else "video",
+            video_name=None if is_live else selected_video,
+        ) if save_output else None,
     }
     if is_live:
         result["camera_index"] = camera_index
@@ -414,6 +453,7 @@ def _start_stream_job_from_payload(payload: Any):
             classification_model_path=prepared["classification_model_path"],
             keypoint_model_path=prepared["keypoint_model_path"],
             inference_options=prepared["inference_options"],
+            save_path=prepared["save_path"],
         )
     else:
         job = inference_stream_job_manager.start_job(
@@ -422,6 +462,7 @@ def _start_stream_job_from_payload(payload: Any):
             classification_model_path=prepared["classification_model_path"],
             keypoint_model_path=prepared["keypoint_model_path"],
             inference_options=prepared["inference_options"],
+            save_path=prepared["save_path"],
         )
 
     return (
@@ -432,6 +473,7 @@ def _start_stream_job_from_payload(payload: Any):
                 "stream_url": f"/api/stream/{job.job_id}",
                 "status_url": f"/api/job_status/{job.job_id}",
                 "stop_url": f"/api/stop_job/{job.job_id}",
+                "save_path": str(job.save_path) if job.save_path is not None else None,
             }
         ),
         202,
