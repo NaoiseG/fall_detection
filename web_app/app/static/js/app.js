@@ -7,6 +7,7 @@ const cameraSelect = document.getElementById("camera-select");
 const windowSizeInput = document.getElementById("window-size");
 const strideOverlapInput = document.getElementById("stride-overlap");
 const samplingKInput = document.getElementById("sampling-k");
+const displayFpsInput = document.getElementById("display-fps");
 const saveOutputInput = document.getElementById("save-output");
 const runButton = document.getElementById("run-inference");
 const stopButton = document.getElementById("stop-inference");
@@ -140,6 +141,9 @@ function parseIntInput(inputElement, name, minValue, maxValue = null) {
   if (!rawValue) {
     throw new Error(`Missing ${name}.`);
   }
+  if (!/^-?\d+$/.test(rawValue)) {
+    throw new Error(`Invalid ${name}.`);
+  }
   const value = Number.parseInt(rawValue, 10);
   if (!Number.isInteger(value) || value < minValue) {
     throw new Error(`Invalid ${name}.`);
@@ -151,17 +155,19 @@ function parseIntInput(inputElement, name, minValue, maxValue = null) {
 }
 
 function readInferenceKnobs() {
-  if (!windowSizeInput || !strideOverlapInput || !samplingKInput) {
+  if (!windowSizeInput || !strideOverlapInput || !samplingKInput || !displayFpsInput) {
     throw new Error("Inference knobs are not available.");
   }
 
   const windowSize = parseIntInput(windowSizeInput, "window size (T)", 1);
   const overlapPercent = parseIntInput(strideOverlapInput, "overlap (%)", 0, 99);
   const samplingK = parseIntInput(samplingKInput, "sampling frequency (k)", 1);
+  const displayFps = parseIntInput(displayFpsInput, "FPS", 1);
   return {
     T: windowSize,
     overlapPercent,
     k: samplingK,
+    fps: displayFps,
   };
 }
 
@@ -535,6 +541,7 @@ async function runInference() {
     !windowSizeInput ||
     !strideOverlapInput ||
     !samplingKInput ||
+    !displayFpsInput ||
     !runButton ||
     !responseBox ||
     !statusLabel
@@ -566,6 +573,7 @@ async function runInference() {
     stride: knobs.overlapPercent,
     overlap_percent: knobs.overlapPercent,
     k: knobs.k,
+    display_fps: knobs.fps,
   };
   if (live && cameraSelect) {
     payload.camera_index = parseInt(cameraSelect.value, 10) || 0;

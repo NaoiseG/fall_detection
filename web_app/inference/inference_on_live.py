@@ -4,11 +4,10 @@ Live webcam -> pose model -> temporal classifier inference.
 Shared model-loading and inference utilities are imported directly from
 inference_on_video.py to keep this file minimal.
 
-Temporal upsampling: the sample buffer is time-stamped.  When the model runs
-slower than training_fps (default 18 fps), accumulated frames span the correct
-real-time window duration but may have fewer points than T.  We linearly
-interpolate them back to exactly T points before feeding the classifier so the
-model always sees a temporally-consistent window.
+Temporal sampling: the sample buffer is time-stamped at the selected FPS
+(default 18 fps).  Windows cover T / selected_fps seconds.  If live processing
+cannot sustain the selected FPS, inference raises an error instead of silently
+falling behind.
 """
 
 from __future__ import annotations
@@ -162,9 +161,9 @@ def run_inference_live(
     """Run live inference from a webcam, emitting the same SSE packet format as
     run_inference_stream_packets in inference_on_video.py.
 
-    Temporal upsampling: regardless of whether the pose model achieves
-    training_fps, each classifier window always covers exactly
-    T / training_fps real seconds by interpolating the buffered samples.
+    Temporal sampling: each classifier window covers exactly T / training_fps
+    real seconds.  The web API passes the user-selected FPS as training_fps for
+    live mode, preserving T while changing the real-time window duration.
     """
     training_fps = max(1.0, float(training_fps))
 
@@ -340,6 +339,8 @@ def run_inference_live(
 
         capture_interval_s = 1.0 / training_fps
         next_capture_t = time.perf_counter()
+        consecutive_overruns = 0
+        max_consecutive_overruns = 3
 
         while not stop_event.is_set():
             # ---------------------------------------- throttle to training_fps
@@ -560,6 +561,17 @@ def run_inference_live(
                 if fps_ema is None
                 else (1.0 - ema_alpha) * fps_ema + ema_alpha * inst_fps
             )
+            if (total_ms / 1000.0) > (capture_interval_s * 1.05):
+                consecutive_overruns += 1
+                if consecutive_overruns >= max_consecutive_overruns:
+                    effective_fps = 1000.0 / max(1e-6, total_ms)
+                    raise RuntimeError(
+                        "Live inference cannot keep up with the selected FPS "
+                        f"({training_fps:.0f}). Recent frame processed at "
+                        f"{effective_fps:.1f} FPS. Select a lower FPS or a faster model."
+                    )
+            else:
+                consecutive_overruns = 0
             display_frame_idx += 1
 
     finally:

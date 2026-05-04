@@ -293,6 +293,15 @@ def _validate_float(value: Any, *, name: str, min_value: float = 0.0) -> float:
 
 
 def _validate_int(value: Any, *, name: str, min_value: int = 0) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid {name}.")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"Invalid {name}.")
+    if isinstance(value, str):
+        text = value.strip()
+        digits = text[1:] if text.startswith("-") else text
+        if not digits or not digits.isdigit():
+            raise ValueError(f"Invalid {name}.")
     try:
         out = int(value)
     except (TypeError, ValueError) as error:
@@ -391,7 +400,7 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         payload.get("save_output", payload.get("save_mode", False)),
         name="save_output",
     )
-    display_fps = _validate_float(payload.get("display_fps", 18.0), name="display_fps", min_value=0.0)
+    display_fps = _validate_int(payload.get("display_fps", 18), name="display_fps", min_value=1)
     window_size = _validate_int(payload.get("T", 64), name="T", min_value=1)
     sampling_k = _validate_int(payload.get("k", 1), name="k", min_value=1)
     overlap_percent = _validate_float(
@@ -421,6 +430,8 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
         "interp_mode": "paper_group_linear",
         "interp_group": 100,
     }
+    if is_live:
+        inference_options["training_fps"] = float(display_fps)
 
     result: Dict[str, Any] = {
         "mode": "live" if is_live else "video",
