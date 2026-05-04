@@ -356,7 +356,7 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     use_half = int(keypoint_backend == "yolo" and keypoint_precision == "FP16")
 
     realtime = bool(payload.get("realtime", True))
-    display_fps = _validate_float(payload.get("display_fps", 0.0), name="display_fps", min_value=0.0)
+    display_fps = _validate_float(payload.get("display_fps", 18.0), name="display_fps", min_value=0.0)
     window_size = _validate_int(payload.get("T", 64), name="T", min_value=1)
     sampling_k = _validate_int(payload.get("k", 1), name="k", min_value=1)
     overlap_percent = _validate_float(

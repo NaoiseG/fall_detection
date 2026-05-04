@@ -23,7 +23,7 @@ class InferenceStreamJob:
     job_id: str
     status: str = "running"  # running | done | error
     error: Optional[str] = None
-    packet_queue: "queue.Queue[str]" = field(default_factory=lambda: queue.Queue(maxsize=4))
+    packet_queue: "queue.Queue[str]" = field(default_factory=lambda: queue.Queue(maxsize=64))
     last_packet: Optional[str] = None
     done_event: threading.Event = field(default_factory=threading.Event)
     stop_event: threading.Event = field(default_factory=threading.Event)

@@ -1766,7 +1766,10 @@ def run_inference_stream_packets(
             f"jump_diag_frac={float(track_max_jump_diag_frac):.3f}"
         )
 
+        is_packet_stream = on_packet is not None and bool(no_display)
         fps_play = float(display_fps) if float(display_fps) > 1e-3 else float(src_fps)
+        if is_packet_stream and float(display_fps) <= 1e-3:
+            fps_play = min(float(src_fps), 18.0)
         frame_period_s = 1.0 / max(1e-6, float(fps_play))
 
         frames_buf: deque[np.ndarray] = deque()
@@ -1988,7 +1991,10 @@ def run_inference_stream_packets(
             if p_fall is not None:
                 hud.append(f"fall_prob: {float(p_fall):.2f}")
             hud_delay_buf.append(list(hud))
-            if len(hud_delay_buf) <= int(hud_delay_frames):
+            show_current_hud = bool(cap_done) and len(frames_buf) <= int(hud_delay_frames)
+            if show_current_hud:
+                hud_to_draw = list(hud)
+            elif len(hud_delay_buf) <= int(hud_delay_frames):
                 hud_to_draw = list(hud)
                 if len(hud_to_draw) > 2:
                     hud_to_draw[2] = f"pose: {standing_label} (1.00)"
@@ -2076,6 +2082,12 @@ def run_inference_stream_packets(
                     else:
                         wait_ms = 1
                     key = cv2.waitKey(wait_ms) & 0xFF
+
+            if bool(realtime) and is_packet_stream:
+                elapsed_s = time.perf_counter() - t_frame_start
+                remaining_s = frame_period_s - elapsed_s
+                if remaining_s > 0.0:
+                    time.sleep(remaining_s)
 
             total_ms = (time.perf_counter() - t_frame_start) * 1000.0
             inst_fps = 1000.0 / max(1e-6, total_ms)
