@@ -233,7 +233,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "No URFD timing annotations were loaded. Fall videos need timing annotations for per-window accuracy."
         )
 
-    device = str(args.device or urfd_eval.pick_device())
+    device = str(urfd_eval.pick_device(args.device))
     resolved_imgsz = float(args.imgsz) if args.imgsz is not None else float(urfd_eval.infer_imgsz_from_path(keypoint_weights) or 640.0)
     classifier = urfd_eval.build_classifier_adapter(args, device=device)
     pose_pipeline = urfd_eval.build_pose_pipeline(args, device=device, keypoint_weights=keypoint_weights, imgsz=resolved_imgsz)
