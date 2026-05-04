@@ -14,7 +14,9 @@ const stopButton = document.getElementById("stop-inference");
 const responseBox = document.getElementById("response");
 const statusLabel = document.getElementById("run-status");
 const liveStatus = document.getElementById("live-status");
+const sourceVideo = document.getElementById("source-video");
 const liveCanvas = document.getElementById("live-canvas");
+const videoStage = document.querySelector(".video-stage");
 
 const frameQueue = [];
 let queueProcessing = false;
@@ -24,6 +26,7 @@ let activeStatusUrl = "";
 let activeJobId = "";
 let activeStopUrl = "";
 let isLiveMode = false;
+let sourceVideoReady = Promise.resolve();
 
 function setOutputState(ok) {
   if (!responseBox || !statusLabel) {
@@ -76,7 +79,7 @@ function syncPrecisionControl() {
     return;
   }
 
-  const fp16Supported = keypointSelect.value === "ultralytics-yolo11l";
+  const fp16Supported = keypointSelect.value.startsWith("ultralytics-yolo11");
   if (!fp16Supported) {
     keypointPrecisionSelect.value = "FP32";
   }
@@ -85,6 +88,40 @@ function syncPrecisionControl() {
 
 function clearFrameQueue() {
   frameQueue.length = 0;
+}
+
+function clearLiveCanvas() {
+  if (!liveCanvas) {
+    return;
+  }
+  const ctx = liveCanvas.getContext("2d");
+  if (ctx) {
+    ctx.clearRect(0, 0, liveCanvas.width, liveCanvas.height);
+  }
+}
+
+function setMetadataMode(enabled) {
+  if (videoStage) {
+    videoStage.classList.toggle("metadata-mode", Boolean(enabled));
+  }
+  if (!liveCanvas) {
+    return;
+  }
+  liveCanvas.style.height = enabled ? "" : "";
+  if (!enabled) {
+    liveCanvas.width = 640;
+    liveCanvas.height = 360;
+  }
+}
+
+function resetSourceVideo() {
+  if (!sourceVideo) {
+    return;
+  }
+  sourceVideo.pause();
+  sourceVideo.removeAttribute("src");
+  sourceVideo.load();
+  sourceVideoReady = Promise.resolve();
 }
 
 function closeActiveStream() {
@@ -97,6 +134,98 @@ function closeActiveStream() {
   activeJobId = "";
   activeStopUrl = "";
   isLiveMode = false;
+}
+
+function selectedVideoUrl(videoName) {
+  return `/api/test_video/${encodeURIComponent(videoName)}`;
+}
+
+async function prepareSourceVideo(videoUrl) {
+  if (!sourceVideo || !videoUrl) {
+    return;
+  }
+  if (sourceVideo.getAttribute("src") !== videoUrl) {
+    sourceVideo.src = videoUrl;
+    sourceVideo.load();
+  }
+  sourceVideo.pause();
+  sourceVideoReady = waitForVideoMetadata();
+  await sourceVideoReady;
+  sourceVideo.currentTime = 0;
+}
+
+function waitForVideoMetadata() {
+  if (!sourceVideo || sourceVideo.readyState >= 1) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      sourceVideo.removeEventListener("loadedmetadata", handleLoaded);
+      sourceVideo.removeEventListener("error", handleError);
+    };
+    const handleLoaded = () => {
+      cleanup();
+      resolve();
+    };
+    const handleError = () => {
+      cleanup();
+      reject(new Error("Failed to load source video."));
+    };
+    sourceVideo.addEventListener("loadedmetadata", handleLoaded, { once: true });
+    sourceVideo.addEventListener("error", handleError, { once: true });
+  });
+}
+
+function seekSourceVideo(timeSeconds) {
+  if (!sourceVideo || !Number.isFinite(timeSeconds)) {
+    return Promise.resolve();
+  }
+
+  sourceVideo.pause();
+  const clampedTime = Math.max(0, Math.min(timeSeconds, Number(sourceVideo.duration) || timeSeconds));
+  if (Math.abs(Number(sourceVideo.currentTime) - clampedTime) < 0.001) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    let timeoutId = 0;
+    const cleanup = () => {
+      sourceVideo.removeEventListener("seeked", handleSeeked);
+      sourceVideo.removeEventListener("error", handleError);
+      window.clearTimeout(timeoutId);
+    };
+    const handleSeeked = () => {
+      cleanup();
+      resolve();
+    };
+    const handleError = () => {
+      cleanup();
+      reject(new Error("Failed to seek source video."));
+    };
+    sourceVideo.addEventListener("seeked", handleSeeked, { once: true });
+    sourceVideo.addEventListener("error", handleError, { once: true });
+    timeoutId = window.setTimeout(() => {
+      cleanup();
+      resolve();
+    }, 500);
+    sourceVideo.currentTime = clampedTime;
+  });
+}
+
+async function syncSourceVideoToPacket(packet) {
+  if (!sourceVideo || isLiveMode || typeof packet.frame_jpeg_b64 === "string") {
+    return;
+  }
+
+  await sourceVideoReady;
+  const timestamp = Number(packet.timestamp_s);
+  const sourceFps = Number(packet.source_fps);
+  const frameIndex = Number(packet.frame_index);
+  const fallbackTimestamp =
+    Number.isFinite(frameIndex) && Number.isFinite(sourceFps) && sourceFps > 0
+      ? frameIndex / sourceFps
+      : NaN;
+  await seekSourceVideo(Number.isFinite(timestamp) ? timestamp : fallbackTimestamp);
 }
 
 function renderStartInfo(data) {
@@ -114,6 +243,9 @@ function renderStartInfo(data) {
   }
   if (data.save_path) {
     lines.push(`saving_to: ${data.save_path}`);
+  }
+  if (data.video_url) {
+    lines.push(`video_url: ${data.video_url}`);
   }
   responseBox.textContent = lines.join("\n");
 }
@@ -285,7 +417,7 @@ function drawPoseOverlay(ctx, pose) {
 }
 
 async function drawPacket(packet) {
-  if (!liveCanvas || !packet || typeof packet.frame_jpeg_b64 !== "string") {
+  if (!liveCanvas || !packet) {
     return;
   }
   const ctx = liveCanvas.getContext("2d");
@@ -293,15 +425,25 @@ async function drawPacket(packet) {
     return;
   }
 
-  const image = await decodeFrameImage(packet.frame_jpeg_b64);
-  const targetW = Number(packet?.size?.w) || image.width;
-  const targetH = Number(packet?.size?.h) || image.height;
+  const hasStreamedFrame = typeof packet.frame_jpeg_b64 === "string";
+  let image = null;
+  if (hasStreamedFrame) {
+    image = await decodeFrameImage(packet.frame_jpeg_b64);
+  } else {
+    await syncSourceVideoToPacket(packet);
+  }
+
+  const targetW = Number(packet?.size?.w) || image?.width || sourceVideo?.videoWidth || liveCanvas.width;
+  const targetH = Number(packet?.size?.h) || image?.height || sourceVideo?.videoHeight || liveCanvas.height;
   if (targetW > 0 && targetH > 0 && (liveCanvas.width !== targetW || liveCanvas.height !== targetH)) {
     liveCanvas.width = targetW;
     liveCanvas.height = targetH;
   }
 
-  ctx.drawImage(image, 0, 0, liveCanvas.width, liveCanvas.height);
+  ctx.clearRect(0, 0, liveCanvas.width, liveCanvas.height);
+  if (image) {
+    ctx.drawImage(image, 0, 0, liveCanvas.width, liveCanvas.height);
+  }
   drawPoseOverlay(ctx, packet.pose);
   drawHudOverlay(ctx, packet.hud_lines);
 
@@ -524,6 +666,11 @@ async function loadTestVideos() {
     videoSelect.appendChild(liveOption);
 
     setRunReady();
+    if (sourceVideo && videoSelect.value && !isLiveSelected()) {
+      setMetadataMode(true);
+      sourceVideo.src = selectedVideoUrl(videoSelect.value);
+      sourceVideo.load();
+    }
   } catch (error) {
     if (statusLabel) {
       statusLabel.textContent = "Error";
@@ -551,6 +698,7 @@ async function runInference() {
 
   closeActiveStream();
   clearFrameQueue();
+  clearLiveCanvas();
 
   let knobs;
   try {
@@ -588,6 +736,13 @@ async function runInference() {
     ? "Starting inference stream with save mode enabled..."
     : "Starting inference stream...";
   setLiveStatus("Starting inference...");
+  if (live) {
+    setMetadataMode(false);
+    resetSourceVideo();
+  } else {
+    setMetadataMode(true);
+    await prepareSourceVideo(selectedVideoUrl(videoSelect.value));
+  }
 
   try {
     const response = await fetch("/api/start_inference_stream", {
@@ -609,6 +764,10 @@ async function runInference() {
     activeJobId = data.job_id || "";
     activeStopUrl = data.stop_url || "";
     isLiveMode = live;
+    if (!live && data.video_url) {
+      setMetadataMode(true);
+      await prepareSourceVideo(data.video_url);
+    }
     if (live && stopButton) {
       stopButton.style.display = "";
     }
@@ -632,10 +791,19 @@ if (videoSelect) {
       return;
     }
     if (isLiveSelected()) {
+      setMetadataMode(false);
+      resetSourceVideo();
+      clearLiveCanvas();
       showCameraSelector();
       void loadCameras();
     } else {
       hideCameraSelector();
+      setMetadataMode(true);
+      clearLiveCanvas();
+      if (sourceVideo && videoSelect.value) {
+        sourceVideo.src = selectedVideoUrl(videoSelect.value);
+        sourceVideo.load();
+      }
       setRunReady();
     }
   });

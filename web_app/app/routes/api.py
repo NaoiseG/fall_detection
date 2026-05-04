@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
+from flask import Blueprint, Response, current_app, jsonify, request, send_file, stream_with_context
 from werkzeug.utils import secure_filename
 
 from app.config import (
@@ -416,6 +416,9 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     inference_options = {
         "display_fps": float(display_fps),
         "realtime": bool(realtime),
+        # Stream decoded frames for both file and live modes. Per-frame browser
+        # seeking is too coarse to reliably hold the selected display FPS.
+        "stream_frames": True,
         "keypoint_backend": keypoint_backend,
         "half": int(use_half),
         "max_people": 1,
@@ -485,6 +488,12 @@ def _start_stream_job_from_payload(payload: Any):
                 "status_url": f"/api/job_status/{job.job_id}",
                 "stop_url": f"/api/stop_job/{job.job_id}",
                 "save_path": str(job.save_path) if job.save_path is not None else None,
+                "mode": prepared["mode"],
+                "video_url": (
+                    f"/api/test_video/{prepared['video_name']}"
+                    if prepared["mode"] == "video"
+                    else None
+                ),
             }
         ),
         202,
@@ -506,6 +515,29 @@ def list_test_videos():
         return jsonify({"error": f"Failed to list test videos: {error}"}), 500
 
     return jsonify({"videos": videos})
+
+
+@api_bp.get("/test_video/<path:video_name>")
+def test_video(video_name: str):
+    if not _is_safe_video_filename(video_name):
+        return jsonify({"error": "Invalid video filename."}), 400
+
+    try:
+        test_videos_dir, available_videos = _list_available_test_videos()
+    except FileNotFoundError as error:
+        return jsonify({"error": str(error)}), 500
+
+    selected_video = str(video_name).strip()
+    if selected_video not in available_videos:
+        return jsonify({"error": "Video not found."}), 404
+
+    video_path = (test_videos_dir / selected_video).resolve()
+    try:
+        video_path.relative_to(test_videos_dir)
+    except ValueError:
+        return jsonify({"error": "Invalid video path."}), 400
+
+    return send_file(video_path, conditional=True)
 
 
 @api_bp.post("/start_inference_stream")

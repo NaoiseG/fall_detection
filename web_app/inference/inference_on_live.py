@@ -22,6 +22,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+
+def _sleep_until(target_t: float) -> None:
+    """Sleep until an absolute perf_counter timestamp with reduced overshoot."""
+    while True:
+        remaining_s = float(target_t) - time.perf_counter()
+        if remaining_s <= 0.0:
+            return
+        if remaining_s > 0.002:
+            time.sleep(max(0.0, remaining_s - 0.001))
+        else:
+            time.sleep(0)
+
+
 # Allow running from any working directory.
 _THIS_FILE = Path(__file__).resolve()
 _REPO_ROOT = _THIS_FILE.parents[1]
@@ -345,13 +358,13 @@ def run_inference_live(
         while not stop_event.is_set():
             # ---------------------------------------- throttle to training_fps
             now = time.perf_counter()
-            wait_s = next_capture_t - now - 0.001
-            if wait_s > 0.0:
-                time.sleep(wait_s)
-                continue
+            if next_capture_t > now:
+                _sleep_until(next_capture_t)
 
             t_frame_start = time.perf_counter()
-            next_capture_t = t_frame_start + capture_interval_s
+            if t_frame_start - next_capture_t > capture_interval_s:
+                next_capture_t = t_frame_start
+            next_capture_t += capture_interval_s
 
             ok, frame = cap.read()
             if not ok:

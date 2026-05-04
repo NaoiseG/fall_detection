@@ -47,6 +47,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+
+def _sleep_until(target_t: float) -> None:
+    """Sleep until an absolute perf_counter timestamp with reduced overshoot."""
+    while True:
+        remaining_s = float(target_t) - time.perf_counter()
+        if remaining_s <= 0.0:
+            return
+        if remaining_s > 0.002:
+            time.sleep(max(0.0, remaining_s - 0.001))
+        else:
+            time.sleep(0)
+
+
 # Allow running as a script from any working directory (mirrors `python -m ...`).
 _THIS_FILE = Path(__file__).resolve()
 _REPO_ROOT = _THIS_FILE.parents[1]
@@ -1596,6 +1609,7 @@ def run_inference_stream_packets(
     rp_img_w: int = 0,
     rp_img_h: int = 0,
     jpeg_quality: int = 80,
+    stream_frames: bool = True,
     **_unused_options: Any,
 ) -> int:
     frame_step = int(frame_step)
@@ -1941,14 +1955,13 @@ def run_inference_stream_packets(
 
         window_name = "inference_on_video"
         fps_ema: Optional[float] = None
-        stream_pace_fps_ema: Optional[float] = None
         ema_alpha = 0.1
+        next_frame_due_t = time.perf_counter()
         while True:
             if not frames_buf and cap_done:
                 break
 
             t_frame_start = time.perf_counter()
-            cap_done_at_frame_start = bool(cap_done)
             display_sample_idx = int(display_idx // max(1, int(frame_step)))
 
             target_sampled = int(display_sample_idx) + int(T_final) + 1
@@ -1990,20 +2003,14 @@ def run_inference_stream_packets(
             hud_to_draw = list(hud)
 
             if on_packet is not None:
-                ok_jpg, encoded = cv2.imencode(
-                    ".jpg",
-                    frame_original,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
-                )
-                if not ok_jpg:
-                    raise RuntimeError(f"Failed to encode frame {int(display_idx)} to JPEG.")
-                frame_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
                 packet: Dict[str, Any] = {
                     "type": "frame",
                     "frame_index": int(display_idx),
                     "frame_number": int(display_idx) + 1,
                     "frame_count": int(frame_count),
                     "fps": float(fps_for_hud),
+                    "source_fps": float(src_fps),
+                    "timestamp_s": float(display_idx) / max(1e-6, float(src_fps)),
                     "pred": {
                         "label": str(label),
                         "conf": float(pconf),
@@ -2022,7 +2029,6 @@ def run_inference_stream_packets(
                         "conf_thres": float(conf_thres),
                         "skeleton": [[int(a), int(b)] for a, b in SKELETON],
                     },
-                    "frame_jpeg_b64": frame_b64,
                     "size": {"w": int(frame_original.shape[1]), "h": int(frame_original.shape[0])},
                     "overlay": {
                         "hud": {
@@ -2039,6 +2045,15 @@ def run_inference_stream_packets(
                         },
                     },
                 }
+                if bool(stream_frames):
+                    ok_jpg, encoded = cv2.imencode(
+                        ".jpg",
+                        frame_original,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
+                    )
+                    if not ok_jpg:
+                        raise RuntimeError(f"Failed to encode frame {int(display_idx)} to JPEG.")
+                    packet["frame_jpeg_b64"] = base64.b64encode(encoded.tobytes()).decode("ascii")
                 if p_fall is not None:
                     packet["pred"]["fall_prob"] = float(p_fall)
                 on_packet(packet)
@@ -2069,23 +2084,15 @@ def run_inference_stream_packets(
                     key = cv2.waitKey(wait_ms) & 0xFF
 
             if bool(realtime) and is_packet_stream:
-                pace_fps = float(fps_play)
-                if cap_done_at_frame_start and stream_pace_fps_ema is not None and float(stream_pace_fps_ema) > 1e-6:
-                    pace_fps = min(float(fps_play), float(stream_pace_fps_ema))
-                elapsed_s = time.perf_counter() - t_frame_start
-                remaining_s = (1.0 / max(1e-6, float(pace_fps))) - elapsed_s
-                if remaining_s > 0.0:
-                    time.sleep(remaining_s)
+                next_frame_due_t += frame_period_s
+                now_t = time.perf_counter()
+                if now_t - next_frame_due_t > frame_period_s:
+                    next_frame_due_t = now_t
+                _sleep_until(next_frame_due_t)
 
             total_ms = (time.perf_counter() - t_frame_start) * 1000.0
             inst_fps = 1000.0 / max(1e-6, total_ms)
             fps_ema = inst_fps if fps_ema is None else (1.0 - ema_alpha) * float(fps_ema) + ema_alpha * inst_fps
-            if is_packet_stream and not cap_done_at_frame_start:
-                stream_pace_fps_ema = (
-                    float(fps_ema)
-                    if stream_pace_fps_ema is None
-                    else (1.0 - ema_alpha) * float(stream_pace_fps_ema) + ema_alpha * float(fps_ema)
-                )
 
             should_quit = (key in (ord("q"), 27))
 

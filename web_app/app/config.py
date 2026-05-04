@@ -69,7 +69,11 @@ KEYPOINT_PRECISIONS = ("FP32", "FP16")
 
 # Optional FP16 engine filenames for Ultralytics keypoint models.
 KEYPOINT_YOLO_FP16_WEIGHT_FILENAMES = {
+    "ultralytics-yolo11n": "yolo11n-pose_fp16.engine",
+    "ultralytics-yolo11s": "yolo11s-pose_fp16.engine",
+    "ultralytics-yolo11m": "yolo11m-pose_fp16.engine",
     "ultralytics-yolo11l": "yolo11l-pose_fp16.engine",
+    "ultralytics-yolo11x": "yolo11x-pose_fp16.engine",
 }
 
 

@@ -64,7 +64,10 @@
 <section class="live-view">
   <h2>Live View</h2>
   <p id="live-status">Idle.</p>
-  <canvas id="live-canvas" width="640" height="360"></canvas>
+  <div class="video-stage">
+    <video id="source-video" muted playsinline></video>
+    <canvas id="live-canvas" width="640" height="360"></canvas>
+  </div>
 </section>
 
 <h2>API Response</h2>
