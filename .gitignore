@@ -25,7 +25,6 @@ fall_models/Prototype/models/prompts/
 fall_models/Prototype/models/stgcn/two_stream_stgcn.py
 fall_models/Prototype/models/tcn/best_05_02/
 fall_models/Prototype/models/videomae/
-fall_models/Prototype/pose_models/AlphaPose/
 fall_models/Prototype/pose_models/ViTPose/
 fall_models/Prototype/dataset_helpers/compare_npz.py
 fall_models/Prototype/test.py
