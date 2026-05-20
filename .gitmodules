@@ -1,0 +1,4 @@
+[submodule "fall_models/Prototype/pose_models/AlphaPose"]
+	path = fall_models/Prototype/pose_models/AlphaPose
+	url = https://github.com/NaoiseG/AlphaPose.git
+	branch = fall-detection-alpha-changes
