@@ -2,6 +2,8 @@ const classificationSelect = document.getElementById("classification-model");
 const keypointSelect = document.getElementById("keypoint-model");
 const keypointPrecisionSelect = document.getElementById("keypoint-precision");
 const videoSelect = document.getElementById("video-select");
+const liveSourceLabel = document.getElementById("live-source-label");
+const liveSourceSelect = document.getElementById("live-source");
 const cameraSelectLabel = document.getElementById("camera-select-label");
 const cameraSelect = document.getElementById("camera-select");
 const windowSizeInput = document.getElementById("window-size");
@@ -27,6 +29,11 @@ let activeJobId = "";
 let activeStopUrl = "";
 let isLiveMode = false;
 let sourceVideoReady = Promise.resolve();
+let clientCameraStream = null;
+let clientCaptureTimer = 0;
+let clientUploadInFlight = false;
+let clientUploadJobId = "";
+let clientCaptureCanvas = null;
 
 function setOutputState(ok) {
   if (!responseBox || !statusLabel) {
@@ -57,12 +64,20 @@ function isLiveSelected() {
   return videoSelect && videoSelect.value === "live";
 }
 
+function selectedLiveSource() {
+  return liveSourceSelect ? liveSourceSelect.value : "server";
+}
+
 function setRunReady() {
   if (!runButton || !videoSelect) {
     return;
   }
   if (isLiveSelected()) {
-    runButton.disabled = !cameraSelect || !cameraSelect.value;
+    if (selectedLiveSource() === "client") {
+      runButton.disabled = false;
+    } else {
+      runButton.disabled = !cameraSelect || !cameraSelect.value;
+    }
   } else {
     runButton.disabled = !videoSelect.value;
   }
@@ -119,15 +134,39 @@ function resetSourceVideo() {
     return;
   }
   sourceVideo.pause();
+  sourceVideo.srcObject = null;
   sourceVideo.removeAttribute("src");
   sourceVideo.load();
   sourceVideoReady = Promise.resolve();
 }
 
-function closeActiveStream() {
+function stopClientCapture() {
+  if (clientCaptureTimer) {
+    window.clearInterval(clientCaptureTimer);
+    clientCaptureTimer = 0;
+  }
+  clientUploadInFlight = false;
+  clientUploadJobId = "";
+  if (clientCameraStream) {
+    for (const track of clientCameraStream.getTracks()) {
+      track.stop();
+    }
+    clientCameraStream = null;
+  }
+  if (sourceVideo && sourceVideo.srcObject) {
+    sourceVideo.pause();
+    sourceVideo.srcObject = null;
+  }
+}
+
+function closeActiveStream(options = {}) {
+  const stopCapture = options.stopClientCapture !== false;
   if (activeEventSource) {
     activeEventSource.close();
     activeEventSource = null;
+  }
+  if (stopCapture) {
+    stopClientCapture();
   }
   streamTerminated = false;
   activeStatusUrl = "";
@@ -494,7 +533,10 @@ async function fetchJobStatus() {
 }
 
 function attachStreamHandlers(streamUrl, statusUrl) {
-  closeActiveStream();
+  if (activeEventSource) {
+    activeEventSource.close();
+    activeEventSource = null;
+  }
   clearFrameQueue();
   streamTerminated = false;
   activeStatusUrl = statusUrl || "";
@@ -582,6 +624,116 @@ async function stopLiveInference() {
   }
 }
 
+async function startClientCamera() {
+  if (!sourceVideo) {
+    throw new Error("Live video element is not available.");
+  }
+  const host = window.location.hostname;
+  const isLocalhost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  if (!window.isSecureContext && !isLocalhost) {
+    throw new Error(
+      "Client webcam requires HTTPS when the app is opened from another device. Use HTTPS, open the app on localhost, or choose Server webcam."
+    );
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error(
+      "Webcam capture is not available in this browser context. Use HTTPS or localhost, and check browser camera permissions."
+    );
+  }
+
+  stopClientCapture();
+  try {
+    clientCameraStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+        facingMode: "environment",
+      },
+      audio: false,
+    });
+  } catch (error) {
+    if (error && error.name === "NotAllowedError") {
+      throw new Error("Camera permission was denied. Allow camera access in the browser and try again.");
+    }
+    if (error && error.name === "NotFoundError") {
+      throw new Error("No client webcam was found by the browser.");
+    }
+    throw error;
+  }
+  sourceVideo.srcObject = clientCameraStream;
+  sourceVideo.muted = true;
+  sourceVideo.playsInline = true;
+  sourceVideoReady = waitForVideoMetadata();
+  await sourceVideo.play();
+  await sourceVideoReady;
+}
+
+async function uploadClientFrame(jobId) {
+  if (!jobId || !sourceVideo || !clientCameraStream || clientUploadInFlight) {
+    return;
+  }
+  if (!sourceVideo.videoWidth || !sourceVideo.videoHeight) {
+    return;
+  }
+
+  clientUploadInFlight = true;
+  try {
+    if (!clientCaptureCanvas) {
+      clientCaptureCanvas = document.createElement("canvas");
+    }
+    const maxWidth = 640;
+    const scale = Math.min(1, maxWidth / sourceVideo.videoWidth);
+    const width = Math.max(1, Math.round(sourceVideo.videoWidth * scale));
+    const height = Math.max(1, Math.round(sourceVideo.videoHeight * scale));
+    clientCaptureCanvas.width = width;
+    clientCaptureCanvas.height = height;
+
+    const ctx = clientCaptureCanvas.getContext("2d");
+    if (!ctx) {
+      return;
+    }
+    ctx.drawImage(sourceVideo, 0, 0, width, height);
+
+    const blob = await new Promise((resolve) => {
+      clientCaptureCanvas.toBlob(resolve, "image/jpeg", 0.75);
+    });
+    if (!blob) {
+      return;
+    }
+
+    const response = await fetch(`/api/client_live_frame/${encodeURIComponent(jobId)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "image/jpeg",
+      },
+      body: blob,
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || "Failed to upload webcam frame.");
+    }
+  } catch (error) {
+    renderError(error.message || "Failed to upload webcam frame.");
+    setLiveStatus("Error.");
+    closeActiveStream();
+    setRunReady();
+  } finally {
+    clientUploadInFlight = false;
+  }
+}
+
+function startClientFrameUpload(jobId, fps) {
+  clientUploadJobId = jobId || "";
+  if (!clientUploadJobId) {
+    return;
+  }
+  const intervalMs = Math.max(50, Math.round(1000 / Math.max(1, Number(fps) || 1)));
+  void uploadClientFrame(clientUploadJobId);
+  clientCaptureTimer = window.setInterval(() => {
+    void uploadClientFrame(clientUploadJobId);
+  }, intervalMs);
+}
+
 async function loadCameras() {
   if (!cameraSelect) {
     return;
@@ -624,6 +776,33 @@ function showCameraSelector() {
 function hideCameraSelector() {
   if (cameraSelectLabel) cameraSelectLabel.style.display = "none";
   if (cameraSelect) cameraSelect.style.display = "none";
+}
+
+function showLiveSourceSelector() {
+  if (liveSourceLabel) liveSourceLabel.style.display = "";
+  if (liveSourceSelect) liveSourceSelect.style.display = "";
+}
+
+function hideLiveSourceSelector() {
+  if (liveSourceLabel) liveSourceLabel.style.display = "none";
+  if (liveSourceSelect) liveSourceSelect.style.display = "none";
+}
+
+function syncLiveSourceControls() {
+  if (!isLiveSelected()) {
+    hideLiveSourceSelector();
+    hideCameraSelector();
+    return;
+  }
+
+  showLiveSourceSelector();
+  if (selectedLiveSource() === "client") {
+    hideCameraSelector();
+    setRunReady();
+  } else {
+    showCameraSelector();
+    void loadCameras();
+  }
 }
 
 async function loadTestVideos() {
@@ -711,6 +890,7 @@ async function runInference() {
   }
 
   const live = isLiveSelected();
+  const liveSource = live ? selectedLiveSource() : "";
   const payload = {
     classification_model: classificationSelect.value,
     keypoint_model: keypointSelect.value,
@@ -723,7 +903,10 @@ async function runInference() {
     k: knobs.k,
     display_fps: knobs.fps,
   };
-  if (live && cameraSelect) {
+  if (live) {
+    payload.live_source = liveSource;
+  }
+  if (live && liveSource === "server" && cameraSelect) {
     payload.camera_index = parseInt(cameraSelect.value, 10) || 0;
   }
 
@@ -739,6 +922,16 @@ async function runInference() {
   if (live) {
     setMetadataMode(false);
     resetSourceVideo();
+    if (liveSource === "client") {
+      try {
+        await startClientCamera();
+      } catch (error) {
+        renderError(error.message || "Could not start client webcam.");
+        setLiveStatus("Error.");
+        setRunReady();
+        return;
+      }
+    }
   } else {
     setMetadataMode(true);
     await prepareSourceVideo(selectedVideoUrl(videoSelect.value));
@@ -754,6 +947,9 @@ async function runInference() {
     });
     const data = await response.json();
     if (!response.ok || !data.ok) {
+      if (live && liveSource === "client") {
+        stopClientCapture();
+      }
       renderError(data.error || "Failed to start inference stream.");
       setLiveStatus("Error.");
       setRunReady();
@@ -771,8 +967,14 @@ async function runInference() {
     if (live && stopButton) {
       stopButton.style.display = "";
     }
+    if (live && liveSource === "client") {
+      startClientFrameUpload(activeJobId, knobs.fps);
+    }
     attachStreamHandlers(data.stream_url, data.status_url);
   } catch (error) {
+    if (live && liveSource === "client") {
+      stopClientCapture();
+    }
     renderError(error.message || "Request failed.");
     setLiveStatus("Error.");
     setRunReady();
@@ -794,9 +996,9 @@ if (videoSelect) {
       setMetadataMode(false);
       resetSourceVideo();
       clearLiveCanvas();
-      showCameraSelector();
-      void loadCameras();
+      syncLiveSourceControls();
     } else {
+      hideLiveSourceSelector();
       hideCameraSelector();
       setMetadataMode(true);
       clearLiveCanvas();
@@ -806,6 +1008,17 @@ if (videoSelect) {
       }
       setRunReady();
     }
+  });
+}
+
+if (liveSourceSelect) {
+  liveSourceSelect.addEventListener("change", () => {
+    if (activeEventSource) {
+      return;
+    }
+    stopClientCapture();
+    clearLiveCanvas();
+    syncLiveSourceControls();
   });
 }
 

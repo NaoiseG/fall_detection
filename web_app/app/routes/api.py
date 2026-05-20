@@ -361,12 +361,19 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
 
     # Live mode: video value is the sentinel string "live".
     is_live = isinstance(video_name, str) and str(video_name).strip().lower() == "live"
+    live_source = str(payload.get("live_source", "server")).strip().lower()
+    if live_source not in {"server", "client"}:
+        raise ValueError("Invalid live_source. Expected 'server' or 'client'.")
 
     if is_live:
-        camera_index = _validate_int(
-            payload.get("camera_index", 0), name="camera_index", min_value=0
-        )
+        if live_source == "server":
+            camera_index = _validate_int(
+                payload.get("camera_index", 0), name="camera_index", min_value=0
+            )
+        else:
+            camera_index = None
     else:
+        live_source = "server"
         if not _is_safe_video_filename(video_name):
             raise ValueError("Invalid video value. Expected a filename without path separators.")
 
@@ -451,6 +458,7 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
     }
     if is_live:
         result["camera_index"] = camera_index
+        result["live_source"] = live_source
     else:
         result["video_name"] = selected_video
         result["video_path"] = resolved_video_path
@@ -460,7 +468,15 @@ def _prepare_stream_request(payload: Any) -> Dict[str, Any]:
 def _start_stream_job_from_payload(payload: Any):
     prepared = _prepare_stream_request(payload)
 
-    if prepared["mode"] == "live":
+    if prepared["mode"] == "live" and prepared.get("live_source") == "client":
+        job = inference_stream_job_manager.start_client_live_job(
+            classification_model=prepared["classification_model"],
+            classification_model_path=prepared["classification_model_path"],
+            keypoint_model_path=prepared["keypoint_model_path"],
+            inference_options=prepared["inference_options"],
+            save_path=prepared["save_path"],
+        )
+    elif prepared["mode"] == "live":
         job = inference_stream_job_manager.start_live_job(
             camera_index=prepared["camera_index"],
             classification_model=prepared["classification_model"],
@@ -489,6 +505,7 @@ def _start_stream_job_from_payload(payload: Any):
                 "stop_url": f"/api/stop_job/{job.job_id}",
                 "save_path": str(job.save_path) if job.save_path is not None else None,
                 "mode": prepared["mode"],
+                "live_source": prepared.get("live_source"),
                 "video_url": (
                     f"/api/test_video/{prepared['video_name']}"
                     if prepared["mode"] == "video"
@@ -587,6 +604,20 @@ def stop_job(job_id: str):
     stopped = inference_stream_job_manager.stop_job(job_id)
     if not stopped:
         return jsonify({"error": "Job not found."}), 404
+    return jsonify({"ok": True})
+
+
+@api_bp.post("/client_live_frame/<job_id>")
+def client_live_frame(job_id: str):
+    frame_bytes = request.get_data(cache=False)
+    if not frame_bytes:
+        return _json_error("Missing frame body.", 400)
+    if len(frame_bytes) > 2 * 1024 * 1024:
+        return _json_error("Frame is too large.", 413)
+
+    accepted = inference_stream_job_manager.submit_client_frame(job_id, frame_bytes)
+    if not accepted:
+        return _json_error("Job not found or not accepting frames.", 404)
     return jsonify({"ok": True})
 
 

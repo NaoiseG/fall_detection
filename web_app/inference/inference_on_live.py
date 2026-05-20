@@ -42,6 +42,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from inference.inference_on_video import (  # noqa: E402
+    AsyncVideoWriter,
     K,
     SKELETON,
     build_temporal_model,
@@ -73,6 +74,9 @@ def list_available_cameras(max_index: int = 4) -> List[Dict[str, Any]]:
     Uses the DirectShow backend on Windows for faster probing (avoids the
     multi-second timeout on missing indices with the default MSMF backend).
     """
+    if sys.platform.startswith("linux") and not any(Path("/dev").glob("video*")):
+        return []
+
     cameras: List[Dict[str, Any]] = []
     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
     for idx in range(max_index + 1):
@@ -143,6 +147,8 @@ def run_inference_live(
     classification_model_path: Path,
     keypoint_model_path: Path,
     on_packet: Optional[Callable[[Dict[str, Any]], None]] = None,
+    frame_source: Optional[Callable[[], Optional[np.ndarray]]] = None,
+    source_label: str = "server",
     save_path: Optional[Path] = None,
     arch: Optional[str] = None,
     labels_file: Optional[str] = None,
@@ -186,7 +192,7 @@ def run_inference_live(
     use_half_temporal = use_half_requested
     print(
         f"[live][runtime] device={run_device} half={int(use_half_requested)} "
-        f"camera_index={camera_index}"
+        f"camera_index={camera_index} source={source_label}"
     )
 
     # ------------------------------------------------------------------ model
@@ -302,32 +308,25 @@ def run_inference_live(
     print(f"[live][pose] backend={keypoint_runtime.backend}")
 
     # ----------------------------------------------------------------- camera
-    backend_flag = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-    cap = cv2.VideoCapture(int(camera_index), backend_flag)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera at index {camera_index}.")
+    cap: Optional[cv2.VideoCapture] = None
+    if frame_source is None:
+        backend_flag = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(int(camera_index), backend_flag)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open camera at index {camera_index}.")
 
-    writer: Optional[cv2.VideoWriter] = None
+        def read_frame() -> Optional[np.ndarray]:
+            assert cap is not None
+            ok, frame_bgr = cap.read()
+            return frame_bgr if ok else None
+    else:
+        read_frame = frame_source
+
+    writer: Optional[AsyncVideoWriter] = None
     out_w = 0
     out_h = 0
+    source_ready = False
     try:
-        # Use camera native resolution to set rp normalisation dimensions.
-        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
-        out_w = int(frame_w)
-        out_h = int(frame_h)
-        if save_path is not None:
-            writer = open_video_writer(
-                save_path=Path(save_path).expanduser(),
-                fps=float(training_fps),
-                frame_size=(out_w, out_h),
-            )
-        if rp_img_w_final is None:
-            rp_img_w_final = frame_w
-        if rp_img_h_final is None:
-            rp_img_h_final = frame_h
-        print(f"[live][camera] index={camera_index} res={frame_w}x{frame_h}")
-
         # Time window parameters.
         window_duration_s = T_final / training_fps
         stride_duration_s = stride_final / training_fps
@@ -366,10 +365,33 @@ def run_inference_live(
                 next_capture_t = t_frame_start
             next_capture_t += capture_interval_s
 
-            ok, frame = cap.read()
-            if not ok:
+            frame = read_frame()
+            if frame is None:
                 time.sleep(0.01)
                 continue
+            if frame.ndim != 3 or frame.shape[2] != 3:
+                continue
+            t_frame_start = time.perf_counter()
+
+            if not source_ready:
+                # Use first readable frame to set normalisation and output size.
+                frame_h, frame_w = frame.shape[:2]
+                out_w = int(frame_w)
+                out_h = int(frame_h)
+                if save_path is not None:
+                    writer = AsyncVideoWriter(
+                        open_video_writer(
+                            save_path=Path(save_path).expanduser(),
+                            fps=float(training_fps),
+                            frame_size=(out_w, out_h),
+                        )
+                    )
+                if rp_img_w_final is None:
+                    rp_img_w_final = frame_w
+                if rp_img_h_final is None:
+                    rp_img_h_final = frame_h
+                print(f"[live][camera] source={source_label} index={camera_index} res={frame_w}x{frame_h}")
+                source_ready = True
 
             # ------------------------------------- initialise tracking targets
             if track_target_center is None or track_max_jump_px_final is None:
@@ -588,8 +610,48 @@ def run_inference_live(
             display_frame_idx += 1
 
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         if writer is not None:
             writer.release()
 
     return 0
+
+
+def _decode_jpeg_frame(frame_bytes: bytes) -> Optional[np.ndarray]:
+    if not frame_bytes:
+        return None
+    encoded = np.frombuffer(frame_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if frame is None or frame.size == 0:
+        return None
+    return frame
+
+
+def run_inference_live_client(
+    *,
+    frame_bytes_source: Callable[[], Optional[bytes]],
+    stop_event: threading.Event,
+    classification_model_path: Path,
+    keypoint_model_path: Path,
+    on_packet: Optional[Callable[[Dict[str, Any]], None]] = None,
+    save_path: Optional[Path] = None,
+    **kwargs: Any,
+) -> int:
+    def read_uploaded_frame() -> Optional[np.ndarray]:
+        frame_bytes = frame_bytes_source()
+        if frame_bytes is None:
+            return None
+        return _decode_jpeg_frame(frame_bytes)
+
+    return run_inference_live(
+        camera_index=-1,
+        stop_event=stop_event,
+        classification_model_path=classification_model_path,
+        keypoint_model_path=keypoint_model_path,
+        on_packet=on_packet,
+        frame_source=read_uploaded_frame,
+        source_label="client",
+        save_path=save_path,
+        **kwargs,
+    )

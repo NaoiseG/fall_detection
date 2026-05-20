@@ -347,6 +347,56 @@ def open_video_writer(save_path: Path, fps: float, frame_size: Tuple[int, int]) 
     raise RuntimeError(f"Could not open VideoWriter for: {save_path} (tried codecs={codecs})")
 
 
+def save_deferred_annotated_video(
+    *,
+    video_path: Path,
+    save_path: Path,
+    annotations: List[Dict[str, Any]],
+    fps: float,
+    frame_size: Tuple[int, int],
+) -> None:
+    if not annotations:
+        return
+
+    ann_by_frame = {int(ann["frame_index"]): ann for ann in annotations}
+    max_frame_idx = max(ann_by_frame)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not reopen video for deferred save: {video_path}")
+
+    writer: Optional[cv2.VideoWriter] = None
+    try:
+        out_w, out_h = int(frame_size[0]), int(frame_size[1])
+        writer = open_video_writer(save_path=Path(save_path), fps=float(fps), frame_size=(out_w, out_h))
+        print(f"[save] rendering deferred annotations: {len(annotations)} frames")
+        frame_idx = 0
+        while frame_idx <= int(max_frame_idx):
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            ann = ann_by_frame.get(int(frame_idx))
+            if ann is not None:
+                frame = draw_pose(
+                    frame,
+                    np.asarray(ann["xy"], dtype=np.float32),
+                    np.asarray(ann["conf"], dtype=np.float32),
+                    conf_thres=float(ann["conf_thres"]),
+                    draw_skeleton=True,
+                )
+                frame = draw_hud(frame, [str(line) for line in ann["hud_lines"]])
+
+            frame_h, frame_w = frame.shape[:2]
+            if frame_w != out_w or frame_h != out_h:
+                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            writer.write(frame)
+            frame_idx += 1
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+
+
 def _clean_state_dict_for_model(state: dict, model: nn.Module) -> dict:
     """
     Flexibly handle DataParallel 'module.' prefixes.
@@ -1289,6 +1339,8 @@ def run_inference_stream_packets(
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     writer: Optional[cv2.VideoWriter] = None
+    save_path_resolved: Optional[Path] = None
+    deferred_save_annotations: List[Dict[str, Any]] = []
     base_w = 0
     base_h = 0
 
@@ -1503,16 +1555,18 @@ def run_inference_stream_packets(
         compute_window_pred(0)
         next_win_start = int(win_step)
 
+        defer_save_until_end = save_path is not None and is_packet_stream
         if save_path is not None and frames_buf:
             save_path_resolved = Path(save_path).expanduser()
             if save_path_resolved.suffix == "":
                 save_path_resolved = save_path_resolved.with_suffix(".mp4")
             base_h, base_w = frames_buf[0].shape[:2]
-            writer = open_video_writer(
-                save_path=save_path_resolved,
-                fps=float(src_fps),
-                frame_size=(int(base_w), int(base_h)),
-            )
+            if not defer_save_until_end:
+                writer = open_video_writer(
+                    save_path=save_path_resolved,
+                    fps=float(src_fps),
+                    frame_size=(int(base_w), int(base_h)),
+                )
 
         fps_ema: Optional[float] = None
         ema_alpha = 0.1
@@ -1629,6 +1683,17 @@ def run_inference_stream_packets(
                     packet["pred"]["fall_prob"] = float(p_fall)
                 on_packet(packet)
 
+            if defer_save_until_end:
+                deferred_save_annotations.append(
+                    {
+                        "frame_index": int(display_idx),
+                        "xy": np.asarray(xy, dtype=np.float32).copy(),
+                        "conf": np.asarray(cf, dtype=np.float32).copy(),
+                        "conf_thres": float(conf_thres_final),
+                        "hud_lines": list(hud_to_draw),
+                    }
+                )
+
             key = -1
             needs_rendered_frame = (on_frame is not None) or (writer is not None) or (not bool(no_display))
             if needs_rendered_frame:
@@ -1680,6 +1745,16 @@ def run_inference_stream_packets(
             display_idx += 1
             if should_quit:
                 break
+
+        if defer_save_until_end and save_path_resolved is not None:
+            cap.release()
+            save_deferred_annotated_video(
+                video_path=resolved_video_path,
+                save_path=save_path_resolved,
+                annotations=deferred_save_annotations,
+                fps=float(src_fps),
+                frame_size=(int(base_w), int(base_h)),
+            )
 
         return 0
     finally:

@@ -40,6 +40,12 @@
     <option value="">Loading cameras...</option>
   </select>
 
+  <label for="live-source" id="live-source-label" style="display:none">Live Feed Source</label>
+  <select id="live-source" name="live-source" style="display:none">
+    <option value="server">Server webcam</option>
+    <option value="client">Client webcam</option>
+  </select>
+
   <label for="window-size">Window Size (T)</label>
   <input id="window-size" name="window-size" type="number" min="1" step="1" value="64">
 

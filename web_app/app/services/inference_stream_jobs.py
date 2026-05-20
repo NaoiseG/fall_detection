@@ -22,9 +22,11 @@ def _format_sse_event(event_name: str, payload_json: str) -> str:
 class InferenceStreamJob:
     job_id: str
     save_path: Optional[Path] = None
+    accepts_client_frames: bool = False
     status: str = "running"  # running | done | error
     error: Optional[str] = None
     packet_queue: "queue.Queue[str]" = field(default_factory=lambda: queue.Queue(maxsize=64))
+    client_frame_queue: "queue.Queue[bytes]" = field(default_factory=lambda: queue.Queue(maxsize=4))
     last_packet: Optional[str] = None
     done_event: threading.Event = field(default_factory=threading.Event)
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -73,6 +75,29 @@ class InferenceStreamJob:
         if accepted:
             with self.lock:
                 self.last_packet = packet_json
+
+    def push_client_frame(self, frame_bytes: bytes) -> bool:
+        if not frame_bytes:
+            return False
+        try:
+            self.client_frame_queue.put_nowait(frame_bytes)
+            return True
+        except queue.Full:
+            try:
+                self.client_frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.client_frame_queue.put_nowait(frame_bytes)
+                return True
+            except queue.Full:
+                return False
+
+    def pop_client_frame(self, timeout_s: float = 1.0) -> Optional[bytes]:
+        try:
+            return self.client_frame_queue.get(timeout=max(0.0, float(timeout_s)))
+        except queue.Empty:
+            return None
 
 
 class InferenceStreamJobManager:
@@ -143,6 +168,50 @@ class InferenceStreamJobManager:
         )
         thread.start()
         return job
+
+    def start_client_live_job(
+        self,
+        *,
+        classification_model: str,
+        classification_model_path: Path,
+        keypoint_model_path: Path,
+        inference_options: Optional[Dict[str, Any]] = None,
+        save_path: Optional[Path] = None,
+    ) -> InferenceStreamJob:
+        resolved_save_path = Path(save_path).resolve() if save_path is not None else None
+        job = InferenceStreamJob(
+            job_id=uuid.uuid4().hex,
+            save_path=resolved_save_path,
+            accepts_client_frames=True,
+        )
+        with self._jobs_lock:
+            self._jobs[job.job_id] = job
+
+        thread = threading.Thread(
+            target=self._run_client_live_job,
+            kwargs={
+                "job": job,
+                "classification_model": str(classification_model),
+                "classification_model_path": classification_model_path.resolve(),
+                "keypoint_model_path": keypoint_model_path.resolve(),
+                "inference_options": dict(inference_options or {}),
+                "save_path": job.save_path,
+            },
+            daemon=True,
+            name=f"inference-client-live-job-{job.job_id}",
+        )
+        thread.start()
+        return job
+
+    def submit_client_frame(self, job_id: str, frame_bytes: bytes) -> bool:
+        job = self.get_job(job_id)
+        if job is None:
+            return False
+        if not job.accepts_client_frames:
+            return False
+        if job.done_event.is_set():
+            return False
+        return job.push_client_frame(frame_bytes)
 
     def stop_job(self, job_id: str) -> bool:
         job = self.get_job(job_id)
@@ -263,4 +332,37 @@ class InferenceStreamJobManager:
             job.set_done()
         except Exception as error:
             logger.exception("Live inference job failed: job_id=%s", job.job_id)
+            job.set_error(str(error))
+
+    def _run_client_live_job(
+        self,
+        *,
+        job: InferenceStreamJob,
+        classification_model: str,
+        classification_model_path: Path,
+        keypoint_model_path: Path,
+        inference_options: Dict[str, Any],
+        save_path: Optional[Path],
+    ) -> None:
+        try:
+            model_key = str(classification_model).strip().lower()
+            if model_key == "motionbert":
+                raise NotImplementedError("MotionBERT is not supported in live mode.")
+
+            from inference.inference_on_live import run_inference_live_client
+
+            return_code = run_inference_live_client(
+                frame_bytes_source=job.pop_client_frame,
+                stop_event=job.stop_event,
+                classification_model_path=classification_model_path,
+                keypoint_model_path=keypoint_model_path,
+                on_packet=job.push_packet,
+                save_path=save_path,
+                **dict(inference_options),
+            )
+            if int(return_code) != 0:
+                raise RuntimeError(f"Client live inference failed with return code {return_code}.")
+            job.set_done()
+        except Exception as error:
+            logger.exception("Client live inference job failed: job_id=%s", job.job_id)
             job.set_error(str(error))
